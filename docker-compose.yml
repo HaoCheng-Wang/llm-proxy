@@ -1,0 +1,31 @@
+services:
+  # ============================================
+  # Backend — Python FastAPI + proxy manager
+  # network_mode: host → proxy ports bind directly
+  # to host NIC, occupied ports auto-skipped.
+  # ============================================
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm-proxy-backend
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      # Mount .env into the container — config.py reads it via python-dotenv.
+      # No need to list every env var individually in docker-compose.
+      - ./.env:/app/.env:ro
+
+  # ============================================
+  # Frontend — nginx serving Vue static files
+  # ============================================
+  frontend:
+    image: nginx:alpine
+    container_name: llm-proxy-frontend
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./frontend/dist:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - backend

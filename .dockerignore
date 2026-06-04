@@ -1,0 +1,29 @@
+# Git
+.git/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.log
+
+# Environment (use docker-compose env vars, not .env file)
+.env
+.env.local
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+
+# Certificates
+backend/certs/
+
+# OS
+.DS_Store
+Thumbs.db
