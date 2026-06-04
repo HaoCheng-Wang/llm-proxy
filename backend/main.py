@@ -55,6 +55,10 @@ async def lifespan(app: FastAPI):
     print("[Main] Closing shared HTTP client...")
     await close_shared_client()
 
+    print("[Main] Disposing database connection pool...")
+    if database.engine:
+        database.engine.dispose()
+
     print("[Main] Shutdown complete.")
 
 

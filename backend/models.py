@@ -36,9 +36,14 @@ class Port(Base):
 
 class Request(Base):
     __tablename__ = "requests"
+    __table_args__ = (
+        # Composite index for fast filtering by port_id and ordering by created_at
+        # This speeds up the get_port_history query significantly
+        {"mysql_charset": "utf8mb4"},
+    )
 
     id = Column(Integer, primary_key=True, index=True)
-    port_id = Column(Integer, ForeignKey("ports.id"), nullable=False)
+    port_id = Column(Integer, ForeignKey("ports.id"), nullable=False, index=True)  # Added index
     method = Column(String(10), nullable=False)
     path = Column(String(1000), nullable=False)
     request_headers = Column(LONGTEXT, nullable=True)
@@ -48,6 +53,6 @@ class Request(Base):
     response_body_raw = Column(LONGTEXT, nullable=True)
     status_code = Column(Integer, nullable=True)
     duration_ms = Column(Integer, nullable=True)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), index=True)  # Added index
 
     port = relationship("Port", back_populates="requests")

@@ -88,39 +88,49 @@ def _save_to_db(port_number: int, method: str, path: str,
                 resp_headers: str, resp_body: str | None,
                 status_code: int, duration_ms: int,
                 resp_body_raw: str | None = None):
-    """Save a request/response record to the database. Runs in a thread."""
-    db = database.SessionLocal()
-    try:
-        port = db.query(Port).filter(
-            Port.port_number == port_number,
-            Port.is_active.is_(True)
-        ).first()
-        if not port:
-            print(f"[Proxy] WARNING: port {port_number} not found in DB, cannot save record",
-                  file=sys.stderr)
-            return
+    """Save a request/response record to the database. Runs in a thread.
+    Retries up to 3 times on transient connection errors."""
+    import time as _time
+    last_error = None
+    for attempt in range(3):
+        db = database.SessionLocal()
+        try:
+            port = db.query(Port).filter(
+                Port.port_number == port_number,
+                Port.is_active.is_(True)
+            ).first()
+            if not port:
+                print(f"[Proxy] WARNING: port {port_number} not found in DB, cannot save record",
+                      file=sys.stderr)
+                return
 
-        record = RequestModel(
-            port_id=port.id,
-            method=method,
-            path=path,
-            request_headers=req_headers,
-            request_body=req_body,
-            response_headers=resp_headers,
-            response_body=resp_body,
-            response_body_raw=resp_body_raw,
-            status_code=status_code,
-            duration_ms=duration_ms,
-        )
-        db.add(record)
-        db.commit()
-    except Exception:
-        db.rollback()
-        print(f"[Proxy] ERROR saving request record for port {port_number}:",
-              file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-    finally:
-        db.close()
+            record = RequestModel(
+                port_id=port.id,
+                method=method,
+                path=path,
+                request_headers=req_headers,
+                request_body=req_body,
+                response_headers=resp_headers,
+                response_body=resp_body,
+                response_body_raw=resp_body_raw,
+                status_code=status_code,
+                duration_ms=duration_ms,
+            )
+            db.add(record)
+            db.commit()
+            return  # success
+        except Exception as e:
+            db.rollback()
+            last_error = e
+            if attempt < 2:
+                _time.sleep(0.5 * (attempt + 1))  # 0.5s, 1.0s backoff
+        finally:
+            db.close()
+
+    print(f"[Proxy] ERROR saving request record for port {port_number} after 3 retries:",
+          file=sys.stderr)
+    traceback.print_exception(type(last_error), last_error, last_error.__traceback__,
+                              file=sys.stderr)
 
 
 async def _save_record_async(port_number: int, method: str, path: str,

@@ -48,14 +48,19 @@ def _init_engine():
         pool_size=DB_POOL_SIZE,
         max_overflow=DB_MAX_OVERFLOW,
         pool_pre_ping=True,
-        pool_recycle=3600,
+        pool_recycle=600,   # recycle before MySQL wait_timeout kills idle connections
         pool_timeout=30,
+        connect_args={
+            "connect_timeout": 10,
+            "read_timeout": 30,
+            "write_timeout": 30,
+        },
     )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def _migrate_columns():
-    """Ensure request storage columns use LONGTEXT; add missing columns."""
+    """Ensure request storage columns use LONGTEXT; add missing columns and indexes."""
     if engine is None:
         return
     with engine.connect() as conn:
@@ -77,6 +82,19 @@ def _migrate_columns():
                 conn.commit()
             except Exception:
                 conn.rollback()
+
+        # Add indexes for faster queries (idempotent - ignore if already exists)
+        for idx_name, idx_sql in [
+            ("ix_requests_port_id", "CREATE INDEX ix_requests_port_id ON requests (port_id)"),
+            ("ix_requests_created_at", "CREATE INDEX ix_requests_created_at ON requests (created_at)"),
+        ]:
+            try:
+                conn.execute(text(idx_sql))
+                conn.commit()
+                print(f"[DB] Added index: {idx_name}")
+            except Exception:
+                conn.rollback()
+
         print("[DB] Column migration complete")
 
 
