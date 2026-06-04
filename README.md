@@ -201,12 +201,13 @@ services:
     volumes:
       - ./.env:/app/.env:ro  # 挂载配置文件，config.py 自动读取
 
-  frontend:             # nginx + Vue 静态文件
+  frontend:             # nginx + Vue 静态文件（容器内自动构建）
     network_mode: host  # 和 backend 共享宿主机网络
-    volumes:            # 挂载前端构建产物 + nginx 配置
+    volumes:
+      - ./nginx.conf    # 挂载 nginx 配置
 ```
 
-> `network_mode: host` 让代理端口直接绑定宿主机网卡，被占端口自动跳过，不会卡住启动。所有配置项写在 `.env` 文件里，容器挂载后 `config.py` 通过 python-dotenv 读取，无需在 docker-compose.yml 重复声明。
+> `network_mode: host` 让代理端口直接绑定宿主机网卡，被占端口自动跳过，不会卡住启动。前端在 Docker 构建阶段自动编译，无需本地安装 Node.js。所有配置项写在 `.env` 文件里，容器挂载后 `config.py` 通过 python-dotenv 读取，无需在 docker-compose.yml 重复声明。
 
 所有环境变量的详细说明见 `.env.example`。
 
@@ -220,7 +221,8 @@ llm-proxy/
 ├── .gitignore               # Git 忽略规则
 ├── .gitattributes           # 统一换行符为 LF
 ├── .dockerignore            # Docker 构建忽略规则
-├── Dockerfile               # 多阶段构建（前端→后端）
+├── Dockerfile               # 后端多阶段构建
+├── Dockerfile.frontend      # 前端构建 + nginx
 ├── docker-compose.yml       # 2 容器编排
 ├── LICENSE                  # AGPL-3.0 许可证
 ├── nginx.conf               # 前端 nginx 配置
