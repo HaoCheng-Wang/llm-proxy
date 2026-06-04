@@ -138,6 +138,13 @@
       <h3>暂无交互记录</h3>
       <p>配置智能体连接到该端口后，所有API通信将在此显示</p>
     </div>
+
+    <!-- Load More -->
+    <div v-if="hasMore" style="text-align:center;margin-top:16px">
+      <button class="btn btn-outline" @click="loadMore" :disabled="loadingMore">
+        {{ loadingMore ? '加载中...' : `加载更多 (${data.port.request_count - requests.length} 条剩余)` }}
+      </button>
+    </div>
   </div>
 </template>
 
@@ -159,9 +166,13 @@ const headersExpanded = ref({})
 const copyMenuOpen = ref(false)
 const newCount = ref(0)
 const polling = ref(false)
+const loadingMore = ref(false)
+const hasMore = ref(false)
 
 let _maxId = 0
 let _pollTimer = null
+let _offset = 0
+const PAGE_SIZE = 20
 
 // Click-outside directive
 const vClickOutside = {
@@ -180,9 +191,12 @@ const vClickOutside = {
 
 async function loadData() {
   try {
-    data.value = await api.getPortHistory(portId)
+    _offset = 0
+    data.value = await api.getPortHistory(portId, 0, PAGE_SIZE, 0)
     requests.value = data.value.requests || []
     _maxId = requests.value.length > 0 ? Math.max(...requests.value.map(r => r.id)) : 0
+    _offset = requests.value.length
+    hasMore.value = _offset < (data.value.port?.request_count || 0)
     // Auto expand first 3
     const nextExpanded = {}
     requests.value.forEach((_, i) => { if (i < 3) nextExpanded[i] = true })
@@ -190,6 +204,24 @@ async function loadData() {
     newCount.value = 0
   } catch (e) {
     showToast('加载数据失败', 'error')
+  }
+}
+
+async function loadMore() {
+  if (loadingMore.value || !hasMore.value) return
+  loadingMore.value = true
+  try {
+    const result = await api.getPortHistory(portId, 0, PAGE_SIZE, _offset)
+    const newReqs = result.requests || []
+    if (newReqs.length > 0) {
+      requests.value = [...requests.value, ...newReqs]
+      _offset += newReqs.length
+    }
+    hasMore.value = _offset < (data.value.port?.request_count || 0)
+  } catch (e) {
+    showToast('加载更多失败', 'error')
+  } finally {
+    loadingMore.value = false
   }
 }
 
@@ -202,13 +234,15 @@ async function pollNewRecords() {
     if (newReqs.length > 0) {
       // Get the highest new id
       _maxId = Math.max(_maxId, ...newReqs.map(r => r.id))
-      // Prepend to requests (they come desc by created_at, latest first)
-      // But _maxId tracking means newer = higher id
-      // We need to merge properly: new reqs have higher ids but newest created_at
-      // API returns desc by created_at, so they're newest-first already
-      // Just prepend them
+      // Prepend new records
       requests.value = [...newReqs, ...requests.value]
+      _offset += newReqs.length
       newCount.value += newReqs.length
+      // Update request_count and hasMore
+      if (result.port?.request_count !== undefined) {
+        data.value.port.request_count = result.port.request_count
+      }
+      hasMore.value = _offset < (data.value.port?.request_count || 0)
       showToast(`收到 ${newReqs.length} 条新交互记录`, 'info')
     }
   } catch (e) {
@@ -316,7 +350,11 @@ async function clearHistory() {
   try {
     await api.clearPortHistory(portId)
     requests.value = []
+    _offset = 0
+    _maxId = 0
+    hasMore.value = false
     newCount.value = 0
+    if (data.value.port) data.value.port.request_count = 0
     showToast('历史记录已清空', 'success')
   } catch (e) {
     showToast('清空失败', 'error')
