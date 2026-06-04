@@ -26,7 +26,7 @@ COPY backend/ ./backend/
 # Copy built frontend assets
 COPY --from=frontend-builder /src/frontend/dist ./frontend/dist
 
-EXPOSE 3998
+EXPOSE 3998 3999
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:3998/api/health || exit 1

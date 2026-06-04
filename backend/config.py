@@ -67,8 +67,9 @@ DEFAULT_ADMIN_PASSWORD = os.getenv("DEFAULT_ADMIN_PASSWORD", "admin123")
 # 安全
 # ---------------------------------------------------------------------------
 # 是否允许代理目标指向内网地址（localhost、私有 IP 等）。
-# 生产环境必须设为 false，开发调试时可设为 true。
-ALLOW_INTERNAL_TARGETS = os.getenv("ALLOW_INTERNAL_TARGETS", "false").lower() == "true"
+# 默认允许，方便开发调试和代理内网服务。
+# 如需部署到公网，建议设为 false 防止 SSRF 攻击。
+ALLOW_INTERNAL_TARGETS = os.getenv("ALLOW_INTERNAL_TARGETS", "true").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # 性能
