@@ -367,15 +367,15 @@ async def proxy_endpoint(request: Request):
 
     duration_ms = int((time.time() - start_time) * 1000)
 
-    # Save non-streaming record asynchronously (streaming records are saved inside the generator)
+    # Save non-streaming record in background — don't block the response
     if not is_streaming:
-        await _save_record_async(
+        asyncio.create_task(_save_record_async(
             port_number, request.method,
             path + ("?" + query_string if query_string else ""),
             req_headers_json, req_body_str,
             resp_headers_json, resp_body_str,
             status_code, duration_ms,
-        )
+        ))
 
     # Return response with original content-type
     response_headers = {"X-Proxy-Port": str(port_number)}
