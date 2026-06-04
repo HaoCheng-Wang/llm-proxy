@@ -29,7 +29,7 @@
               </td>
               <td>
                 <code style="font-size:12px;color:#aeb6bf;background:#15222b;padding:2px 6px;border-radius:4px">
-                  http://{{ displayIp }}:{{ port.port_number }}/v1
+                  http://{{ displayIp }}:{{ port.port_number }}
                 </code>
               </td>
               <td>
@@ -84,16 +84,17 @@
           <li>Ollama 本地模型：<code>http://localhost:11434</code></li>
           <li>第三方兼容接口：<code>https://your-api-provider.com</code></li>
         </ul>
-        <p style="color:#e67e22">⚠️ 注意：只填域名和端口，<strong>不要</strong>带 <code>/v1</code> 路径，系统会自动拼接。</p>
+        <p style="color:#e67e22">⚠️ 注意：只填域名和端口（如 <code>https://api.openai.com</code>），<strong>不要</strong>带 <code>/v1</code> 等路径，路径会在智能体配置中保留。</p>
 
         <p><strong>第 2 步：获取分配的端口号</strong></p>
         <p>系统会在 4000–5000 范围内自动分配一个空闲端口号，每个用户最多可创建多个端口（上限可通过环境变量配置）。</p>
 
         <p><strong>第 3 步：修改智能体的 API 地址</strong></p>
-        <p>在你的智能体（Agent）或客户端配置中，将大模型 API 地址改为代理地址：</p>
+        <p>在你的智能体（Agent）或客户端配置中，将大模型 API 的 Base URL 改为代理地址。<strong>路径部分保持不变</strong>，只需替换域名和端口：</p>
         <ul style="margin:4px 0 8px 20px">
-          <li>原来：<code>https://api.openai.com/v1</code> 或 <code>http://localhost:11434/v1</code></li>
-          <li>改为：<code>http://{{ displayIp }}:&lt;端口号&gt;/v1</code></li>
+          <li>原来：<code>https://api.openai.com/v1</code> → 改为：<code>http://{{ displayIp }}:&lt;端口号&gt;/v1</code></li>
+          <li>原来：<code>https://api.openai.com/v1/chat</code> → 改为：<code>http://{{ displayIp }}:&lt;端口号&gt;/v1/chat</code></li>
+          <li>原来：<code>http://localhost:11434/v1</code> → 改为：<code>http://{{ displayIp }}:&lt;端口号&gt;/v1</code></li>
         </ul>
         <p>API Key 等其他配置保持不变。如果你的客户端支持自定义 Base URL，只需修改 Base URL 即可。</p>
 
@@ -120,7 +121,7 @@
           <div class="form-group">
             <label>目标API地址</label>
             <input v-model="createForm.target_url" class="form-input"
-                   placeholder="例如: https://api.openai.com  (不要带/v1路径)"
+                   placeholder="例如: https://api.openai.com  (只填域名和端口，不带路径)"
                    required />
           </div>
           <div class="form-group">

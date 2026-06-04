@@ -146,7 +146,7 @@ npm run dev
 
 1. 管理员登录 → 进入「用户管理」→ 批准新注册的用户
 2. 用户登录 → 点击「创建新端口」→ 输入目标 API 地址（如 `https://api.openai.com`）
-3. 在智能体中，把 API Base URL 改为 `http://<你的IP>:<分配的端口>/v1`
+3. 在智能体中，把 API Base URL 改为 `http://<你的IP>:<分配的端口>`，路径部分保持不变（如原来用 `/v1/chat/completions`，现在仍然用 `/v1/chat/completions`）
 4. 在「查看详情」页面实时查看所有交互记录
 
 ---

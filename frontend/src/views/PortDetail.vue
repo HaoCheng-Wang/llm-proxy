@@ -44,7 +44,7 @@
         <div><span class="text-muted">创建时间：</span>{{ formatTime(data.port.created_at) }}</div>
         <div>
           <span class="text-muted">代理地址：</span>
-          <code>http://{{ displayIp }}:{{ data.port.port_number }}/v1</code>
+          <code>http://{{ displayIp }}:{{ data.port.port_number }}</code>
         </div>
       </div>
     </div>
