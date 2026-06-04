@@ -20,12 +20,13 @@ services:
   # Frontend — nginx serving Vue static files
   # ============================================
   frontend:
-    image: nginx:alpine
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
     container_name: llm-proxy-frontend
     restart: unless-stopped
     network_mode: host
     volumes:
-      - ./frontend/dist:/usr/share/nginx/html:ro
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - backend
