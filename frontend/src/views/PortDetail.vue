@@ -89,15 +89,32 @@
 
         <!-- Expanded Body -->
         <div v-if="expanded[index]" class="request-card-body">
-          <!-- View mode toggle -->
-          <div style="margin-bottom:8px;display:flex;gap:8px">
+          <!-- Toolbar: view mode + headers toggle -->
+          <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
             <button class="btn btn-sm" :class="treeView[index] ? 'btn-outline' : 'btn-primary'" @click.stop="treeView[index] = false">
               📝 纯文本
             </button>
             <button class="btn btn-sm" :class="treeView[index] ? 'btn-primary' : 'btn-outline'" @click.stop="treeView[index] = true">
               🌳 树形查看
             </button>
+            <button class="btn btn-outline btn-sm" @click.stop="headersExpanded[index] = !headersExpanded[index]">
+              {{ headersExpanded[index] ? '🔽 隐藏HTTP头' : '🔍 查看HTTP头' }}
+            </button>
           </div>
+
+          <!-- Headers (shown above JSON when expanded) -->
+          <div v-if="headersExpanded[index]" class="headers-grid" style="margin-bottom:12px">
+            <div>
+              <div class="section-label">📤 请求头</div>
+              <pre class="headers-pre">{{ formatJson(req.request_headers) }}</pre>
+            </div>
+            <div>
+              <div class="section-label">📥 响应头</div>
+              <pre class="headers-pre">{{ formatJson(req.response_headers) }}</pre>
+            </div>
+          </div>
+
+          <!-- JSON Panels -->
           <div class="json-panels">
             <!-- Request JSON -->
             <div class="json-panel json-panel-request">
@@ -119,23 +136,6 @@
                 <JsonTree v-if="treeView[index] && parseJsonOrNull(req.response_body) !== null"
                           :data="parseJsonOrNull(req.response_body)" />
                 <pre v-else class="json-content">{{ formatJson(req.response_body) }}</pre>
-              </div>
-            </div>
-          </div>
-
-          <!-- Headers toggle -->
-          <div class="headers-section">
-            <button class="btn btn-outline btn-sm" @click.stop="headersExpanded[index] = !headersExpanded[index]">
-              {{ headersExpanded[index] ? '🔽 隐藏HTTP头' : '🔍 查看HTTP头' }}
-            </button>
-            <div v-if="headersExpanded[index]" class="headers-grid">
-              <div>
-                <div class="section-label">📤 请求头</div>
-                <pre class="headers-pre">{{ formatJson(req.request_headers) }}</pre>
-              </div>
-              <div>
-                <div class="section-label">📥 响应头</div>
-                <pre class="headers-pre">{{ formatJson(req.response_headers) }}</pre>
               </div>
             </div>
           </div>
