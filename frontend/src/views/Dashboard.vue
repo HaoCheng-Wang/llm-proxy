@@ -77,11 +77,38 @@
     <div class="card mt-24">
       <div class="card-header">📖 使用说明</div>
       <div style="font-size:14px;line-height:1.8;color:#aeb6bf">
-        <p>1. 点击 <strong>"创建新端口"</strong>，输入大模型API的目标地址（如 <code>https://api.openai.com</code>）</p>
-        <p>2. 系统会自动分配一个端口号（4000-5000）</p>
-        <p>3. 在智能体配置中，将大模型网址从 <code>https://xxxx.com/v1</code> 或 <code>http://localhost:11434/v1</code> 改为 <code>http://{{ displayIp }}:&lt;端口号&gt;/v1</code></p>
-        <p>4. 其他配置不变，请求会自动转发到目标地址，同时记录完整的通信内容</p>
-        <p>5. 在 <strong>"查看详情"</strong> 页面可以查看、复制和清空交互历史</p>
+        <p><strong>第 1 步：创建代理端口</strong></p>
+        <p>点击 <strong>"创建新端口"</strong>，输入大模型 API 的目标地址。常见示例：</p>
+        <ul style="margin:4px 0 8px 20px">
+          <li>OpenAI：<code>https://api.openai.com</code></li>
+          <li>Ollama 本地模型：<code>http://localhost:11434</code></li>
+          <li>第三方兼容接口：<code>https://your-api-provider.com</code></li>
+        </ul>
+        <p style="color:#e67e22">⚠️ 注意：只填域名和端口，<strong>不要</strong>带 <code>/v1</code> 路径，系统会自动拼接。</p>
+
+        <p><strong>第 2 步：获取分配的端口号</strong></p>
+        <p>系统会在 4000–5000 范围内自动分配一个空闲端口号，每个用户最多可创建多个端口（上限可通过环境变量配置）。</p>
+
+        <p><strong>第 3 步：修改智能体的 API 地址</strong></p>
+        <p>在你的智能体（Agent）或客户端配置中，将大模型 API 地址改为代理地址：</p>
+        <ul style="margin:4px 0 8px 20px">
+          <li>原来：<code>https://api.openai.com/v1</code> 或 <code>http://localhost:11434/v1</code></li>
+          <li>改为：<code>http://{{ displayIp }}:&lt;端口号&gt;/v1</code></li>
+        </ul>
+        <p>API Key 等其他配置保持不变。如果你的客户端支持自定义 Base URL，只需修改 Base URL 即可。</p>
+
+        <p><strong>第 4 步：开始使用</strong></p>
+        <p>智能体发出的所有请求会自动转发到目标地址，同时系统会完整记录请求头/体、响应头/体、状态码和耗时。支持流式（SSE）和非流式请求。</p>
+
+        <p><strong>第 5 步：查看交互记录</strong></p>
+        <p>点击 <strong>"查看详情"</strong> 进入端口详情页，可以：</p>
+        <ul style="margin:4px 0 0 20px">
+          <li>实时查看所有交互记录（每 2 秒自动刷新）</li>
+          <li>展开单条记录查看完整的请求和响应 JSON</li>
+          <li>切换「纯文本」或「树形查看」模式</li>
+          <li>一键复制 JSON 数据或完整交互内容</li>
+          <li>清空历史记录或删除单条记录</li>
+        </ul>
       </div>
     </div>
 
