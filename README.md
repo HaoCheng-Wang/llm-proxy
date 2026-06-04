@@ -69,7 +69,7 @@ http://your-server-ip:4000/v1/chat/completions
 ### 1. 克隆项目
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/HaoCheng-Wang/llm-proxy.git
 cd llm-proxy
 ```
 
@@ -163,7 +163,7 @@ npm run dev
 ### 1. 准备
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/HaoCheng-Wang/llm-proxy.git
 cd llm-proxy
 cp .env.example .env
 vim .env
