@@ -64,27 +64,83 @@
         </div>
       </div>
 
-      <DynamicScroller
-        :items="requests"
-        :min-item-size="60"
-        class="virtual-scroller"
-        key-field="id"
-      >
-        <template v-slot="{ item, index, active }">
-          <DynamicScrollerItem
-            :item="item"
-            :active="active"
-            :data-index="index"
-          >
-            <RequestCard
-              :req="item"
-              :is-expanded="!!expanded[index]"
-              @toggle="toggleExpandByReq"
-              @delete="handleDeleteRequest"
-            />
-          </DynamicScrollerItem>
-        </template>
-      </DynamicScroller>
+      <div v-for="(req, index) in requests" :key="req.id" class="request-card">
+        <!-- Card Header -->
+        <div class="request-card-header" @click="toggleExpand(index)">
+          <div class="flex gap-12" style="align-items:center">
+            <span class="request-direction" :class="['post','patch','put'].includes(req.method.toLowerCase()) ? 'dir-req' : 'dir-resp'">
+              {{ ['post','patch','put'].includes(req.method.toLowerCase()) ? '📤' : '📥' }}
+            </span>
+            <span :class="['method-tag', 'method-' + req.method.toLowerCase()]">{{ req.method }}</span>
+            <span :class="['status-tag', getStatusClass(req.status_code)]">{{ req.status_code }}</span>
+            <span class="req-path">{{ req.path.length > 60 ? req.path.slice(0, 60) + '...' : req.path }}</span>
+            <span v-if="req.duration_ms" class="text-sm text-muted">{{ req.duration_ms }}ms</span>
+          </div>
+          <div class="flex gap-8" style="align-items:center">
+            <button class="btn btn-sm" style="color:#e74c3c;font-size:11px;padding:2px 6px;background:transparent;border:1px solid rgba(231,76,60,0.3);border-radius:4px"
+                    @click.stop="handleDeleteRequest(req, index)"
+                    title="删除此条记录">
+              ✕
+            </button>
+            <span class="text-sm text-muted">{{ formatTime(req.created_at) }}</span>
+            <span style="color:#85929e;font-size:12px">{{ expanded[index] ? '▲' : '▼' }}</span>
+          </div>
+        </div>
+
+        <!-- Expanded Body -->
+        <div v-if="expanded[index]" class="request-card-body">
+          <!-- View mode toggle -->
+          <div style="margin-bottom:8px;display:flex;gap:8px">
+            <button class="btn btn-sm" :class="treeView[index] ? 'btn-outline' : 'btn-primary'" @click.stop="treeView[index] = false">
+              📝 纯文本
+            </button>
+            <button class="btn btn-sm" :class="treeView[index] ? 'btn-primary' : 'btn-outline'" @click.stop="treeView[index] = true">
+              🌳 树形查看
+            </button>
+          </div>
+          <div class="json-panels">
+            <!-- Request JSON -->
+            <div class="json-panel json-panel-request">
+              <div class="json-panel-header">
+                <span>📤 请求 JSON</span>
+              </div>
+              <div class="json-tree-wrapper">
+                <JsonTree v-if="treeView[index] && parseJsonOrNull(req.request_body) !== null"
+                          :data="parseJsonOrNull(req.request_body)" />
+                <pre v-else class="json-content">{{ formatJson(req.request_body) }}</pre>
+              </div>
+            </div>
+            <!-- Response JSON -->
+            <div class="json-panel json-panel-response">
+              <div class="json-panel-header">
+                <span>📥 响应 JSON</span>
+              </div>
+              <div class="json-tree-wrapper">
+                <JsonTree v-if="treeView[index] && parseJsonOrNull(req.response_body) !== null"
+                          :data="parseJsonOrNull(req.response_body)" />
+                <pre v-else class="json-content">{{ formatJson(req.response_body) }}</pre>
+              </div>
+            </div>
+          </div>
+
+          <!-- Headers toggle -->
+          <div class="headers-section">
+            <button class="btn btn-outline btn-sm" @click.stop="headersExpanded[index] = !headersExpanded[index]">
+              {{ headersExpanded[index] ? '🔽 隐藏HTTP头' : '🔍 查看HTTP头' }}
+            </button>
+            <div v-if="headersExpanded[index]" class="headers-grid">
+              <div>
+                <div class="section-label">📤 请求头</div>
+                <pre class="headers-pre">{{ formatJson(req.request_headers) }}</pre>
+              </div>
+              <div>
+                <div class="section-label">📥 响应头</div>
+                <pre class="headers-pre">{{ formatJson(req.response_headers) }}</pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div v-else class="card empty-state">
@@ -104,9 +160,8 @@
 <script setup>
 import { ref, reactive, onMounted, onUnmounted, inject, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
-import { DynamicScroller, DynamicScrollerItem } from 'vue-virtual-scroller'
 import api from '../api'
-import RequestCard from '../components/RequestCard.vue'
+import JsonTree from '../components/JsonTree.vue'
 
 const route = useRoute()
 const showToast = inject('showToast')
@@ -116,6 +171,8 @@ const portId = route.params.id
 const data = ref({ port: null, requests: [] })
 const requests = ref([])
 const expanded = ref({})
+const treeView = ref({})
+const headersExpanded = ref({})
 const copyMenuOpen = ref(false)
 const newCount = ref(0)
 const polling = ref(false)
@@ -214,23 +271,17 @@ function stopPolling() {
   }
 }
 
+function parseJsonOrNull(raw) {
+  if (!raw) return null
+  if (typeof raw === 'object') return raw
+  try { return JSON.parse(raw) } catch (e) { return null }
+}
+
 function toggleExpand(index) {
   expanded.value[index] = !expanded.value[index]
 }
 
-function toggleExpandByReq(req) {
-  const index = requests.value.findIndex(r => r.id === req.id)
-  if (index !== -1) {
-    toggleExpand(index)
-  }
-}
-
 function expandAll() {
-  if (requests.value.length > 5) {
-    if (!confirm(`确定要展开全部 ${requests.value.length} 条记录吗？大量展开可能导致页面卡顿。`)) {
-      return
-    }
-  }
   const next = {}
   requests.value.forEach((_, i) => { next[i] = true })
   expanded.value = next
@@ -238,6 +289,22 @@ function expandAll() {
 
 function collapseAll() {
   expanded.value = {}
+  treeView.value = {}
+  headersExpanded.value = {}
+}
+
+function formatJson(raw) {
+  if (!raw) return '(空)'
+  if (typeof raw === 'object') return JSON.stringify(raw, null, 2)
+  return raw
+}
+
+function getStatusClass(code) {
+  if (!code) return ''
+  if (code < 300) return 'status-2xx'
+  if (code < 400) return 'status-3xx'
+  if (code < 500) return 'status-4xx'
+  return 'status-5xx'
 }
 
 function toggleCopyMenu() { copyMenuOpen.value = !copyMenuOpen.value }
@@ -275,22 +342,11 @@ async function copyAllData() {
   }
 }
 
-async function handleDeleteRequest(req) {
+async function handleDeleteRequest(req, index) {
   if (!confirm(`确定删除 ${req.method} ${req.path.slice(0, 40)} 这条记录吗？`)) return
   try {
     await api.deleteRequest(portId, req.id)
-    const index = requests.value.findIndex(r => r.id === req.id)
-    if (index !== -1) {
-      requests.value.splice(index, 1)
-      // Rebuild expanded map since indices shifted
-      const newExpanded = {}
-      Object.keys(expanded.value).forEach(k => {
-        const i = parseInt(k)
-        if (i < index) newExpanded[i] = expanded.value[i]
-        else if (i > index) newExpanded[i - 1] = expanded.value[i]
-      })
-      expanded.value = newExpanded
-    }
+    requests.value.splice(index, 1)
     newCount.value = Math.max(0, newCount.value - 1)
     showToast('已删除', 'success')
   } catch (e) {
@@ -336,10 +392,3 @@ onUnmounted(() => {
   stopPolling()
 })
 </script>
-
-<style scoped>
-.virtual-scroller {
-  max-height: calc(100vh - 280px);
-  overflow-y: auto;
-}
-</style>
