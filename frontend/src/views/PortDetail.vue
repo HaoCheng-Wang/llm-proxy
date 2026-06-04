@@ -63,9 +63,9 @@
         </div>
       </div>
 
-      <div v-for="(req, index) in requests" :key="req.id" class="request-card">
+      <div v-for="req in requests" :key="req.id" class="request-card">
         <!-- Card Header -->
-        <div class="request-card-header" @click="toggleExpand(index)">
+        <div class="request-card-header" @click="toggleExpand(req.id)">
           <div class="flex gap-12" style="align-items:center">
             <span class="request-direction" :class="['post','patch','put'].includes(req.method.toLowerCase()) ? 'dir-req' : 'dir-resp'">
               {{ ['post','patch','put'].includes(req.method.toLowerCase()) ? '📤' : '📥' }}
@@ -77,33 +77,33 @@
           </div>
           <div class="flex gap-8" style="align-items:center">
             <button class="btn btn-sm" style="color:#e74c3c;font-size:11px;padding:2px 6px;background:transparent;border:1px solid rgba(231,76,60,0.3);border-radius:4px"
-                    @click.stop="handleDeleteRequest(req, index)"
+                    @click.stop="handleDeleteRequest(req)"
                     title="删除此条记录">
               ✕
             </button>
             <span class="text-sm text-muted">{{ formatTime(req.created_at) }}</span>
-            <span style="color:#85929e;font-size:12px">{{ expanded[index] ? '▲' : '▼' }}</span>
+            <span style="color:#85929e;font-size:12px">{{ expanded[req.id] ? '▲' : '▼' }}</span>
           </div>
         </div>
 
         <!-- Expanded Body -->
-        <div v-if="expanded[index]" class="request-card-body"
+        <div v-if="expanded[req.id]" class="request-card-body"
              @mouseenter="scrollLocked = true" @mouseleave="scrollLocked = false">
           <!-- Toolbar: view mode + headers toggle -->
           <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
-            <button class="btn btn-sm" :class="treeView[index] ? 'btn-outline' : 'btn-primary'" @click.stop="treeView[index] = false">
+            <button class="btn btn-sm" :class="treeView[req.id] ? 'btn-outline' : 'btn-primary'" @click.stop="treeView[req.id] = false">
               📝 纯文本
             </button>
-            <button class="btn btn-sm" :class="treeView[index] ? 'btn-primary' : 'btn-outline'" @click.stop="treeView[index] = true">
+            <button class="btn btn-sm" :class="treeView[req.id] ? 'btn-primary' : 'btn-outline'" @click.stop="treeView[req.id] = true">
               🌳 树形查看
             </button>
-            <button class="btn btn-outline btn-sm" @click.stop="headersExpanded[index] = !headersExpanded[index]">
-              {{ headersExpanded[index] ? '🔽 隐藏HTTP头' : '🔍 查看HTTP头' }}
+            <button class="btn btn-outline btn-sm" @click.stop="headersExpanded[req.id] = !headersExpanded[req.id]">
+              {{ headersExpanded[req.id] ? '🔽 隐藏HTTP头' : '🔍 查看HTTP头' }}
             </button>
           </div>
 
           <!-- Headers (shown above JSON when expanded) -->
-          <div v-if="headersExpanded[index]" class="headers-grid" style="margin-bottom:12px">
+          <div v-if="headersExpanded[req.id]" class="headers-grid" style="margin-bottom:12px">
             <div>
               <div class="section-label">📤 请求头</div>
               <pre class="headers-pre">{{ formatJson(req.request_headers) }}</pre>
@@ -122,7 +122,7 @@
                 <span>📤 请求 JSON</span>
               </div>
               <div class="json-tree-wrapper">
-                <JsonTree v-if="treeView[index] && parseJsonOrNull(req.request_body) !== null"
+                <JsonTree v-if="treeView[req.id] && parseJsonOrNull(req.request_body) !== null"
                           :data="parseJsonOrNull(req.request_body)" />
                 <pre v-else class="json-content">{{ formatJson(req.request_body) }}</pre>
               </div>
@@ -130,10 +130,10 @@
             <!-- Response JSON -->
             <div class="json-panel json-panel-response">
               <div class="json-panel-header">
-                <span>📥 响应 JSON</span>
+                <span> 响应 JSON</span>
               </div>
               <div class="json-tree-wrapper">
-                <JsonTree v-if="treeView[index] && parseJsonOrNull(req.response_body) !== null"
+                <JsonTree v-if="treeView[req.id] && parseJsonOrNull(req.response_body) !== null"
                           :data="parseJsonOrNull(req.response_body)" />
                 <pre v-else class="json-content">{{ formatJson(req.response_body) }}</pre>
               </div>
@@ -312,8 +312,8 @@ function parseJsonOrNull(raw) {
   try { return JSON.parse(raw) } catch (e) { return null }
 }
 
-function toggleExpand(index) {
-  expanded.value[index] = !expanded.value[index]
+function toggleExpand(reqId) {
+  expanded.value[reqId] = !expanded.value[reqId]
 }
 
 function collapseAll() {
@@ -371,11 +371,12 @@ async function copyAllData() {
   }
 }
 
-async function handleDeleteRequest(req, index) {
+async function handleDeleteRequest(req) {
   if (!confirm(`确定删除 ${req.method} ${req.path.slice(0, 40)} 这条记录吗？`)) return
   try {
     await api.deleteRequest(portId, req.id)
-    requests.value.splice(index, 1)
+    const idx = requests.value.findIndex(r => r.id === req.id)
+    if (idx !== -1) requests.value.splice(idx, 1)
     newCount.value = Math.max(0, newCount.value - 1)
     showToast('已删除', 'success')
   } catch (e) {
