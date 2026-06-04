@@ -279,8 +279,11 @@ llm-proxy/
 |------|------|------|
 | `POST` | `/api/ports` | 创建代理端口 |
 | `GET` | `/api/ports` | 端口列表（admin 看全部） |
-| `GET` | `/api/ports/{id}?since_id=N&limit=20&offset=0` | 交互历史（`since_id` 增量轮询，`limit`/`offset` 分页，默认 20 条） |
+| `GET` | `/api/ports/active-ports` | 活跃端口号列表（内部用） |
+| `GET` | `/api/ports/{id}?since_id=N&limit=20&offset=0` | 交互历史（`since_id` 增量轮询，`limit`/`offset` 分页，默认 20 条，最大 100） |
 | `DELETE` | `/api/ports/{id}` | 删除端口 |
+| `POST` | `/api/ports/{id}/stop` | 停止端口代理 |
+| `POST` | `/api/ports/{id}/start` | 启动端口代理 |
 | `DELETE` | `/api/ports/{id}/history` | 清空历史 |
 | `DELETE` | `/api/ports/{id}/history/{request_id}` | 删除单条记录 |
 | `GET` | `/api/ports/{id}/export` | 导出全量数据 |
