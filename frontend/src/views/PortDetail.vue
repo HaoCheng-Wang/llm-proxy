@@ -172,7 +172,7 @@ const hasMore = ref(false)
 let _maxId = 0
 let _pollTimer = null
 let _offset = 0
-const PAGE_SIZE = 20
+const PAGE_SIZE = 10
 
 // Click-outside directive
 const vClickOutside = {
@@ -197,10 +197,8 @@ async function loadData() {
     _maxId = requests.value.length > 0 ? Math.max(...requests.value.map(r => r.id)) : 0
     _offset = requests.value.length
     hasMore.value = _offset < (data.value.port?.request_count || 0)
-    // Auto expand first 3
-    const nextExpanded = {}
-    requests.value.forEach((_, i) => { if (i < 3) nextExpanded[i] = true })
-    expanded.value = nextExpanded
+    // Don't auto-expand any cards for faster initial render
+    expanded.value = {}
     newCount.value = 0
   } catch (e) {
     showToast('加载数据失败', 'error')
@@ -367,12 +365,16 @@ function formatTime(t) {
 }
 
 onMounted(async () => {
-  try {
-    const cfg = await api.getConfig()
+  // Load config and data in parallel for faster initial render
+  const configPromise = api.getConfig().then(cfg => {
     displayIp.value = cfg.display_ip
-  } catch (e) { /* keep default */ }
+  }).catch(() => { /* keep default */ })
+
   await loadData()
   startPolling()
+
+  // Wait for config to finish (non-blocking)
+  await configPromise
 })
 
 onUnmounted(() => {
