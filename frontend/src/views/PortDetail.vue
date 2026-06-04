@@ -88,7 +88,8 @@
         </div>
 
         <!-- Expanded Body -->
-        <div v-if="expanded[index]" class="request-card-body">
+        <div v-if="expanded[index]" class="request-card-body"
+             @mouseenter="readingJson = true" @mouseleave="readingJson = false">
           <!-- Toolbar: view mode + headers toggle -->
           <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
             <button class="btn btn-sm" :class="treeView[index] ? 'btn-outline' : 'btn-primary'" @click.stop="treeView[index] = false">
@@ -148,10 +149,10 @@
       <p>配置智能体连接到该端口后，所有API通信将在此显示</p>
     </div>
 
-    <!-- Load More -->
+    <!-- Load All -->
     <div v-if="hasMore" style="text-align:center;margin-top:16px">
-      <button class="btn btn-outline" @click="loadMore" :disabled="loadingMore">
-        {{ loadingMore ? '加载中...' : `加载更多 (${data.port.request_count - requests.length} 条剩余)` }}
+      <button class="btn btn-outline" @click="loadAll" :disabled="loadingMore">
+        {{ loadingMore ? '加载中...' : `加载全部 (${data.port.request_count - requests.length} 条剩余)` }}
       </button>
     </div>
   </div>
@@ -178,11 +179,30 @@ const newCount = ref(0)
 const polling = ref(false)
 const loadingMore = ref(false)
 const hasMore = ref(false)
+const readingJson = ref(false)
 
 let _maxId = 0
 let _pollTimer = null
 let _offset = 0
 const PAGE_SIZE = 10
+
+// Prevent page scroll when user is reading JSON content
+function _onWheel(e) {
+  if (readingJson.value) {
+    // Check if the target is inside a scrollable JSON panel
+    const jsonPanel = e.target.closest('.json-tree-wrapper, .headers-pre')
+    if (jsonPanel) {
+      const { scrollTop, scrollHeight, clientHeight } = jsonPanel
+      const atTop = scrollTop <= 0
+      const atBottom = scrollTop + clientHeight >= scrollHeight - 1
+      // If the JSON panel can scroll and isn't at boundary, let it scroll
+      if (scrollHeight > clientHeight && !((e.deltaY < 0 && atTop) || (e.deltaY > 0 && atBottom))) {
+        return // Let the JSON panel handle scroll
+      }
+    }
+    e.preventDefault()
+  }
+}
 
 // Click-outside directive
 const vClickOutside = {
@@ -215,19 +235,22 @@ async function loadData() {
   }
 }
 
-async function loadMore() {
+async function loadAll() {
   if (loadingMore.value || !hasMore.value) return
   loadingMore.value = true
   try {
-    const result = await api.getPortHistory(portId, 0, PAGE_SIZE, _offset)
-    const newReqs = result.requests || []
-    if (newReqs.length > 0) {
-      requests.value = [...requests.value, ...newReqs]
-      _offset += newReqs.length
+    const result = await api.getPortHistory(portId, 0, 0, 0, true)
+    const allReqs = result.requests || []
+    // Replace with all records from server
+    requests.value = allReqs
+    _offset = allReqs.length
+    hasMore.value = false
+    if (result.port?.request_count !== undefined) {
+      data.value.port.request_count = result.port.request_count
     }
-    hasMore.value = _offset < (data.value.port?.request_count || 0)
+    showToast(`已加载全部 ${allReqs.length} 条记录`, 'success')
   } catch (e) {
-    showToast('加载更多失败', 'error')
+    showToast('加载全部失败', 'error')
   } finally {
     loadingMore.value = false
   }
@@ -242,6 +265,11 @@ async function pollNewRecords() {
     if (newReqs.length > 0) {
       // Get the highest new id
       _maxId = Math.max(_maxId, ...newReqs.map(r => r.id))
+
+      // Preserve scroll position when user is reading
+      const scrollY = window.scrollY
+      const wasReading = readingJson.value
+
       // Prepend new records
       requests.value = [...newReqs, ...requests.value]
       _offset += newReqs.length
@@ -251,6 +279,13 @@ async function pollNewRecords() {
         data.value.port.request_count = result.port.request_count
       }
       hasMore.value = _offset < (data.value.port?.request_count || 0)
+
+      // If user was reading, restore scroll position after DOM update
+      if (wasReading) {
+        await nextTick()
+        window.scrollTo(0, scrollY)
+      }
+
       showToast(`收到 ${newReqs.length} 条新交互记录`, 'info')
     }
   } catch (e) {
@@ -384,11 +419,15 @@ onMounted(async () => {
   await loadData()
   startPolling()
 
+  // Prevent page scroll when reading JSON (passive: false required for preventDefault)
+  document.addEventListener('wheel', _onWheel, { passive: false })
+
   // Wait for config to finish (non-blocking)
   await configPromise
 })
 
 onUnmounted(() => {
   stopPolling()
+  document.removeEventListener('wheel', _onWheel)
 })
 </script>

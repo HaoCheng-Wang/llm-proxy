@@ -205,12 +205,14 @@ def get_port_history(
     since_id: int = 0,
     limit: int = 20,
     offset: int = 0,
+    load_all: bool = False,
     current_user: User = Depends(require_approved),
     db: Session = Depends(get_db),
 ):
     """Get detailed history for a specific port.
     If since_id > 0, only return records with id > since_id (for incremental polling).
-    Supports pagination via limit (default 20, max 100) and offset."""
+    Supports pagination via limit (default 20, max 100) and offset.
+    If load_all is true, returns all records (bypasses limit cap)."""
     port = db.query(Port).filter(Port.id == port_id).first()
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
@@ -228,9 +230,12 @@ def get_port_history(
     )
     if since_id > 0:
         query = query.filter(RequestModel.id > since_id)
-    # Cap limit to prevent huge responses
-    limit = min(max(limit, 1), 100)
-    requests = query.order_by(RequestModel.created_at.desc()).offset(offset).limit(limit).all()
+    if load_all:
+        requests = query.order_by(RequestModel.created_at.desc()).all()
+    else:
+        # Cap limit to prevent huge responses
+        limit = min(max(limit, 1), 100)
+        requests = query.order_by(RequestModel.created_at.desc()).offset(offset).limit(limit).all()
 
     # Get creator username
     creator = db.query(User).filter(User.id == port.user_id).first()
