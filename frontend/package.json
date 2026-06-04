@@ -1,0 +1,22 @@
+{
+  "name": "llm-proxy-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 3999",
+    "build": "vite build",
+    "preview": "vite preview --port 3999"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "pinia": "^2.1.0",
+    "vue": "^3.4.0",
+    "vue-json-pretty": "^2.6.0",
+    "vue-router": "^4.3.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.0",
+    "vite": "^5.4.0"
+  }
+}
