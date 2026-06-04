@@ -223,7 +223,7 @@ llm-proxy/
 ├── .dockerignore
 ├── Dockerfile               # 多阶段构建（前端→后端）
 ├── docker-compose.yml       # 2 容器编排
-├── LICENSE                  # MIT 许可证
+├── LICENSE                  # AGPL-3.0 许可证
 ├── nginx.conf               # 前端 nginx 配置
 ├── pyproject.toml           # uv 项目定义
 ├── README.md
@@ -350,4 +350,4 @@ certbot --nginx -d your-domain.com
 - 将本项目集成到闭源商业产品中
 - 无需遵守 AGPL 的 copyleft 条款
 
-**联系方式：** [请替换为你的邮箱或联系方式]
+**联系方式：** hcwang0025@163.com
