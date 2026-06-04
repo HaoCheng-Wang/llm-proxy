@@ -38,8 +38,11 @@ export default {
   // Ports
   listPorts: () => http.get('/ports').then(r => r.data),
   createPort: (data) => http.post('/ports', data).then(r => r.data),
-  getPortHistory: (portId, sinceId = 0) => {
-    const params = sinceId > 0 ? { since_id: sinceId } : {}
+  getPortHistory: (portId, sinceId = 0, limit = 20, offset = 0) => {
+    const params = {}
+    if (sinceId > 0) params.since_id = sinceId
+    if (limit !== 20) params.limit = limit
+    if (offset > 0) params.offset = offset
     return http.get(`/ports/${portId}`, { params }).then(r => r.data)
   },
   deletePort: (portId) => http.delete(`/ports/${portId}`).then(r => r.data),
