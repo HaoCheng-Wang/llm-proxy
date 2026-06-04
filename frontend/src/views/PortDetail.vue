@@ -59,7 +59,6 @@
           </span>
         </h3>
         <div class="flex gap-8">
-          <button class="btn btn-outline btn-sm" @click="expandAll">全部展开</button>
           <button class="btn btn-outline btn-sm" @click="collapseAll">全部折叠</button>
         </div>
       </div>
@@ -89,7 +88,7 @@
 
         <!-- Expanded Body -->
         <div v-if="expanded[index]" class="request-card-body"
-             @mouseenter="readingJson = true" @mouseleave="readingJson = false">
+             @mouseenter="scrollLocked = true" @mouseleave="scrollLocked = false">
           <!-- Toolbar: view mode + headers toggle -->
           <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
             <button class="btn btn-sm" :class="treeView[index] ? 'btn-outline' : 'btn-primary'" @click.stop="treeView[index] = false">
@@ -149,10 +148,13 @@
       <p>配置智能体连接到该端口后，所有API通信将在此显示</p>
     </div>
 
-    <!-- Load All -->
-    <div v-if="hasMore" style="text-align:center;margin-top:16px">
-      <button class="btn btn-outline" @click="loadAll" :disabled="loadingMore">
-        {{ loadingMore ? '加载中...' : `加载全部 (${data.port.request_count - requests.length} 条剩余)` }}
+    <!-- Load More -->
+    <div v-if="hasMore" style="text-align:center;margin-top:16px;display:flex;gap:12px;justify-content:center">
+      <button class="btn btn-outline" @click="loadMore" :disabled="loadingMore">
+        {{ loadingMore ? '加载中...' : `加载更多 (${data.port.request_count - requests.length} 条剩余)` }}
+      </button>
+      <button class="btn btn-primary" @click="loadAll" :disabled="loadingMore">
+        {{ loadingMore ? '加载中...' : '加载全部' }}
       </button>
     </div>
   </div>
@@ -179,30 +181,12 @@ const newCount = ref(0)
 const polling = ref(false)
 const loadingMore = ref(false)
 const hasMore = ref(false)
-const readingJson = ref(false)
+const scrollLocked = ref(false)
 
 let _maxId = 0
 let _pollTimer = null
 let _offset = 0
 const PAGE_SIZE = 10
-
-// Prevent page scroll when user is reading JSON content
-function _onWheel(e) {
-  if (readingJson.value) {
-    // Check if the target is inside a scrollable JSON panel
-    const jsonPanel = e.target.closest('.json-tree-wrapper, .headers-pre')
-    if (jsonPanel) {
-      const { scrollTop, scrollHeight, clientHeight } = jsonPanel
-      const atTop = scrollTop <= 0
-      const atBottom = scrollTop + clientHeight >= scrollHeight - 1
-      // If the JSON panel can scroll and isn't at boundary, let it scroll
-      if (scrollHeight > clientHeight && !((e.deltaY < 0 && atTop) || (e.deltaY > 0 && atBottom))) {
-        return // Let the JSON panel handle scroll
-      }
-    }
-    e.preventDefault()
-  }
-}
 
 // Click-outside directive
 const vClickOutside = {
@@ -235,20 +219,37 @@ async function loadData() {
   }
 }
 
+async function loadMore() {
+  if (loadingMore.value || !hasMore.value) return
+  loadingMore.value = true
+  try {
+    const result = await api.getPortHistory(portId, 0, PAGE_SIZE, _offset)
+    const newReqs = result.requests || []
+    if (newReqs.length > 0) {
+      requests.value = [...requests.value, ...newReqs]
+      _offset += newReqs.length
+    }
+    hasMore.value = _offset < (data.value.port?.request_count || 0)
+  } catch (e) {
+    showToast('加载更多失败', 'error')
+  } finally {
+    loadingMore.value = false
+  }
+}
+
 async function loadAll() {
   if (loadingMore.value || !hasMore.value) return
   loadingMore.value = true
   try {
-    const result = await api.getPortHistory(portId, 0, 0, 0, true)
-    const allReqs = result.requests || []
-    // Replace with all records from server
-    requests.value = allReqs
-    _offset = allReqs.length
-    hasMore.value = false
-    if (result.port?.request_count !== undefined) {
-      data.value.port.request_count = result.port.request_count
+    // Load in batches of 100 (backend max) until all records are fetched
+    while (hasMore.value) {
+      const result = await api.getPortHistory(portId, 0, 100, _offset)
+      const newReqs = result.requests || []
+      if (newReqs.length === 0) break
+      requests.value = [...requests.value, ...newReqs]
+      _offset += newReqs.length
+      hasMore.value = _offset < (data.value.port?.request_count || 0)
     }
-    showToast(`已加载全部 ${allReqs.length} 条记录`, 'success')
   } catch (e) {
     showToast('加载全部失败', 'error')
   } finally {
@@ -266,9 +267,8 @@ async function pollNewRecords() {
       // Get the highest new id
       _maxId = Math.max(_maxId, ...newReqs.map(r => r.id))
 
-      // Preserve scroll position when user is reading
-      const scrollY = window.scrollY
-      const wasReading = readingJson.value
+      // If user is reading (scroll locked), preserve scroll position
+      const savedScrollY = scrollLocked.value ? window.scrollY : null
 
       // Prepend new records
       requests.value = [...newReqs, ...requests.value]
@@ -280,10 +280,10 @@ async function pollNewRecords() {
       }
       hasMore.value = _offset < (data.value.port?.request_count || 0)
 
-      // If user was reading, restore scroll position after DOM update
-      if (wasReading) {
+      // Restore scroll position after Vue re-renders
+      if (savedScrollY !== null) {
         await nextTick()
-        window.scrollTo(0, scrollY)
+        window.scrollTo(0, savedScrollY)
       }
 
       showToast(`收到 ${newReqs.length} 条新交互记录`, 'info')
@@ -314,12 +314,6 @@ function parseJsonOrNull(raw) {
 
 function toggleExpand(index) {
   expanded.value[index] = !expanded.value[index]
-}
-
-function expandAll() {
-  const next = {}
-  requests.value.forEach((_, i) => { next[i] = true })
-  expanded.value = next
 }
 
 function collapseAll() {
@@ -419,15 +413,11 @@ onMounted(async () => {
   await loadData()
   startPolling()
 
-  // Prevent page scroll when reading JSON (passive: false required for preventDefault)
-  document.addEventListener('wheel', _onWheel, { passive: false })
-
   // Wait for config to finish (non-blocking)
   await configPromise
 })
 
 onUnmounted(() => {
   stopPolling()
-  document.removeEventListener('wheel', _onWheel)
 })
 </script>
