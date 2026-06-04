@@ -21,11 +21,11 @@
         <!-- Copy dropdown -->
         <div class="copy-dropdown" v-click-outside="closeCopyMenu">
           <button class="btn btn-success btn-sm" @click="toggleCopyMenu">
-            📋 一键复制 ▾
+            � 一键导出 ▾
           </button>
           <div v-if="copyMenuOpen" class="copy-menu">
-            <div class="copy-menu-item" @click="copyJsonOnly">📄 仅复制JSON数据</div>
-            <div class="copy-menu-item" @click="copyAllData">📦 复制全部交互数据</div>
+            <div class="copy-menu-item" @click="exportJsonOnly">📄 仅导出JSON数据</div>
+            <div class="copy-menu-item" @click="exportAllData">📦 导出全部交互数据</div>
           </div>
         </div>
         <button class="btn btn-danger btn-sm" @click="clearHistory">
@@ -339,7 +339,25 @@ function getStatusClass(code) {
 function toggleCopyMenu() { copyMenuOpen.value = !copyMenuOpen.value }
 function closeCopyMenu() { copyMenuOpen.value = false }
 
-async function copyJsonOnly() {
+function downloadJson(filename, data) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+function getExportFilename(suffix) {
+  const port = data.value.port?.port_number || 'unknown'
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  return `llm-proxy-port${port}-${suffix}-${ts}.json`
+}
+
+function exportJsonOnly() {
   closeCopyMenu()
   try {
     const output = requests.value.map((r, i) => {
@@ -348,25 +366,25 @@ async function copyJsonOnly() {
       try { entry.response = JSON.parse(r.response_body) } catch (e) { entry.response = r.response_body }
       return entry
     })
-    await navigator.clipboard.writeText(JSON.stringify(output, null, 2))
-    showToast(`已复制 ${output.length} 条JSON数据到剪贴板`, 'success')
+    downloadJson(getExportFilename('json-only'), output)
+    showToast(`已导出 ${output.length} 条JSON数据`, 'success')
   } catch (e) {
-    showToast('复制失败', 'error')
+    showToast('导出失败', 'error')
   }
 }
 
-async function copyAllData() {
+async function exportAllData() {
   closeCopyMenu()
   try {
     const exportData = await api.exportPortHistory(portId)
-    await navigator.clipboard.writeText(JSON.stringify(exportData, null, 2))
-    showToast(`已复制 ${exportData.total_requests} 条完整交互记录到剪贴板`, 'success')
+    downloadJson(getExportFilename('full'), exportData)
+    showToast(`已导出 ${exportData.total_requests} 条完整交互记录`, 'success')
   } catch (e) {
     try {
-      await navigator.clipboard.writeText(JSON.stringify(data.value, null, 2))
-      showToast('已复制全部数据到剪贴板', 'success')
+      downloadJson(getExportFilename('full'), data.value)
+      showToast('已导出全部数据', 'success')
     } catch (e2) {
-      showToast('复制失败，请手动选择文本复制', 'error')
+      showToast('导出失败', 'error')
     }
   }
 }
