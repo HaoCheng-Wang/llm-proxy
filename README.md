@@ -216,50 +216,63 @@ services:
 
 ```
 llm-proxy/
-├── .env                     # 环境变量（不提交 git）
-├── .env.example             # 环境变量模板
-├── .gitignore
-├── .gitattributes
-├── .dockerignore
+├── .env.example             # 环境变量模板（复制为 .env 后修改）
+├── .gitignore               # Git 忽略规则
+├── .gitattributes           # 统一换行符为 LF
+├── .dockerignore            # Docker 构建忽略规则
 ├── Dockerfile               # 多阶段构建（前端→后端）
 ├── docker-compose.yml       # 2 容器编排
 ├── LICENSE                  # AGPL-3.0 许可证
 ├── nginx.conf               # 前端 nginx 配置
-├── pyproject.toml           # uv 项目定义
+├── pyproject.toml           # uv 项目定义 + Python 依赖声明
 ├── README.md
 │
-├── backend/                 # Python FastAPI
-│   ├── main.py              # 入口
-│   ├── config.py            # 读取 .env
-│   ├── database.py          # 自动建库建表 + 连接池
-│   ├── models.py            # ORM 模型
-│   ├── schemas.py           # Pydantic 模型
-│   ├── auth.py              # JWT + bcrypt
-│   ├── proxy_app.py         # 代理核心
-│   ├── proxy_manager.py     # 多端口管理
-│   ├── requirements.txt     # pip 兼容
+├── backend/                 # Python FastAPI 后端
+│   ├── main.py              # 入口：启动管理 API + 初始化数据库
+│   ├── config.py            # 读取 .env 环境变量
+│   ├── database.py          # 自动建库建表 + 连接池 + 索引迁移
+│   ├── models.py            # SQLAlchemy ORM 模型
+│   ├── schemas.py           # Pydantic 请求/响应模型
+│   ├── auth.py              # JWT 认证 + bcrypt 密码哈希
+│   ├── proxy_app.py         # 代理核心：拦截、转发、记录
+│   ├── proxy_manager.py     # 多端口动态管理
+│   ├── requirements.txt     # pip 依赖（与 pyproject.toml 同步）
 │   └── routers/
-│       ├── auth_router.py
-│       ├── admin_router.py
-│       ├── ports_router.py
-│       └── config_router.py
+│       ├── __init__.py
+│       ├── auth_router.py   # 注册/登录/用户信息
+│       ├── admin_router.py  # 用户审批/管理
+│       ├── ports_router.py  # 端口 CRUD + 历史查询
+│       └── config_router.py # 前端配置（display_ip）
 │
-└── frontend/                # Vue 3
-    ├── package.json
-    ├── vite.config.js
+└── frontend/                # Vue 3 前端
+    ├── index.html           # HTML 入口
+    ├── package.json         # npm 依赖
+    ├── package-lock.json    # npm 锁定文件
+    ├── vite.config.js       # Vite 构建配置
     └── src/
+        ├── App.vue          # 根组件
+        ├── main.js          # Vue 入口
+        ├── style.css        # 全局样式
+        ├── api/index.js     # Axios API 封装
         ├── components/
         │   └── JsonTree.vue # JSON 树形查看器
         ├── views/
-        │   ├── Login.vue
-        │   ├── Register.vue
-        │   ├── Dashboard.vue
-        │   ├── PortDetail.vue
-        │   └── Admin.vue
-        ├── api/index.js
-        ├── stores/auth.js
-        └── router/index.js
+        │   ├── Login.vue    # 登录页
+        │   ├── Register.vue # 注册页
+        │   ├── Dashboard.vue# 端口列表 + 使用说明
+        │   ├── PortDetail.vue# 交互记录详情
+        │   └── Admin.vue    # 管理员面板
+        ├── stores/auth.js   # Pinia 认证状态
+        └── router/index.js  # Vue Router 路由
 ```
+
+> **以下文件/目录仅存在于本地开发环境，不会提交到 Git：**
+> - `.env` — 包含数据库密码、JWT 密钥等敏感配置
+> - `backend/__pycache__/` — Python 字节码缓存
+> - `frontend/node_modules/` — npm 依赖
+> - `frontend/dist/` — 前端构建产物
+> - `frontend/.vite/` — Vite 开发缓存
+> - `.venv/` — Python 虚拟环境（uv 创建）
 
 ---
 
