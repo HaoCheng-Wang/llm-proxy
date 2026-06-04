@@ -219,9 +219,11 @@ llm-proxy/
 ├── .env                     # 环境变量（不提交 git）
 ├── .env.example             # 环境变量模板
 ├── .gitignore
+├── .gitattributes
 ├── .dockerignore
 ├── Dockerfile               # 多阶段构建（前端→后端）
 ├── docker-compose.yml       # 2 容器编排
+├── LICENSE                  # MIT 许可证
 ├── nginx.conf               # 前端 nginx 配置
 ├── pyproject.toml           # uv 项目定义
 ├── README.md
@@ -303,7 +305,7 @@ llm-proxy/
 
 ### HTTPS
 
-默认 `nginx.conf` 仅监听 HTTP (80)。生产环境**必须**启用 HTTPS，否则 JWT token 和密码以明文传输。
+默认 `nginx.conf` 仅监听 HTTP (3999)。生产环境**必须**启用 HTTPS，否则 JWT token 和密码以明文传输。
 
 推荐使用 [Let's Encrypt](https://letsencrypt.org/) 免费证书 + [Certbot](https://certbot.eff.org/) 自动续期：
 
@@ -323,4 +325,4 @@ certbot --nginx -d your-domain.com
 
 ### SSRF 防护
 
-系统默认禁止代理目标指向内网地址（localhost、私有 IP 等）。如需代理本地服务进行调试，在 `.env` 中设置 `ALLOW_INTERNAL_TARGETS=true`。
+系统默认允许代理目标指向任意地址（包括内网）。如需部署到公网环境，在 `.env` 中设置 `ALLOW_INTERNAL_TARGETS=false` 以阻止内网访问。
