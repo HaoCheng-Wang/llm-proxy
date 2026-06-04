@@ -79,7 +79,7 @@
       <div style="font-size:14px;line-height:1.8;color:#aeb6bf">
         <p>1. 点击 <strong>"创建新端口"</strong>，输入大模型API的目标地址（如 <code>https://api.openai.com</code>）</p>
         <p>2. 系统会自动分配一个端口号（4000-5000）</p>
-        <p>3. 在智能体配置中，将大模型网址从 <code>https://xxxx.com/v1</code> 改为 <code>http://{{ displayIp }}:&lt;端口号&gt;/v1</code></p>
+        <p>3. 在智能体配置中，将大模型网址从 <code>https://xxxx.com/v1</code> 或 <code>http://localhost:11434/v1</code> 改为 <code>http://{{ displayIp }}:&lt;端口号&gt;/v1</code></p>
         <p>4. 其他配置不变，请求会自动转发到目标地址，同时记录完整的通信内容</p>
         <p>5. 在 <strong>"查看详情"</strong> 页面可以查看、复制和清空交互历史</p>
       </div>
