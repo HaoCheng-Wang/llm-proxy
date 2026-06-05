@@ -58,12 +58,24 @@
             +{{ newCount }} 条新记录
           </span>
         </h3>
-        <div class="flex gap-8">
+        <div class="flex gap-8" style="align-items:center">
+          <!-- Method filter tabs -->
+          <div class="method-filters">
+            <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'all' }" @click="methodFilter = 'all'">
+              全部 ({{ requests.length }})
+            </button>
+            <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'api' }" @click="methodFilter = 'api'">
+              📤 API请求 ({{ apiCount }})
+            </button>
+            <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'other' }" @click="methodFilter = 'other'">
+              🌐 其他 ({{ otherCount }})
+            </button>
+          </div>
           <button class="btn btn-outline btn-sm" @click="collapseAll">全部折叠</button>
         </div>
       </div>
 
-      <div v-for="req in requests" :key="req.id" class="request-card">
+      <div v-for="req in filteredRequests" :key="req.id" class="request-card">
         <!-- Card Header -->
         <div class="request-card-header" @click="toggleExpand(req.id)">
           <div class="flex gap-12" style="align-items:center">
@@ -161,7 +173,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted, inject, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, inject, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import api from '../api'
 import JsonTree from '../components/JsonTree.vue'
@@ -182,6 +194,20 @@ const polling = ref(false)
 const loadingMore = ref(false)
 const hasMore = ref(false)
 const scrollLocked = ref(false)
+const methodFilter = ref('all')
+
+// API requests = POST/PUT/PATCH/DELETE (intelligent agent calls)
+// Other = GET/OPTIONS/HEAD (browser scans, probes, etc.)
+const isApiMethod = (m) => ['post', 'put', 'patch', 'delete'].includes(m.toLowerCase())
+
+const apiCount = computed(() => requests.value.filter(r => isApiMethod(r.method)).length)
+const otherCount = computed(() => requests.value.filter(r => !isApiMethod(r.method)).length)
+
+const filteredRequests = computed(() => {
+  if (methodFilter.value === 'api') return requests.value.filter(r => isApiMethod(r.method))
+  if (methodFilter.value === 'other') return requests.value.filter(r => !isApiMethod(r.method))
+  return requests.value
+})
 
 let _maxId = 0
 let _pollTimer = null

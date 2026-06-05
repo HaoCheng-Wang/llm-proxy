@@ -698,3 +698,33 @@ table tr:hover td {
   background: #2980b9;
   border-color: #2980b9;
 }
+
+/* Method filter tabs in port detail */
+.method-filters {
+  display: flex;
+  gap: 4px;
+  background: rgba(255,255,255,0.05);
+  border-radius: 6px;
+  padding: 3px;
+}
+
+.method-filter-btn {
+  background: transparent !important;
+  border: none !important;
+  color: #85929e !important;
+  font-size: 12px !important;
+  padding: 4px 10px !important;
+  border-radius: 4px !important;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.method-filter-btn:hover {
+  background: rgba(255,255,255,0.08) !important;
+  color: #aeb6bf !important;
+}
+
+.method-filter-btn.active {
+  background: rgba(52,152,219,0.2) !important;
+  color: #5dade2 !important;
+}
