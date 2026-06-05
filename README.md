@@ -7,8 +7,9 @@
 - **多端口代理** (4000–5000)：每用户端口数可通过 `MAX_PORTS_PER_USER` 环境变量配置（默认 10），被占端口自动跳过
 - **全量截获**：请求头/体、响应头/体、状态码、耗时，流式 SSE 自动重组为完整 JSON，原始 SSE 文本保留
 - **实时刷新**：前端每 2 秒轮询，新交互即时出现，无需手动刷新
-- **JSON 树形查看**：折叠/展开、搜索过滤、请求与响应并排展示
-- **一键复制**：可选仅复制 JSON 数据，或完整交互含 HTTP 头
+- **交互分类筛选**：API 请求（POST/PUT/PATCH/DELETE）与其他请求（端口扫描、浏览器预检、健康检查等）分开展示，悬停可查看详情
+- **JSON 树形查看**：请求/响应 JSON 各有独立的树形查看按钮，点击在新标签页中打开专用查看页面，支持折叠/展开、搜索过滤
+- **一键导出**：可选仅导出 JSON 数据或完整交互含 HTTP 头；支持从后端直接导出全量 API 请求，无需前端加载
 - **用户系统**：注册→管理员审批→登录，数据按用户隔离
 - **管理员面板**：查看全部端口及创建者，审批/删除用户
 
@@ -259,11 +260,12 @@ llm-proxy/
         ├── components/
         │   └── JsonTree.vue # JSON 树形查看器
         ├── views/
-        │   ├── Login.vue    # 登录页
-        │   ├── Register.vue # 注册页
-        │   ├── Dashboard.vue# 端口列表 + 使用说明
-        │   ├── PortDetail.vue# 交互记录详情
-        │   └── Admin.vue    # 管理员面板
+        │   ├── Login.vue         # 登录页
+        │   ├── Register.vue      # 注册页
+        │   ├── Dashboard.vue     # 端口列表 + 使用说明
+        │   ├── PortDetail.vue    # 交互记录详情
+        │   ├── JsonTreeViewer.vue# JSON 树形查看（新标签页）
+        │   └── Admin.vue         # 管理员面板
         ├── stores/auth.js   # Pinia 认证状态
         └── router/index.js  # Vue Router 路由
 ```
@@ -301,6 +303,7 @@ llm-proxy/
 | `POST` | `/api/ports/{id}/start` | 启动端口代理 |
 | `DELETE` | `/api/ports/{id}/history` | 清空历史 |
 | `DELETE` | `/api/ports/{id}/history/{request_id}` | 删除单条记录 |
+| `GET` | `/api/ports/{id}/history/{request_id}` | 获取单条记录详情（树形查看页用） |
 | `GET` | `/api/ports/{id}/export` | 导出全量数据 |
 
 ### 管理员
