@@ -5,14 +5,12 @@ import Register from '../views/Register.vue'
 import Dashboard from '../views/Dashboard.vue'
 import PortDetail from '../views/PortDetail.vue'
 import Admin from '../views/Admin.vue'
-import JsonViewer from '../views/JsonViewer.vue'
 
 const routes = [
   { path: '/login', name: 'Login', component: Login, meta: { guest: true } },
   { path: '/register', name: 'Register', component: Register, meta: { guest: true } },
   { path: '/', name: 'Dashboard', component: Dashboard, meta: { auth: true } },
   { path: '/port/:id', name: 'PortDetail', component: PortDetail, meta: { auth: true } },
-  { path: '/json-viewer', name: 'JsonViewer', component: JsonViewer, meta: { auth: true } },
   { path: '/admin', name: 'Admin', component: Admin, meta: { auth: true, admin: true } },
 ]
 
