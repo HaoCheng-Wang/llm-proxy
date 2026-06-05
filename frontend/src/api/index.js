@@ -50,7 +50,10 @@ export default {
   startPort: (portId) => http.post(`/ports/${portId}/start`).then(r => r.data),
   clearPortHistory: (portId) => http.delete(`/ports/${portId}/history`).then(r => r.data),
   deleteRequest: (portId, requestId) => http.delete(`/ports/${portId}/history/${requestId}`).then(r => r.data),
-  exportPortHistory: (portId) => http.get(`/ports/${portId}/export`).then(r => r.data),
+  exportPortHistory: (portId, methodFilter = 'all') => {
+    const params = methodFilter !== 'all' ? { method_filter: methodFilter } : {}
+    return http.get(`/ports/${portId}/export`, { params }).then(r => r.data)
+  },
   getActivePorts: () => http.get('/ports/active-ports').then(r => r.data),
 
   // Admin

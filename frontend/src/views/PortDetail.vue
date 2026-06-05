@@ -20,12 +20,16 @@
         </span>
         <!-- Copy dropdown -->
         <div class="copy-dropdown" v-click-outside="closeCopyMenu">
-          <button class="btn btn-success btn-sm" @click="toggleCopyMenu">
-            � 一键导出 ▾
+          <button class="btn btn-success btn-sm" @click="toggleCopyMenu" title="导出当前显示的记录">
+            📥 一键导出 ▾
           </button>
           <div v-if="copyMenuOpen" class="copy-menu">
+            <div class="copy-menu-hint">导出当前分类下已加载的记录</div>
             <div class="copy-menu-item" @click="exportJsonOnly">📄 仅导出JSON数据</div>
             <div class="copy-menu-item" @click="exportAllData">📦 导出全部交互数据</div>
+            <div class="copy-menu-divider"></div>
+            <div class="copy-menu-hint">直接从后端导出API请求（无需前端加载）</div>
+            <div class="copy-menu-item" @click="exportApiFromServer">🔄 从后端导出全部API请求</div>
           </div>
         </div>
         <button class="btn btn-danger btn-sm" @click="clearHistory">
@@ -428,6 +432,17 @@ async function exportAllData() {
     } catch (e2) {
       showToast('导出失败', 'error')
     }
+  }
+}
+
+async function exportApiFromServer() {
+  closeCopyMenu()
+  try {
+    const exportData = await api.exportPortHistory(portId, 'api')
+    downloadJson(getExportFilename('api-server'), exportData)
+    showToast(`已从后端导出 ${exportData.total_requests} 条API请求记录`, 'success')
+  } catch (e) {
+    showToast('后端导出失败', 'error')
   }
 }
 

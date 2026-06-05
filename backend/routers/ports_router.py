@@ -412,10 +412,15 @@ def delete_single_request(
 @router.get("/{port_id}/export", response_model=dict)
 def export_port_history(
     port_id: int,
+    method_filter: str = "all",
     current_user: User = Depends(require_approved),
     db: Session = Depends(get_db),
 ):
-    """Export all request history for a port as a JSON-serializable structure."""
+    """Export all request history for a port as a JSON-serializable structure.
+    
+    Args:
+        method_filter: 'all' (default) or 'api' (POST/PUT/PATCH/DELETE only).
+    """
     port = db.query(Port).filter(Port.id == port_id).first()
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
@@ -426,6 +431,11 @@ def export_port_history(
     requests = db.query(RequestModel).filter(
         RequestModel.port_id == port.id
     ).order_by(RequestModel.created_at.asc()).all()
+
+    # Apply method filter
+    if method_filter == "api":
+        api_methods = {"POST", "PUT", "PATCH", "DELETE"}
+        requests = [r for r in requests if r.method.upper() in api_methods]
 
     export_data = {
         "port": {
