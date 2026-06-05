@@ -28,8 +28,8 @@
             <div class="copy-menu-item" @click="exportJsonOnly">📄 仅导出JSON数据</div>
             <div class="copy-menu-item" @click="exportAllData">📦 导出全部交互数据</div>
             <div class="copy-menu-divider"></div>
-            <div class="copy-menu-hint">直接从后端导出API请求（无需前端加载）</div>
-            <div class="copy-menu-item" @click="exportApiFromServer">🔄 从后端导出全部API请求</div>
+            <div class="copy-menu-hint">直接从后端导出（无需前端加载）</div>
+            <div class="copy-menu-item" @click="exportApiFromServer">🔄 从后端导出全部API请求JSON</div>
           </div>
         </div>
         <button class="btn btn-danger btn-sm" @click="clearHistory">
@@ -439,11 +439,23 @@ async function exportApiFromServer() {
   closeCopyMenu()
   try {
     const exportData = await api.exportPortHistory(portId, 'api')
-    downloadJson(getExportFilename('api-server'), exportData)
-    showToast(`已从后端导出 ${exportData.total_requests} 条API请求记录`, 'success')
+    // Extract only JSON data (request/response bodies), same as exportJsonOnly format
+    const output = (exportData.requests || []).map((r, i) => {
+      const entry = { index: i + 1, method: r.method, path: r.path, status_code: r.status_code }
+      entry.request = typeof r.request_body === 'string' ? (tryParseJson(r.request_body) ?? r.request_body) : r.request_body
+      entry.response = typeof r.response_body === 'string' ? (tryParseJson(r.response_body) ?? r.response_body) : r.response_body
+      return entry
+    })
+    downloadJson(getExportFilename('api-json-only'), output)
+    showToast(`已从后端导出 ${output.length} 条API请求JSON数据`, 'success')
   } catch (e) {
     showToast('后端导出失败', 'error')
   }
+}
+
+function tryParseJson(raw) {
+  if (!raw) return null
+  try { return JSON.parse(raw) } catch (e) { return null }
 }
 
 async function handleDeleteRequest(req) {
