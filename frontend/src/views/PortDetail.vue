@@ -20,7 +20,7 @@
         </span>
         <!-- Copy dropdown -->
         <div class="copy-dropdown" v-click-outside="closeCopyMenu">
-          <button class="btn btn-success btn-sm" @click="toggleCopyMenu" title="导出当前显示的记录">
+          <button class="btn btn-success btn-sm" @click="toggleCopyMenu" title="点击展开导出菜单，选择导出方式">
             📥 一键导出 ▾
           </button>
           <div v-if="copyMenuOpen" class="copy-menu">
@@ -68,10 +68,12 @@
             <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'all' }" @click="methodFilter = 'all'">
               全部 ({{ requests.length }})
             </button>
-            <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'api' }" @click="methodFilter = 'api'">
+            <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'api' }" @click="methodFilter = 'api'"
+                    title="POST、PUT、PATCH、DELETE 请求，通常是 AI Agent / 大模型 API 调用">
               📤 API请求 ({{ apiCount }})
             </button>
-            <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'other' }" @click="methodFilter = 'other'">
+            <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'other' }" @click="methodFilter = 'other'"
+                    title="GET、OPTIONS、HEAD 等请求，通常来自端口扫描、浏览器探测、CORS 预检、安全扫描器、爬虫等，非 AI Agent 行为，建议忽略">
               🌐 其他 ({{ otherCount }})
             </button>
           </div>
@@ -107,11 +109,11 @@
              @mouseenter="scrollLocked = true" @mouseleave="scrollLocked = false">
           <!-- Toolbar: view mode + headers toggle -->
           <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
-            <button class="btn btn-sm" :class="treeView[req.id] ? 'btn-outline' : 'btn-primary'" @click.stop="treeView[req.id] = false">
+            <button class="btn btn-sm btn-primary" @click.stop>
               📝 纯文本
             </button>
-            <button class="btn btn-sm" :class="treeView[req.id] ? 'btn-primary' : 'btn-outline'" @click.stop="treeView[req.id] = true">
-              🌳 树形查看
+            <button class="btn btn-sm btn-outline" @click.stop="openTreeInNewTab(req)">
+              🌳 树形查看（新页面）
             </button>
             <button class="btn btn-outline btn-sm" @click.stop="headersExpanded[req.id] = !headersExpanded[req.id]">
               {{ headersExpanded[req.id] ? '🔽 隐藏HTTP头' : '🔍 查看HTTP头' }}
@@ -138,9 +140,7 @@
                 <span>📤 请求 JSON</span>
               </div>
               <div class="json-tree-wrapper">
-                <JsonTree v-if="treeView[req.id] && parseJsonOrNull(req.request_body) !== null"
-                          :data="parseJsonOrNull(req.request_body)" />
-                <pre v-else class="json-content">{{ formatJson(req.request_body) }}</pre>
+                <pre class="json-content">{{ formatJson(req.request_body) }}</pre>
               </div>
             </div>
             <!-- Response JSON -->
@@ -149,9 +149,7 @@
                 <span> 响应 JSON</span>
               </div>
               <div class="json-tree-wrapper">
-                <JsonTree v-if="treeView[req.id] && parseJsonOrNull(req.response_body) !== null"
-                          :data="parseJsonOrNull(req.response_body)" />
-                <pre v-else class="json-content">{{ formatJson(req.response_body) }}</pre>
+                <pre class="json-content">{{ formatJson(req.response_body) }}</pre>
               </div>
             </div>
           </div>
@@ -189,7 +187,6 @@
 import { ref, reactive, computed, onMounted, onUnmounted, inject, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import api from '../api'
-import JsonTree from '../components/JsonTree.vue'
 
 const route = useRoute()
 const showToast = inject('showToast')
@@ -199,7 +196,6 @@ const portId = route.params.id
 const data = ref({ port: null, requests: [] })
 const requests = ref([])
 const expanded = ref({})
-const treeView = ref({})
 const headersExpanded = ref({})
 const copyMenuOpen = ref(false)
 const newCount = ref(0)
@@ -345,19 +341,12 @@ function stopPolling() {
   }
 }
 
-function parseJsonOrNull(raw) {
-  if (!raw) return null
-  if (typeof raw === 'object') return raw
-  try { return JSON.parse(raw) } catch (e) { return null }
-}
-
 function toggleExpand(reqId) {
   expanded.value[reqId] = !expanded.value[reqId]
 }
 
 function collapseAll() {
   expanded.value = {}
-  treeView.value = {}
   headersExpanded.value = {}
 }
 
@@ -465,6 +454,22 @@ async function exportApiFromServer() {
 function tryParseJson(raw) {
   if (!raw) return null
   try { return JSON.parse(raw) } catch (e) { return null }
+}
+
+function openTreeInNewTab(req) {
+  const title = `${req.method} ${req.path.slice(0, 60)}`
+  const data = {
+    request: tryParseJson(req.request_body) ?? req.request_body,
+    response: tryParseJson(req.response_body) ?? req.response_body,
+    requestHeaders: tryParseJson(req.request_headers) ?? req.request_headers,
+    responseHeaders: tryParseJson(req.response_headers) ?? req.response_headers,
+    metadata: { method: req.method, path: req.path, status_code: req.status_code, duration_ms: req.duration_ms },
+  }
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title></head><body><pre id="json" style="padding:16px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-all"></pre><script>const d=${JSON.stringify(data)};document.getElementById('json').textContent=JSON.stringify(d,null,2)<\\/script></body></html>`
+  const blob = new Blob([html], { type: 'text/html' })
+  const url = URL.createObjectURL(blob)
+  window.open(url, '_blank')
+  URL.revokeObjectURL(url)
 }
 
 async function handleDeleteRequest(req) {
