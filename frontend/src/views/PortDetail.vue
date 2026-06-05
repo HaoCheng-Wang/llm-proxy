@@ -20,7 +20,7 @@
         </span>
         <!-- Copy dropdown -->
         <div class="copy-dropdown" v-click-outside="closeCopyMenu">
-          <button class="btn btn-success btn-sm" @click="toggleCopyMenu" title="点击展开导出选项">
+          <button class="btn btn-success btn-sm" @click="toggleCopyMenu" title="点击展开导出菜单，支持导出已加载数据或从后端直接导出">
             📥 一键导出 ▾
           </button>
           <div v-if="copyMenuOpen" class="copy-menu">
@@ -69,11 +69,11 @@
               全部 ({{ requests.length }})
             </button>
             <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'api' }" @click="methodFilter = 'api'"
-                    title="智能体发起的 API 调用，含请求体/响应体的业务请求（POST/PUT/PATCH/DELETE）">
+                    title="智能体与大模型 API 之间的请求（POST /v1/chat/completions 等）">
               📤 API请求 ({{ apiCount }})
             </button>
             <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'other' }" @click="methodFilter = 'other'"
-                    title="浏览器探测、端口扫描、CORS 预检、爬虫索引、健康检查等非业务请求（GET/OPTIONS/HEAD），通常可忽略">
+                    title="由端口扫描、浏览器探测、搜索引擎爬虫、CORS 预检、健康检查等触发的非智能体请求，通常可忽略">
               🌐 其他 ({{ otherCount }})
             </button>
           </div>
@@ -107,14 +107,8 @@
         <!-- Expanded Body -->
         <div v-if="expanded[req.id]" class="request-card-body"
              @mouseenter="scrollLocked = true" @mouseleave="scrollLocked = false">
-          <!-- Toolbar: view mode + headers toggle -->
+          <!-- Toolbar: headers toggle -->
           <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
-            <button class="btn btn-sm" :class="treeView[req.id] ? 'btn-outline' : 'btn-primary'" @click.stop="treeView[req.id] = false">
-              📝 纯文本
-            </button>
-            <button class="btn btn-sm" :class="treeView[req.id] ? 'btn-primary' : 'btn-outline'" @click.stop="treeView[req.id] = true">
-              🌳 树形查看
-            </button>
             <button class="btn btn-outline btn-sm" @click.stop="headersExpanded[req.id] = !headersExpanded[req.id]">
               {{ headersExpanded[req.id] ? '🔽 隐藏HTTP头' : '🔍 查看HTTP头' }}
             </button>
@@ -138,24 +132,28 @@
             <div class="json-panel json-panel-request">
               <div class="json-panel-header">
                 <span>📤 请求 JSON</span>
-                <button class="btn btn-sm btn-popout" @click.stop="openJsonPopup('request', req)" title="在新页面放大查看">🔍 放大</button>
+                <button class="btn btn-outline btn-sm" style="margin-left:auto;font-size:11px;padding:2px 8px"
+                        @click.stop="openTreeViewer('请求', req.request_body)"
+                        title="在新页面中以树形结构查看请求 JSON">
+                  🌳 树形查看
+                </button>
               </div>
               <div class="json-tree-wrapper">
-                <JsonTree v-if="treeView[req.id] && parseJsonOrNull(req.request_body) !== null"
-                          :data="parseJsonOrNull(req.request_body)" />
-                <pre v-else class="json-content">{{ formatJson(req.request_body) }}</pre>
+                <pre class="json-content">{{ formatJson(req.request_body) }}</pre>
               </div>
             </div>
             <!-- Response JSON -->
             <div class="json-panel json-panel-response">
               <div class="json-panel-header">
                 <span>📥 响应 JSON</span>
-                <button class="btn btn-sm btn-popout" @click.stop="openJsonPopup('response', req)" title="在新页面放大查看">🔍 放大</button>
+                <button class="btn btn-outline btn-sm" style="margin-left:auto;font-size:11px;padding:2px 8px"
+                        @click.stop="openTreeViewer('响应', req.response_body)"
+                        title="在新页面中以树形结构查看响应 JSON">
+                  🌳 树形查看
+                </button>
               </div>
               <div class="json-tree-wrapper">
-                <JsonTree v-if="treeView[req.id] && parseJsonOrNull(req.response_body) !== null"
-                          :data="parseJsonOrNull(req.response_body)" />
-                <pre v-else class="json-content">{{ formatJson(req.response_body) }}</pre>
+                <pre class="json-content">{{ formatJson(req.response_body) }}</pre>
               </div>
             </div>
           </div>
@@ -193,7 +191,6 @@
 import { ref, reactive, computed, onMounted, onUnmounted, inject, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import api from '../api'
-import JsonTree from '../components/JsonTree.vue'
 
 const route = useRoute()
 const showToast = inject('showToast')
@@ -203,7 +200,6 @@ const portId = route.params.id
 const data = ref({ port: null, requests: [] })
 const requests = ref([])
 const expanded = ref({})
-const treeView = ref({})
 const headersExpanded = ref({})
 const copyMenuOpen = ref(false)
 const newCount = ref(0)
@@ -361,8 +357,15 @@ function toggleExpand(reqId) {
 
 function collapseAll() {
   expanded.value = {}
-  treeView.value = {}
   headersExpanded.value = {}
+}
+
+function openTreeViewer(label, raw) {
+  if (!raw) { showToast('无数据', 'error'); return }
+  const key = `jv-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  sessionStorage.setItem(key, typeof raw === 'string' ? raw : JSON.stringify(raw))
+  const title = encodeURIComponent(`端口 ${data.value.port?.port_number || ''} — ${label} JSON`)
+  window.open(`/json-viewer?key=${key}&title=${title}`, '_blank')
 }
 
 function formatJson(raw) {
@@ -469,26 +472,6 @@ async function exportApiFromServer() {
 function tryParseJson(raw) {
   if (!raw) return null
   try { return JSON.parse(raw) } catch (e) { return null }
-}
-
-function openJsonPopup(type, req) {
-  const body = type === 'request' ? req.request_body : req.response_body
-  const label = type === 'request' ? '请求 JSON' : '响应 JSON'
-  const title = `${req.method} ${req.path} — ${label}`
-
-  // Store data in sessionStorage for the popup to read
-  sessionStorage.setItem('json-popup-title', title)
-  sessionStorage.setItem('json-popup-data', body || '')
-  sessionStorage.setItem('json-popup-method', req.method)
-  sessionStorage.setItem('json-popup-path', req.path)
-
-  // Open popup window
-  const w = window.open('/json-viewer', '_blank', 'width=1000,height=800,left=200,top=50')
-  // Fallback: if popup blocked, open as new tab with query param
-  if (!w || w.closed) {
-    const encoded = encodeURIComponent(body || '')
-    window.open(`/json-viewer?data=${encoded}&title=${encodeURIComponent(title)}`, '_blank')
-  }
 }
 
 async function handleDeleteRequest(req) {
