@@ -173,15 +173,178 @@ def _serialize_body(body_bytes: bytes) -> str | None:
         return f"[binary data, {len(body_bytes)} bytes]"
 
 
-def _reconstruct_sse_to_json(raw_sse: str) -> str | None:
-    """Parse SSE (text/event-stream) raw text and reconstruct a full
-    non-streaming chat completion JSON by merging all delta chunks.
+# ──────────────────────────────────────────────
+#  SSE format auto-detection
+# ──────────────────────────────────────────────
 
-    Returns the reconstructed JSON string, or None if parsing fails.
+# Anthropic Messages API event types
+_ANTHROPIC_EVENT_TYPES = frozenset({
+    "message_start", "content_block_start", "content_block_delta",
+    "content_block_stop", "message_delta", "message_stop", "ping",
+})
+
+# OpenAI Responses API event type prefixes
+_OPENAI_RESPONSES_PREFIXES = (
+    "response.", "error",
+)
+
+
+def _detect_sse_format(first_chunk: dict) -> str:
+    """Detect the SSE stream format from the first parsed JSON chunk.
+
+    Returns one of:
+      'anthropic'       — Anthropic Messages API
+      'openai_responses'— OpenAI Responses API  (/v1/responses)
+      'gemini'          — Google Gemini API
+      'openai_chat'     — OpenAI Chat Completions  (/v1/chat/completions)
+      'generic'         — Unknown format, try best-effort extraction
     """
-    if not raw_sse:
+    event_type = first_chunk.get("type", "")
+
+    # Anthropic: type is a known Anthropic event name
+    if event_type in _ANTHROPIC_EVENT_TYPES:
+        return "anthropic"
+
+    # OpenAI Responses API: type starts with "response."
+    if isinstance(event_type, str) and event_type.startswith(_OPENAI_RESPONSES_PREFIXES):
+        return "openai_responses"
+
+    # Google Gemini: has a "candidates" array
+    if "candidates" in first_chunk:
+        return "gemini"
+
+    # OpenAI Chat Completions: has "choices" with nested "delta"
+    if "choices" in first_chunk:
+        return "openai_chat"
+
+    return "generic"
+
+
+# ──────────────────────────────────────────────
+#  Format-specific parsers
+# ──────────────────────────────────────────────
+
+def _parse_anthropic_sse(raw_sse: str) -> str | None:
+    """Parse Anthropic Messages API SSE stream → reconstructed Messages JSON.
+
+    Handles text, reasoning, and tool_use content blocks."""
+    blocks: dict[int, dict] = {}
+    stop_reason = None
+    usage = None
+    model = ""
+    msg_id = ""
+    role = "assistant"
+
+    try:
+        for line in raw_sse.split("\n"):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload:
+                continue
+
+            event = json.loads(payload)
+            event_type = event.get("type", "")
+
+            if event_type == "message_start":
+                message = event.get("message", {})
+                msg_id = message.get("id", "")
+                model = message.get("model", "")
+                role = message.get("role", "assistant")
+                if message.get("usage"):
+                    usage = message["usage"]
+
+            elif event_type == "content_block_start":
+                idx = event.get("index", 0)
+                cb = event.get("content_block", {})
+                blocks[idx] = {"type": cb.get("type", "text")}
+                if cb.get("type") == "tool_use":
+                    blocks[idx].update({
+                        "id": cb.get("id", ""),
+                        "name": cb.get("name", ""),
+                        "input_json": "",
+                    })
+                elif cb.get("type") == "text":
+                    blocks[idx]["text"] = ""
+
+            elif event_type == "content_block_delta":
+                idx = event.get("index", 0)
+                delta = event.get("delta", {})
+                delta_type = delta.get("type", "")
+
+                if idx not in blocks:
+                    blocks[idx] = {"type": "text"}
+
+                if delta_type == "text_delta":
+                    blocks[idx]["text"] = blocks[idx].get("text", "") + delta.get("text", "")
+                elif delta_type == "reasoning_delta":
+                    blocks[idx]["reasoning_content"] = (
+                        blocks[idx].get("reasoning_content", "")
+                        + delta.get("reasoning_content", "")
+                    )
+                elif delta_type == "input_json_delta":
+                    blocks[idx]["input_json"] = (
+                        blocks[idx].get("input_json", "")
+                        + delta.get("partial_json", "")
+                    )
+
+            elif event_type == "message_delta":
+                delta = event.get("delta", {})
+                if delta.get("stop_reason"):
+                    stop_reason = delta["stop_reason"]
+                if event.get("usage"):
+                    usage = event["usage"]
+
+        content_blocks = []
+        for idx in sorted(blocks.keys()):
+            b = blocks[idx]
+            if b["type"] == "text":
+                content_blocks.append({"type": "text", "text": b.get("text", "")})
+            elif b["type"] == "tool_use":
+                tool_block = {
+                    "type": "tool_use",
+                    "id": b.get("id", ""),
+                    "name": b.get("name", ""),
+                    "input": {},
+                }
+                raw_input = b.get("input_json", "")
+                if raw_input:
+                    try:
+                        tool_block["input"] = json.loads(raw_input)
+                    except json.JSONDecodeError:
+                        tool_block["input"] = raw_input
+                content_blocks.append(tool_block)
+            elif b.get("reasoning_content"):
+                content_blocks.append({
+                    "type": "reasoning",
+                    "reasoning_content": b["reasoning_content"],
+                })
+
+        reconstructed = {
+            "id": msg_id,
+            "type": "message",
+            "role": role,
+            "content": content_blocks,
+            "model": model,
+            "stop_reason": stop_reason,
+            "stop_sequence": None,
+        }
+        if usage:
+            reconstructed["usage"] = usage
+
+        return json.dumps(reconstructed, ensure_ascii=False, indent=2)
+    except Exception:
+        print("[Proxy] WARNING: failed to reconstruct Anthropic SSE to JSON",
+              file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         return None
 
+
+def _parse_openai_chat_sse(raw_sse: str) -> str | None:
+    """Parse OpenAI Chat Completions SSE stream → reconstructed chat.completion JSON.
+
+    Handles: choices[0].delta.content, reasoning_content, tool_calls."""
     full_content = ""
     full_reasoning = ""
     finish_reason = None
@@ -191,25 +354,25 @@ def _reconstruct_sse_to_json(raw_sse: str) -> str | None:
     msg_id = ""
     created = 0
     role = "assistant"
+    # Accumulate tool_calls by index
+    tool_calls: dict[int, dict] = {}
 
     try:
         for line in raw_sse.split("\n"):
             line = line.strip()
             if not line.startswith("data:"):
                 continue
-            payload = line[5:].strip()  # remove "data:" prefix
+            payload = line[5:].strip()
             if not payload or payload == "[DONE]":
                 continue
 
             chunk = json.loads(payload)
-            # Collect metadata from first chunk
             if not msg_id:
                 msg_id = chunk.get("id", "")
                 obj_type = chunk.get("object", "").replace(".chunk", "")
                 model = chunk.get("model", "")
                 created = chunk.get("created", 0)
 
-            # Collect usage from the chunk that has it
             if chunk.get("usage"):
                 usage = chunk["usage"]
 
@@ -222,13 +385,33 @@ def _reconstruct_sse_to_json(raw_sse: str) -> str | None:
                 full_content += delta["content"]
             if delta.get("reasoning_content"):
                 full_reasoning += delta["reasoning_content"]
+
+            # Accumulate streaming tool calls
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                if idx not in tool_calls:
+                    tool_calls[idx] = {
+                        "id": tc.get("id", ""),
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                if tc.get("id"):
+                    tool_calls[idx]["id"] = tc["id"]
+                if tc.get("function", {}).get("name"):
+                    tool_calls[idx]["function"]["name"] += tc["function"]["name"]
+                if tc.get("function", {}).get("arguments"):
+                    tool_calls[idx]["function"]["arguments"] += tc["function"]["arguments"]
+
             if choices[0].get("finish_reason") and not finish_reason:
                 finish_reason = choices[0]["finish_reason"]
 
-        # Build reconstructed full response
-        message = {"role": role, "content": full_content}
+        message: dict = {"role": role, "content": full_content}
         if full_reasoning:
             message["reasoning_content"] = full_reasoning
+        if tool_calls:
+            message["tool_calls"] = [
+                tool_calls[i] for i in sorted(tool_calls.keys())
+            ]
 
         reconstructed = {
             "id": msg_id,
@@ -246,9 +429,414 @@ def _reconstruct_sse_to_json(raw_sse: str) -> str | None:
 
         return json.dumps(reconstructed, ensure_ascii=False, indent=2)
     except Exception:
-        print("[Proxy] WARNING: failed to reconstruct SSE to JSON", file=sys.stderr)
+        print("[Proxy] WARNING: failed to reconstruct OpenAI Chat SSE to JSON",
+              file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         return None
+
+
+def _parse_openai_responses_sse(raw_sse: str) -> str | None:
+    """Parse OpenAI Responses API SSE stream → reconstructed response JSON.
+
+    Key events: response.output_text.delta, response.reasoning_summary_text.delta,
+    response.function_call_arguments.delta, response.created, response.completed."""
+    output_text = ""
+    reasoning_text = ""
+    function_args = ""
+    response_id = ""
+    model = ""
+    status = ""
+    usage = None
+    output_items: list[dict] = []
+
+    try:
+        for line in raw_sse.split("\n"):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+
+            event = json.loads(payload)
+            event_type = event.get("type", "")
+
+            if event_type == "response.created":
+                resp = event.get("response", {})
+                response_id = resp.get("id", "")
+                model = resp.get("model", "")
+                status = resp.get("status", "")
+
+            elif event_type == "response.completed":
+                resp = event.get("response", {})
+                if resp.get("usage"):
+                    usage = resp["usage"]
+                status = "completed"
+                # The completed response may have the full output array
+                if resp.get("output"):
+                    output_items = resp["output"]
+
+            elif event_type == "response.output_text.delta":
+                output_text += event.get("delta", "")
+
+            elif event_type == "response.reasoning_summary_text.delta":
+                reasoning_text += event.get("delta", "")
+
+            elif event_type == "response.function_call_arguments.delta":
+                function_args += event.get("delta", "")
+
+            elif event_type == "response.failed":
+                status = "failed"
+
+        # Build reconstructed response
+        reconstructed: dict = {
+            "id": response_id,
+            "object": "response",
+            "model": model,
+            "status": status or "completed",
+        }
+
+        # If we captured output items from response.completed, use those
+        if output_items:
+            reconstructed["output"] = output_items
+        else:
+            # Build output from accumulated deltas
+            output = []
+            if output_text:
+                output.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": output_text}],
+                })
+            if reasoning_text:
+                output.append({
+                    "type": "reasoning",
+                    "summary": [{"type": "reasoning_summary_text", "text": reasoning_text}],
+                })
+            if function_args:
+                try:
+                    parsed_args = json.loads(function_args)
+                except json.JSONDecodeError:
+                    parsed_args = function_args
+                output.append({
+                    "type": "function_call",
+                    "arguments": parsed_args,
+                })
+            reconstructed["output"] = output
+
+        if usage:
+            reconstructed["usage"] = usage
+
+        return json.dumps(reconstructed, ensure_ascii=False, indent=2)
+    except Exception:
+        print("[Proxy] WARNING: failed to reconstruct OpenAI Responses SSE to JSON",
+              file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return None
+
+
+def _parse_gemini_sse(raw_sse: str) -> str | None:
+    """Parse Google Gemini SSE stream → reconstructed generateContent JSON.
+
+    Each SSE chunk is a full GenerateContentResponse. We collect the text from
+    candidates[0].content.parts[*].text across all chunks (Gemini sends
+    incremental text in each chunk)."""
+    full_text = ""
+    finish_reason = None
+    usage = None
+    model = ""
+    response_id = ""
+    role = "model"
+
+    try:
+        for line in raw_sse.split("\n"):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload:
+                continue
+
+            chunk = json.loads(payload)
+
+            # Metadata
+            if not model:
+                model = chunk.get("modelVersion", "")
+            if not response_id:
+                response_id = chunk.get("responseId", "")
+
+            if chunk.get("usageMetadata"):
+                usage = chunk["usageMetadata"]
+
+            candidates = chunk.get("candidates", [])
+            if not candidates:
+                continue
+
+            candidate = candidates[0]
+            content = candidate.get("content", {})
+            role = content.get("role", "model")
+            parts = content.get("parts", [])
+
+            for part in parts:
+                if "text" in part:
+                    full_text += part["text"]
+
+            if candidate.get("finishReason") and not finish_reason:
+                finish_reason = candidate["finishReason"]
+
+        reconstructed = {
+            "responseId": response_id,
+            "modelVersion": model,
+            "candidates": [{
+                "index": 0,
+                "content": {
+                    "role": role,
+                    "parts": [{"text": full_text}],
+                },
+                "finishReason": finish_reason or "STOP",
+            }],
+        }
+        if usage:
+            reconstructed["usageMetadata"] = usage
+
+        return json.dumps(reconstructed, ensure_ascii=False, indent=2)
+    except Exception:
+        print("[Proxy] WARNING: failed to reconstruct Gemini SSE to JSON",
+              file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return None
+
+
+def _deep_merge(base: dict, chunk: dict) -> dict:
+    """Deep merge two dicts. Strings concatenate, lists merge by index, dicts recurse.
+    
+    This is the universal SSE reconstruction algorithm:
+    - All SSE chunks share the same top-level structure
+    - Incremental content is in string fields that should be concatenated
+    - Metadata fields (id, model, etc.) appear in early chunks and are preserved
+    """
+    result = dict(base)
+    for key, new_val in chunk.items():
+        if key not in result:
+            result[key] = new_val
+        else:
+            old_val = result[key]
+            if isinstance(old_val, str) and isinstance(new_val, str):
+                # Strings concatenate (this is the key for SSE!)
+                result[key] = old_val + new_val
+            elif isinstance(old_val, dict) and isinstance(new_val, dict):
+                result[key] = _deep_merge(old_val, new_val)
+            elif isinstance(old_val, list) and isinstance(new_val, list):
+                result[key] = _merge_lists(old_val, new_val)
+            else:
+                # Overwrite with new value (for numbers, booleans, null)
+                result[key] = new_val
+    return result
+
+
+def _merge_lists(base_list: list, new_list: list) -> list:
+    """Merge lists by index. If new_list has items at same indices, deep merge them."""
+    result = list(base_list)
+    for i, item in enumerate(new_list):
+        if i < len(result):
+            if isinstance(result[i], dict) and isinstance(item, dict):
+                result[i] = _deep_merge(result[i], item)
+            elif isinstance(result[i], str) and isinstance(item, str):
+                result[i] = result[i] + item
+            else:
+                result[i] = item
+        else:
+            result.append(item)
+    return result
+
+
+def _reconstruct_sse_universal(raw_sse: str) -> str | None:
+    """Universal SSE reconstruction using deep merge.
+    
+    Works for any format where all chunks share the same structure:
+    - OpenAI Chat Completions
+    - Google Gemini
+    - Any OpenAI-compatible API (DeepSeek, Mistral, Together, etc.)
+    
+    For event-based formats (Anthropic, OpenAI Responses), use format-specific parsers.
+    """
+    if not raw_sse:
+        return None
+    
+    merged = {}
+    try:
+        for line in raw_sse.split("\n"):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            
+            chunk = json.loads(payload)
+            merged = _deep_merge(merged, chunk)
+        
+        # Post-processing for OpenAI-like formats
+        # Rename delta → message in choices (OpenAI Chat Completions pattern)
+        for choice in merged.get("choices", []):
+            if "delta" in choice:
+                choice["message"] = choice.pop("delta")
+        
+        return json.dumps(merged, ensure_ascii=False, indent=2)
+    except Exception:
+        print("[Proxy] WARNING: universal SSE reconstruction failed", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return None
+
+
+def _parse_generic_sse(raw_sse: str) -> str | None:
+    """Best-effort SSE parser for unknown formats.
+    
+    Strategy:
+    1. Try universal deep merge (works for OpenAI-like formats)
+    2. If that fails or produces empty content, fall back to text extraction
+    3. If nothing works, return raw SSE text
+    """
+    # Try universal deep merge first
+    result = _reconstruct_sse_universal(raw_sse)
+    if result and result != "{}":
+        # Check if the merged result has meaningful content
+        try:
+            parsed = json.loads(result)
+            # If it has choices with message content, or candidates with text, it's good
+            if parsed.get("choices") or parsed.get("candidates"):
+                return result
+        except json.JSONDecodeError:
+            pass
+    
+    # Fallback: extract text from common paths
+    all_text = ""
+    try:
+        for line in raw_sse.split("\n"):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+
+            obj = json.loads(payload)
+
+            # Try OpenAI-compatible
+            for choice in obj.get("choices") or []:
+                delta = choice.get("delta") or choice.get("message") or {}
+                if delta.get("content"):
+                    all_text += delta["content"]
+                    continue
+                for tc in delta.get("tool_calls") or []:
+                    fn = tc.get("function", {})
+                    if fn.get("arguments"):
+                        all_text += fn["arguments"]
+
+            # Try Gemini-compatible
+            for cand in obj.get("candidates") or []:
+                for part in (cand.get("content") or {}).get("parts") or []:
+                    if part.get("text"):
+                        all_text += part["text"]
+
+            # Try Anthropic-like
+            delta = obj.get("delta", {})
+            if delta.get("text"):
+                all_text += delta["text"]
+            if delta.get("partial_json"):
+                all_text += delta["partial_json"]
+
+            # Recursive walk for "content" / "text" / "delta" leaves
+            if not all_text:
+                all_text += _walk_json_for_text(obj)
+
+        # If we found text, return a simple reconstructed object
+        if all_text.strip():
+            reconstructed = {
+                "_format": "generic",
+                "content": all_text,
+                "note": "Best-effort reconstruction — see response_body_raw for original SSE",
+            }
+            return json.dumps(reconstructed, ensure_ascii=False, indent=2)
+
+        # Nothing found — return raw SSE so it's at least visible
+        return raw_sse
+    except Exception:
+        print("[Proxy] WARNING: failed to reconstruct generic SSE to JSON",
+              file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return raw_sse
+
+
+def _walk_json_for_text(obj, depth: int = 0) -> str:
+    """Recursively walk a JSON object looking for string values at
+    common text-bearing keys. Depth-limited to prevent runaway."""
+    if depth > 10:
+        return ""
+    if isinstance(obj, str):
+        return ""
+    if isinstance(obj, dict):
+        pieces = []
+        for key in ("content", "text", "delta", "value", "data",
+                     "reasoning_content", "reasoning"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip():
+                pieces.append(val)
+        # Recurse into nested objects/arrays
+        for val in obj.values():
+            pieces.append(_walk_json_for_text(val, depth + 1))
+        return "".join(pieces)
+    if isinstance(obj, list):
+        return "".join(_walk_json_for_text(item, depth + 1) for item in obj)
+    return ""
+
+
+# ──────────────────────────────────────────────
+#  Dispatcher
+# ──────────────────────────────────────────────
+
+def _reconstruct_sse_to_json(raw_sse: str) -> str | None:
+    """Parse SSE (text/event-stream) raw text and reconstruct a full
+    non-streaming response JSON by merging all delta chunks.
+
+    Supports these formats (auto-detected):
+      • Anthropic Messages API
+      • OpenAI Chat Completions API
+      • OpenAI Responses API
+      • Google Gemini API
+      • Generic / unknown (best-effort extraction)
+
+    Returns the reconstructed JSON string, or None if parsing fails.
+    """
+    if not raw_sse:
+        return None
+
+    # Detect format from the first valid data line
+    for line in raw_sse.split("\n"):
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            first_chunk = json.loads(payload)
+            fmt = _detect_sse_format(first_chunk)
+
+            if fmt == "anthropic":
+                return _parse_anthropic_sse(raw_sse)
+            elif fmt == "openai_responses":
+                return _parse_openai_responses_sse(raw_sse)
+            elif fmt == "gemini":
+                return _parse_gemini_sse(raw_sse)
+            elif fmt == "openai_chat":
+                return _parse_openai_chat_sse(raw_sse)
+            else:
+                return _parse_generic_sse(raw_sse)
+        except (json.JSONDecodeError, Exception):
+            continue
+
+    return None
 
 
 async def proxy_endpoint(request: Request):
