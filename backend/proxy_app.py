@@ -227,10 +227,34 @@ def _detect_sse_format(first_chunk: dict) -> str:
 def _parse_anthropic_sse(raw_sse: str) -> str | None:
     """Parse Anthropic Messages API SSE stream → reconstructed Messages JSON.
 
-    Handles text, reasoning, and tool_use content blocks."""
+    Handles: text, thinking (extended thinking), tool_use, and server_tool_use blocks."""
+
+    # ── Event type constants ──
+    MSG_START = "message_start"
+    CB_START = "content_block_start"
+    CB_DELTA = "content_block_delta"
+    CB_STOP = "content_block_stop"
+    MSG_DELTA = "message_delta"
+    MSG_STOP = "message_stop"
+
+    # Anthropic content block types we handle
+    BLOCK_TEXT = "text"
+    BLOCK_TOOL_USE = "tool_use"
+    BLOCK_SERVER_TOOL_USE = "server_tool_use"
+    BLOCK_THINKING = "thinking"
+
+    # Anthropic delta types for content_block_delta
+    DELTA_TEXT = "text_delta"
+    DELTA_THINKING = "thinking_delta"
+    DELTA_SIGNATURE = "signature_delta"
+    DELTA_INPUT_JSON = "input_json_delta"
+
     blocks: dict[int, dict] = {}
+    # Each block: {"type": str, "text": str, "thinking": str, "signature": str,
+    #               "id": str, "name": str, "input_json": str}
     stop_reason = None
-    usage = None
+    usage_output = None
+    usage_input = None
     model = ""
     msg_id = ""
     role = "assistant"
@@ -247,63 +271,103 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
             event = json.loads(payload)
             event_type = event.get("type", "")
 
-            if event_type == "message_start":
+            # ── message_start ──
+            if event_type == MSG_START:
                 message = event.get("message", {})
                 msg_id = message.get("id", "")
                 model = message.get("model", "")
                 role = message.get("role", "assistant")
+                # Input tokens usage
                 if message.get("usage"):
-                    usage = message["usage"]
+                    usage_input = message["usage"]
 
-            elif event_type == "content_block_start":
+            # ── content_block_start ──
+            elif event_type == CB_START:
                 idx = event.get("index", 0)
                 cb = event.get("content_block", {})
-                blocks[idx] = {"type": cb.get("type", "text")}
-                if cb.get("type") == "tool_use":
+                block_type = cb.get("type", "text")
+
+                blocks[idx] = {"type": block_type}
+
+                if block_type in (BLOCK_TOOL_USE, BLOCK_SERVER_TOOL_USE):
                     blocks[idx].update({
                         "id": cb.get("id", ""),
                         "name": cb.get("name", ""),
                         "input_json": "",
                     })
-                elif cb.get("type") == "text":
-                    blocks[idx]["text"] = ""
+                elif block_type == BLOCK_THINKING:
+                    blocks[idx].update({
+                        "thinking": cb.get("thinking", ""),
+                        "signature": "",
+                    })
+                elif block_type == BLOCK_TEXT:
+                    blocks[idx]["text"] = cb.get("text", "")
 
-            elif event_type == "content_block_delta":
+            # ── content_block_delta ──
+            elif event_type == CB_DELTA:
                 idx = event.get("index", 0)
                 delta = event.get("delta", {})
                 delta_type = delta.get("type", "")
 
                 if idx not in blocks:
-                    blocks[idx] = {"type": "text"}
+                    # content_block_start was missed — infer type from delta type
+                    if delta_type == DELTA_INPUT_JSON:
+                        blocks[idx] = {"type": BLOCK_TOOL_USE, "id": "", "name": "", "input_json": ""}
+                    elif delta_type == DELTA_THINKING:
+                        blocks[idx] = {"type": BLOCK_THINKING, "thinking": "", "signature": ""}
+                    elif delta_type == DELTA_SIGNATURE:
+                        blocks[idx] = {"type": BLOCK_THINKING, "thinking": "", "signature": ""}
+                    else:
+                        blocks[idx] = {"type": BLOCK_TEXT, "text": ""}
 
-                if delta_type == "text_delta":
+                if delta_type == DELTA_TEXT:
                     blocks[idx]["text"] = blocks[idx].get("text", "") + delta.get("text", "")
-                elif delta_type == "reasoning_delta":
-                    blocks[idx]["reasoning_content"] = (
-                        blocks[idx].get("reasoning_content", "")
-                        + delta.get("reasoning_content", "")
-                    )
-                elif delta_type == "input_json_delta":
+                elif delta_type == DELTA_THINKING:
+                    blocks[idx]["thinking"] = blocks[idx].get("thinking", "") + delta.get("thinking", "")
+                elif delta_type == DELTA_SIGNATURE:
+                    blocks[idx]["signature"] = blocks[idx].get("signature", "") + delta.get("signature", "")
+                elif delta_type == DELTA_INPUT_JSON:
                     blocks[idx]["input_json"] = (
                         blocks[idx].get("input_json", "")
                         + delta.get("partial_json", "")
                     )
 
-            elif event_type == "message_delta":
+            # ── content_block_stop ── (no data needed, index is enough)
+            elif event_type == CB_STOP:
+                pass
+
+            # ── message_delta ──
+            elif event_type == MSG_DELTA:
                 delta = event.get("delta", {})
                 if delta.get("stop_reason"):
                     stop_reason = delta["stop_reason"]
+                # Output tokens usage
                 if event.get("usage"):
-                    usage = event["usage"]
+                    usage_output = event["usage"]
 
+            # ── message_stop ── (end of stream, no data)
+            elif event_type == MSG_STOP:
+                pass
+
+        # ── Build reconstructed message ──
         content_blocks = []
         for idx in sorted(blocks.keys()):
             b = blocks[idx]
-            if b["type"] == "text":
+            block_type = b.get("type", "text")
+
+            if block_type == BLOCK_TEXT:
                 content_blocks.append({"type": "text", "text": b.get("text", "")})
-            elif b["type"] == "tool_use":
+
+            elif block_type == BLOCK_THINKING:
+                content_blocks.append({
+                    "type": "thinking",
+                    "thinking": b.get("thinking", ""),
+                    "signature": b.get("signature", ""),
+                })
+
+            elif block_type in (BLOCK_TOOL_USE, BLOCK_SERVER_TOOL_USE):
                 tool_block = {
-                    "type": "tool_use",
+                    "type": block_type,
                     "id": b.get("id", ""),
                     "name": b.get("name", ""),
                     "input": {},
@@ -315,11 +379,19 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
                     except json.JSONDecodeError:
                         tool_block["input"] = raw_input
                 content_blocks.append(tool_block)
-            elif b.get("reasoning_content"):
-                content_blocks.append({
-                    "type": "reasoning",
-                    "reasoning_content": b["reasoning_content"],
-                })
+
+        # Merge input + output usage
+        usage = None
+        if usage_input or usage_output:
+            usage = {
+                "input_tokens": (usage_input or {}).get("input_tokens", 0),
+                "output_tokens": (usage_output or {}).get("output_tokens", 0),
+                # Include cache tokens if present (Anthropic prompt caching)
+                "cache_creation_input_tokens": (usage_input or {}).get("cache_creation_input_tokens"),
+                "cache_read_input_tokens": (usage_input or {}).get("cache_read_input_tokens"),
+            }
+            # Remove None values
+            usage = {k: v for k, v in usage.items() if v is not None}
 
         reconstructed = {
             "id": msg_id,
