@@ -409,6 +409,44 @@ def delete_single_request(
     return {"message": "Request record deleted."}
 
 
+@router.get("/{port_id}/history/{request_id}", response_model=RequestInfo)
+def get_single_request(
+    port_id: int,
+    request_id: int,
+    current_user: User = Depends(require_approved),
+    db: Session = Depends(get_db),
+):
+    """Fetch a single request record by ID (for the tree-viewer page)."""
+    port = db.query(Port).filter(Port.id == port_id).first()
+    if not port:
+        raise HTTPException(status_code=404, detail="Port not found")
+
+    if current_user.role != "admin" and port.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    req_record = db.query(RequestModel).filter(
+        RequestModel.id == request_id,
+        RequestModel.port_id == port_id,
+    ).first()
+    if not req_record:
+        raise HTTPException(status_code=404, detail="Request record not found")
+
+    return RequestInfo(
+        id=req_record.id,
+        port_id=req_record.port_id,
+        method=req_record.method,
+        path=req_record.path,
+        request_headers=req_record.request_headers,
+        request_body=req_record.request_body,
+        response_headers=req_record.response_headers,
+        response_body=req_record.response_body,
+        response_body_raw=req_record.response_body_raw,
+        status_code=req_record.status_code,
+        duration_ms=req_record.duration_ms,
+        created_at=req_record.created_at,
+    )
+
+
 @router.get("/{port_id}/export", response_model=dict)
 def export_port_history(
     port_id: int,
