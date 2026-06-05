@@ -9,7 +9,7 @@ _env_paths = [
 ]
 for _p in _env_paths:
     if _p.exists():
-        load_dotenv(_p)
+        load_dotenv(_p, override=True)
         break
 
 # ---------------------------------------------------------------------------
