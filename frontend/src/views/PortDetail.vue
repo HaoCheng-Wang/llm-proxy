@@ -20,7 +20,7 @@
         </span>
         <!-- Copy dropdown -->
         <div class="copy-dropdown" v-click-outside="closeCopyMenu">
-          <button class="btn btn-success btn-sm" @click="toggleCopyMenu" title="导出当前显示的记录">
+          <button class="btn btn-success btn-sm" @click="toggleCopyMenu" title="点击展开导出菜单 — 可导出 JSON 数据或完整交互记录">
             📥 一键导出 ▾
           </button>
           <div v-if="copyMenuOpen" class="copy-menu">
@@ -68,10 +68,12 @@
             <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'all' }" @click="methodFilter = 'all'">
               全部 ({{ requests.length }})
             </button>
-            <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'api' }" @click="methodFilter = 'api'">
+            <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'api' }" @click="methodFilter = 'api'"
+                    title="智能体 API 调用 — 即 POST/PUT/PATCH/DELETE 请求，是实际发送给 LLM 的交互记录">
               📤 API请求 ({{ apiCount }})
             </button>
-            <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'other' }" @click="methodFilter = 'other'">
+            <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'other' }" @click="methodFilter = 'other'"
+                    title="非 API 请求 — 包括端口扫描探测、浏览器预检（OPTIONS）、健康检查（HEAD）、网站图标（favicon）、爬虫抓取等触发的 GET/OPTIONS/HEAD 请求，通常可忽略">
               🌐 其他 ({{ otherCount }})
             </button>
           </div>
@@ -105,14 +107,8 @@
         <!-- Expanded Body -->
         <div v-if="expanded[req.id]" class="request-card-body"
              @mouseenter="scrollLocked = true" @mouseleave="scrollLocked = false">
-          <!-- Toolbar: view mode + headers toggle -->
+          <!-- Toolbar: headers toggle -->
           <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
-            <button class="btn btn-sm" :class="treeView[req.id] ? 'btn-outline' : 'btn-primary'" @click.stop="treeView[req.id] = false">
-              📝 纯文本
-            </button>
-            <button class="btn btn-sm" :class="treeView[req.id] ? 'btn-primary' : 'btn-outline'" @click.stop="treeView[req.id] = true">
-              🌳 树形查看
-            </button>
             <button class="btn btn-outline btn-sm" @click.stop="headersExpanded[req.id] = !headersExpanded[req.id]">
               {{ headersExpanded[req.id] ? '🔽 隐藏HTTP头' : '🔍 查看HTTP头' }}
             </button>
@@ -136,22 +132,30 @@
             <div class="json-panel json-panel-request">
               <div class="json-panel-header">
                 <span>📤 请求 JSON</span>
+                <button class="btn btn-sm tree-view-btn tree-view-btn-req"
+                        @click="openTreeView(req, 'request')"
+                        :disabled="!parseJsonOrNull(req.request_body)"
+                        title="在新页面中以树形结构查看请求 JSON">
+                  🌳 树形查看
+                </button>
               </div>
               <div class="json-tree-wrapper">
-                <JsonTree v-if="treeView[req.id] && parseJsonOrNull(req.request_body) !== null"
-                          :data="parseJsonOrNull(req.request_body)" />
-                <pre v-else class="json-content">{{ formatJson(req.request_body) }}</pre>
+                <pre class="json-content">{{ formatJson(req.request_body) }}</pre>
               </div>
             </div>
             <!-- Response JSON -->
             <div class="json-panel json-panel-response">
               <div class="json-panel-header">
-                <span> 响应 JSON</span>
+                <span>📥 响应 JSON</span>
+                <button class="btn btn-sm tree-view-btn tree-view-btn-resp"
+                        @click="openTreeView(req, 'response')"
+                        :disabled="!parseJsonOrNull(req.response_body)"
+                        title="在新页面中以树形结构查看响应 JSON">
+                  🌳 树形查看
+                </button>
               </div>
               <div class="json-tree-wrapper">
-                <JsonTree v-if="treeView[req.id] && parseJsonOrNull(req.response_body) !== null"
-                          :data="parseJsonOrNull(req.response_body)" />
-                <pre v-else class="json-content">{{ formatJson(req.response_body) }}</pre>
+                <pre class="json-content">{{ formatJson(req.response_body) }}</pre>
               </div>
             </div>
           </div>
@@ -189,7 +193,6 @@
 import { ref, reactive, computed, onMounted, onUnmounted, inject, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import api from '../api'
-import JsonTree from '../components/JsonTree.vue'
 
 const route = useRoute()
 const showToast = inject('showToast')
@@ -199,7 +202,6 @@ const portId = route.params.id
 const data = ref({ port: null, requests: [] })
 const requests = ref([])
 const expanded = ref({})
-const treeView = ref({})
 const headersExpanded = ref({})
 const copyMenuOpen = ref(false)
 const newCount = ref(0)
@@ -357,8 +359,11 @@ function toggleExpand(reqId) {
 
 function collapseAll() {
   expanded.value = {}
-  treeView.value = {}
   headersExpanded.value = {}
+}
+
+function openTreeView(req, type) {
+  window.open(`/json-viewer/${portId}/${req.id}?type=${type}`, '_blank', 'noopener')
 }
 
 function formatJson(raw) {

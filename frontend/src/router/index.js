@@ -4,6 +4,7 @@ import Login from '../views/Login.vue'
 import Register from '../views/Register.vue'
 import Dashboard from '../views/Dashboard.vue'
 import PortDetail from '../views/PortDetail.vue'
+import JsonTreeViewer from '../views/JsonTreeViewer.vue'
 import Admin from '../views/Admin.vue'
 
 const routes = [
@@ -11,6 +12,7 @@ const routes = [
   { path: '/register', name: 'Register', component: Register, meta: { guest: true } },
   { path: '/', name: 'Dashboard', component: Dashboard, meta: { auth: true } },
   { path: '/port/:id', name: 'PortDetail', component: PortDetail, meta: { auth: true } },
+  { path: '/json-viewer/:portId/:requestId', name: 'JsonTreeViewer', component: JsonTreeViewer, meta: { auth: true } },
   { path: '/admin', name: 'Admin', component: Admin, meta: { auth: true, admin: true } },
 ]
 
