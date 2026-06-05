@@ -253,6 +253,7 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
     # Each block: {"type": str, "text": str, "thinking": str, "signature": str,
     #               "id": str, "name": str, "input_json": str}
     stop_reason = None
+    stop_sequence = None
     usage_output = None
     usage_input = None
     model = ""
@@ -296,8 +297,10 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
                         "input_json": "",
                     })
                 elif block_type == BLOCK_THINKING:
+                    # content_block_start for thinking only has {"type": "thinking"}
+                    # thinking text and signature come via content_block_delta
                     blocks[idx].update({
-                        "thinking": cb.get("thinking", ""),
+                        "thinking": "",
                         "signature": "",
                     })
                 elif block_type == BLOCK_TEXT:
@@ -341,6 +344,8 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
                 delta = event.get("delta", {})
                 if delta.get("stop_reason"):
                     stop_reason = delta["stop_reason"]
+                if delta.get("stop_sequence") is not None:
+                    stop_sequence = delta["stop_sequence"]
                 # Output tokens usage
                 if event.get("usage"):
                     usage_output = event["usage"]
@@ -380,18 +385,14 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
                         tool_block["input"] = raw_input
                 content_blocks.append(tool_block)
 
-        # Merge input + output usage
+        # Merge input + output usage (preserve all fields from both)
         usage = None
         if usage_input or usage_output:
-            usage = {
-                "input_tokens": (usage_input or {}).get("input_tokens", 0),
-                "output_tokens": (usage_output or {}).get("output_tokens", 0),
-                # Include cache tokens if present (Anthropic prompt caching)
-                "cache_creation_input_tokens": (usage_input or {}).get("cache_creation_input_tokens"),
-                "cache_read_input_tokens": (usage_input or {}).get("cache_read_input_tokens"),
-            }
-            # Remove None values
-            usage = {k: v for k, v in usage.items() if v is not None}
+            usage = {}
+            if usage_input:
+                usage.update(usage_input)
+            if usage_output:
+                usage.update(usage_output)
 
         reconstructed = {
             "id": msg_id,
@@ -400,7 +401,7 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
             "content": content_blocks,
             "model": model,
             "stop_reason": stop_reason,
-            "stop_sequence": None,
+            "stop_sequence": stop_sequence,
         }
         if usage:
             reconstructed["usage"] = usage
