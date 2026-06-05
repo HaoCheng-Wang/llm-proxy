@@ -4,6 +4,7 @@ import Login from '../views/Login.vue'
 import Register from '../views/Register.vue'
 import Dashboard from '../views/Dashboard.vue'
 import PortDetail from '../views/PortDetail.vue'
+import TreeView from '../views/TreeView.vue'
 import Admin from '../views/Admin.vue'
 
 const routes = [
@@ -12,6 +13,7 @@ const routes = [
   { path: '/', name: 'Dashboard', component: Dashboard, meta: { auth: true } },
   { path: '/port/:id', name: 'PortDetail', component: PortDetail, meta: { auth: true } },
   { path: '/admin', name: 'Admin', component: Admin, meta: { auth: true, admin: true } },
+  { path: '/tree-view', name: 'TreeView', component: TreeView },  // public, no auth required
 ]
 
 const router = createRouter({
