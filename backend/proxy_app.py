@@ -237,23 +237,27 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
     MSG_DELTA = "message_delta"
     MSG_STOP = "message_stop"
 
-    # Anthropic content block types we handle
-    BLOCK_TEXT = "text"
-    BLOCK_TOOL_USE = "tool_use"
-    BLOCK_SERVER_TOOL_USE = "server_tool_use"
-    BLOCK_THINKING = "thinking"
-
     # Anthropic delta types for content_block_delta
     DELTA_TEXT = "text_delta"
     DELTA_THINKING = "thinking_delta"
     DELTA_SIGNATURE = "signature_delta"
     DELTA_INPUT_JSON = "input_json_delta"
+    DELTA_CITATIONS = "citations_delta"
+    DELTA_COMPACTION = "compaction_delta"
+
+    # Anthropic content block types we handle
+    BLOCK_TEXT = "text"
+    BLOCK_TOOL_USE = "tool_use"
+    BLOCK_SERVER_TOOL_USE = "server_tool_use"
+    BLOCK_THINKING = "thinking"
+    BLOCK_COMPACTION = "compaction"
 
     blocks: dict[int, dict] = {}
     # Each block: {"type": str, "text": str, "thinking": str, "signature": str,
     #               "id": str, "name": str, "input_json": str}
     stop_reason = None
     stop_sequence = None
+    stop_details = None
     usage_output = None
     usage_input = None
     model = ""
@@ -303,8 +307,16 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
                         "thinking": "",
                         "signature": "",
                     })
+                elif block_type == BLOCK_COMPACTION:
+                    # compaction content block: content and encrypted_content come via delta
+                    blocks[idx].update({
+                        "content": "",
+                        "encrypted_content": "",
+                    })
                 elif block_type == BLOCK_TEXT:
                     blocks[idx]["text"] = cb.get("text", "")
+                    # Citations may accumulate
+                    blocks[idx]["citations"] = []
 
             # ── content_block_delta ──
             elif event_type == CB_DELTA:
@@ -320,8 +332,10 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
                         blocks[idx] = {"type": BLOCK_THINKING, "thinking": "", "signature": ""}
                     elif delta_type == DELTA_SIGNATURE:
                         blocks[idx] = {"type": BLOCK_THINKING, "thinking": "", "signature": ""}
+                    elif delta_type == DELTA_COMPACTION:
+                        blocks[idx] = {"type": BLOCK_COMPACTION, "content": "", "encrypted_content": ""}
                     else:
-                        blocks[idx] = {"type": BLOCK_TEXT, "text": ""}
+                        blocks[idx] = {"type": BLOCK_TEXT, "text": "", "citations": []}
 
                 if delta_type == DELTA_TEXT:
                     blocks[idx]["text"] = blocks[idx].get("text", "") + delta.get("text", "")
@@ -334,6 +348,15 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
                         blocks[idx].get("input_json", "")
                         + delta.get("partial_json", "")
                     )
+                elif delta_type == DELTA_CITATIONS:
+                    # citations accumulate as a list
+                    if "citations" not in blocks[idx]:
+                        blocks[idx]["citations"] = []
+                    if delta.get("citation"):
+                        blocks[idx]["citations"].append(delta["citation"])
+                elif delta_type == DELTA_COMPACTION:
+                    blocks[idx]["content"] = delta.get("content", "")
+                    blocks[idx]["encrypted_content"] = delta.get("encrypted_content", "")
 
             # ── content_block_stop ── (no data needed, index is enough)
             elif event_type == CB_STOP:
@@ -346,6 +369,8 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
                     stop_reason = delta["stop_reason"]
                 if delta.get("stop_sequence") is not None:
                     stop_sequence = delta["stop_sequence"]
+                if delta.get("stop_details") is not None:
+                    stop_details = delta["stop_details"]
                 # Output tokens usage
                 if event.get("usage"):
                     usage_output = event["usage"]
@@ -361,13 +386,23 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
             block_type = b.get("type", "text")
 
             if block_type == BLOCK_TEXT:
-                content_blocks.append({"type": "text", "text": b.get("text", "")})
+                text_block = {"type": "text", "text": b.get("text", "")}
+                if b.get("citations"):
+                    text_block["citations"] = b["citations"]
+                content_blocks.append(text_block)
 
             elif block_type == BLOCK_THINKING:
                 content_blocks.append({
                     "type": "thinking",
                     "thinking": b.get("thinking", ""),
                     "signature": b.get("signature", ""),
+                })
+
+            elif block_type == BLOCK_COMPACTION:
+                content_blocks.append({
+                    "type": "compaction",
+                    "content": b.get("content", ""),
+                    "encrypted_content": b.get("encrypted_content", ""),
                 })
 
             elif block_type in (BLOCK_TOOL_USE, BLOCK_SERVER_TOOL_USE):
@@ -403,6 +438,8 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
             "stop_reason": stop_reason,
             "stop_sequence": stop_sequence,
         }
+        if stop_details is not None:
+            reconstructed["stop_details"] = stop_details
         if usage:
             reconstructed["usage"] = usage
 
