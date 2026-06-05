@@ -379,21 +379,29 @@ function downloadJson(filename, data) {
 
 function getExportFilename(suffix) {
   const port = data.value.port?.port_number || 'unknown'
+  const filterLabel = methodFilter.value === 'api' ? '-api' : methodFilter.value === 'other' ? '-other' : ''
   const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-  return `llm-proxy-port${port}-${suffix}-${ts}.json`
+  return `llm-proxy-port${port}${filterLabel}-${suffix}-${ts}.json`
+}
+
+// Use filtered requests for "export JSON only"
+function _getExportRequests() {
+  return filteredRequests.value
 }
 
 function exportJsonOnly() {
   closeCopyMenu()
   try {
-    const output = requests.value.map((r, i) => {
+    const source = _getExportRequests()
+    const output = source.map((r, i) => {
       const entry = { index: i + 1, method: r.method, path: r.path, status_code: r.status_code }
       try { entry.request = JSON.parse(r.request_body) } catch (e) { entry.request = r.request_body }
       try { entry.response = JSON.parse(r.response_body) } catch (e) { entry.response = r.response_body }
       return entry
     })
     downloadJson(getExportFilename('json-only'), output)
-    showToast(`已导出 ${output.length} 条JSON数据`, 'success')
+    const label = methodFilter.value === 'all' ? '' : ` (${methodFilter.value === 'api' ? '仅API请求' : '仅其他请求'})`
+    showToast(`已导出 ${output.length} 条JSON数据${label}`, 'success')
   } catch (e) {
     showToast('导出失败', 'error')
   }
@@ -403,11 +411,19 @@ async function exportAllData() {
   closeCopyMenu()
   try {
     const exportData = await api.exportPortHistory(portId)
+    // If filtered, only include filtered requests in full export too
+    if (methodFilter.value !== 'all') {
+      const filteredIds = new Set(_getExportRequests().map(r => r.id))
+      exportData.requests = (exportData.requests || []).filter(r => filteredIds.has(r.id))
+      exportData.total_requests = exportData.requests.length
+    }
     downloadJson(getExportFilename('full'), exportData)
-    showToast(`已导出 ${exportData.total_requests} 条完整交互记录`, 'success')
+    const label = methodFilter.value === 'all' ? '' : ` (${methodFilter.value === 'api' ? '仅API请求' : '仅其他请求'})`
+    showToast(`已导出 ${exportData.total_requests} 条完整交互记录${label}`, 'success')
   } catch (e) {
     try {
-      downloadJson(getExportFilename('full'), data.value)
+      const source = _getExportRequests()
+      downloadJson(getExportFilename('full'), { port: data.value.port, requests: source, total_requests: source.length })
       showToast('已导出全部数据', 'success')
     } catch (e2) {
       showToast('导出失败', 'error')
