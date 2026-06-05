@@ -2,7 +2,7 @@
   <div class="json-viewer-page">
     <div class="json-viewer-header">
       <h2 style="font-size:18px;margin:0">{{ title }}</h2>
-      <button class="btn btn-outline btn-sm" @click="window.close()">✕ 关闭</button>
+      <button class="btn btn-outline btn-sm" @click="closeOrBack()">✕ 关闭</button>
     </div>
     <div class="json-viewer-content">
       <JsonTree v-if="parsed" :data="parsed" />
@@ -18,6 +18,15 @@ import JsonTree from '../components/JsonTree.vue'
 const title = ref('JSON 查看器')
 const rawData = ref('')
 const parsed = ref(null)
+
+function closeOrBack() {
+  // Try to close if opened via window.open, otherwise go back
+  if (window.opener) {
+    window.close()
+  } else {
+    window.history.back()
+  }
+}
 
 onMounted(() => {
   title.value = sessionStorage.getItem('jsonViewerTitle') || 'JSON 查看器'
