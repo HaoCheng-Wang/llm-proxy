@@ -263,6 +263,7 @@ llm-proxy/
         │   ├── Register.vue # 注册页
         │   ├── Dashboard.vue# 端口列表 + 使用说明
         │   ├── PortDetail.vue# 交互记录详情
+        │   ├── JsonViewer.vue# JSON 树形查看（新页面）
         │   └── Admin.vue    # 管理员面板
         ├── stores/auth.js   # Pinia 认证状态
         └── router/index.js  # Vue Router 路由
