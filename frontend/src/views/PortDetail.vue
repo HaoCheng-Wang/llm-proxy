@@ -465,10 +465,10 @@ function openJsonViewer(req, type) {
   // Store in sessionStorage so the new Vue page can read it
   sessionStorage.setItem('jsonViewerData', rawData || '')
   sessionStorage.setItem('jsonViewerTitle', title)
-  // Try window.open first (new tab), fallback to current tab
-  const win = window.open(`/json-viewer`, '_blank')
-  if (!win) {
-    // Popup blocked — navigate in current tab
+  // Try to open in new tab, fallback to router push if blocked
+  const newWindow = window.open('/json-viewer', '_blank')
+  if (!newWindow || newWindow.closed || typeof newWindow.closed === 'undefined') {
+    // Popup was blocked, use router push instead
     router.push('/json-viewer')
   }
 }
