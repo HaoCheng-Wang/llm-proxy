@@ -457,7 +457,6 @@ function tryParseJson(raw) {
 }
 
 function openTreeInNewTab(req) {
-  const title = `${req.method} ${req.path.slice(0, 60)}`
   const data = {
     request: tryParseJson(req.request_body) ?? req.request_body,
     response: tryParseJson(req.response_body) ?? req.response_body,
@@ -465,11 +464,10 @@ function openTreeInNewTab(req) {
     responseHeaders: tryParseJson(req.response_headers) ?? req.response_headers,
     metadata: { method: req.method, path: req.path, status_code: req.status_code, duration_ms: req.duration_ms },
   }
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title></head><body><pre id="json" style="padding:16px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-all"></pre><script>const d=${JSON.stringify(data)};document.getElementById('json').textContent=JSON.stringify(d,null,2)<\\/script></body></html>`
-  const blob = new Blob([html], { type: 'text/html' })
-  const url = URL.createObjectURL(blob)
+  const key = 'tree-view-' + Date.now()
+  sessionStorage.setItem(key, JSON.stringify(data))
+  const url = window.location.origin + '/tree-view?key=' + encodeURIComponent(key)
   window.open(url, '_blank')
-  URL.revokeObjectURL(url)
 }
 
 async function handleDeleteRequest(req) {
