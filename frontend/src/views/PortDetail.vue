@@ -187,10 +187,11 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted, inject, nextTick } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import api from '../api'
 
 const route = useRoute()
+const router = useRouter()
 const showToast = inject('showToast')
 const displayIp = ref('your-server-ip')
 const portId = route.params.id
@@ -464,7 +465,12 @@ function openJsonViewer(req, type) {
   // Store in sessionStorage so the new Vue page can read it
   sessionStorage.setItem('jsonViewerData', rawData || '')
   sessionStorage.setItem('jsonViewerTitle', title)
-  window.open(`/json-viewer`, '_blank')
+  // Try window.open first (new tab), fallback to current tab
+  const win = window.open(`/json-viewer`, '_blank')
+  if (!win) {
+    // Popup blocked — navigate in current tab
+    router.push('/json-viewer')
+  }
 }
 
 async function handleDeleteRequest(req) {
