@@ -107,14 +107,8 @@
         <!-- Expanded Body -->
         <div v-if="expanded[req.id]" class="request-card-body"
              @mouseenter="scrollLocked = true" @mouseleave="scrollLocked = false">
-          <!-- Toolbar: view mode + headers toggle -->
+          <!-- Toolbar: headers toggle -->
           <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
-            <button class="btn btn-sm btn-primary" @click.stop>
-              📝 纯文本
-            </button>
-            <button class="btn btn-sm btn-outline" @click.stop="openTreeInNewTab(req)">
-              🌳 树形查看（新页面）
-            </button>
             <button class="btn btn-outline btn-sm" @click.stop="headersExpanded[req.id] = !headersExpanded[req.id]">
               {{ headersExpanded[req.id] ? '🔽 隐藏HTTP头' : '🔍 查看HTTP头' }}
             </button>
@@ -138,6 +132,10 @@
             <div class="json-panel json-panel-request">
               <div class="json-panel-header">
                 <span>📤 请求 JSON</span>
+                <button class="btn btn-sm btn-outline" style="padding:2px 8px;font-size:11px"
+                        @click.stop="openJsonViewer(req, 'request')">
+                  🌳 树形查看
+                </button>
               </div>
               <div class="json-tree-wrapper">
                 <pre class="json-content">{{ formatJson(req.request_body) }}</pre>
@@ -146,7 +144,11 @@
             <!-- Response JSON -->
             <div class="json-panel json-panel-response">
               <div class="json-panel-header">
-                <span> 响应 JSON</span>
+                <span>📥 响应 JSON</span>
+                <button class="btn btn-sm btn-outline" style="padding:2px 8px;font-size:11px"
+                        @click.stop="openJsonViewer(req, 'response')">
+                  🌳 树形查看
+                </button>
               </div>
               <div class="json-tree-wrapper">
                 <pre class="json-content">{{ formatJson(req.response_body) }}</pre>
@@ -456,18 +458,13 @@ function tryParseJson(raw) {
   try { return JSON.parse(raw) } catch (e) { return null }
 }
 
-function openTreeInNewTab(req) {
-  const data = {
-    request: tryParseJson(req.request_body) ?? req.request_body,
-    response: tryParseJson(req.response_body) ?? req.response_body,
-    requestHeaders: tryParseJson(req.request_headers) ?? req.request_headers,
-    responseHeaders: tryParseJson(req.response_headers) ?? req.response_headers,
-    metadata: { method: req.method, path: req.path, status_code: req.status_code, duration_ms: req.duration_ms },
-  }
-  const key = 'tree-view-' + Date.now()
-  sessionStorage.setItem(key, JSON.stringify(data))
-  const url = window.location.origin + '/tree-view?key=' + encodeURIComponent(key)
-  window.open(url, '_blank')
+function openJsonViewer(req, type) {
+  const title = `${type === 'request' ? '请求' : '响应'} JSON — ${req.method} ${req.path.slice(0, 80)}`
+  const rawData = type === 'request' ? req.request_body : req.response_body
+  // Store in sessionStorage so the new Vue page can read it
+  sessionStorage.setItem('jsonViewerData', rawData || '')
+  sessionStorage.setItem('jsonViewerTitle', title)
+  window.open(`/json-viewer`, '_blank')
 }
 
 async function handleDeleteRequest(req) {

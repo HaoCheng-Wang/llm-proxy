@@ -350,6 +350,7 @@ table tr:hover td {
   font-weight: 700;
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 6px;
   border-bottom: 1px solid #2c3e50;
 }
