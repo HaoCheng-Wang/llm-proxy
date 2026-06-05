@@ -350,9 +350,23 @@ table tr:hover td {
   font-weight: 700;
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 6px;
   border-bottom: 1px solid #2c3e50;
+}
+.json-panel-header .btn-popout {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.12);
+  color: #85929e;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.json-panel-header .btn-popout:hover {
+  background: rgba(255,255,255,0.15);
+  color: #fff;
 }
 .json-panel-request .json-panel-header {
   background: rgba(52, 152, 219, 0.10);

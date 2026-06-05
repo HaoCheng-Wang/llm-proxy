@@ -1,12 +1,16 @@
 <template>
-  <div class="json-viewer-page">
-    <div class="json-viewer-header">
-      <h2 style="font-size:18px;margin:0">{{ title }}</h2>
-      <button class="btn btn-outline btn-sm" @click="closeOrBack()">✕ 关闭</button>
+  <div style="display:flex;flex-direction:column;height:100vh;background:#0f1923;color:#e0e6ed">
+    <!-- Header -->
+    <div style="display:flex;align-items:center;padding:10px 16px;background:#15222b;border-bottom:1px solid #2c3e50;gap:12px">
+      <span style="font-weight:600;font-size:14px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ title }}</span>
+      <span class="method-tag" :style="{ fontSize: '12px', padding: '2px 8px' }" :class="'method-' + (method || 'get').toLowerCase()">{{ method }}</span>
+      <span style="font-size:12px;color:#85929e;max-width:400px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ path }}</span>
     </div>
-    <div class="json-viewer-content">
-      <JsonTree v-if="parsed" :data="parsed" />
-      <pre v-else class="json-fallback">{{ rawData }}</pre>
+
+    <!-- Content -->
+    <div style="flex:1;overflow:auto;padding:0">
+      <JsonTree v-if="parsedData !== null" :data="parsedData" />
+      <pre v-else style="padding:16px;font-size:13px;line-height:1.6;color:#aeb6bf;white-space:pre-wrap;word-break:break-all">{{ rawText || '(空)' }}</pre>
     </div>
   </div>
 </template>
@@ -15,56 +19,36 @@
 import { ref, onMounted } from 'vue'
 import JsonTree from '../components/JsonTree.vue'
 
-const title = ref('JSON 查看器')
-const rawData = ref('')
-const parsed = ref(null)
-
-function closeOrBack() {
-  // Try to close if opened via window.open, otherwise go back
-  if (window.opener) {
-    window.close()
-  } else {
-    window.history.back()
-  }
-}
+const title = ref('')
+const method = ref('')
+const path = ref('')
+const parsedData = ref(null)
+const rawText = ref('')
 
 onMounted(() => {
-  title.value = sessionStorage.getItem('jsonViewerTitle') || 'JSON 查看器'
-  rawData.value = sessionStorage.getItem('jsonViewerData') || ''
-  try {
-    parsed.value = JSON.parse(rawData.value)
-  } catch {
-    parsed.value = null
+  // Try reading from sessionStorage first (set by PortDetail)
+  title.value = sessionStorage.getItem('json-popup-title') || ''
+  method.value = sessionStorage.getItem('json-popup-method') || ''
+  path.value = sessionStorage.getItem('json-popup-path') || ''
+  const data = sessionStorage.getItem('json-popup-data') || ''
+
+  if (!data) {
+    // Fallback: read from query param (for blocked popup fallback)
+    const params = new URLSearchParams(window.location.search)
+    title.value = params.get('title') || ''
+    const encoded = params.get('data') || ''
+    try {
+      const raw = decodeURIComponent(encoded)
+      try { parsedData.value = JSON.parse(raw) } catch { rawText.value = raw }
+    } catch { rawText.value = encoded }
+  } else {
+    try { parsedData.value = JSON.parse(data) } catch { rawText.value = data }
   }
+
+  // Clean up sessionStorage
+  sessionStorage.removeItem('json-popup-title')
+  sessionStorage.removeItem('json-popup-data')
+  sessionStorage.removeItem('json-popup-method')
+  sessionStorage.removeItem('json-popup-path')
 })
 </script>
-
-<style scoped>
-.json-viewer-page {
-  min-height: 100vh;
-  background: #0f1923;
-  color: #e0e6ed;
-  display: flex;
-  flex-direction: column;
-}
-.json-viewer-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 16px 24px;
-  background: #15222b;
-  border-bottom: 1px solid #2c3e50;
-}
-.json-viewer-content {
-  flex: 1;
-  padding: 16px 24px;
-  overflow: auto;
-}
-.json-fallback {
-  white-space: pre-wrap;
-  word-break: break-all;
-  font-size: 13px;
-  line-height: 1.6;
-  color: #aeb6bf;
-}
-</style>

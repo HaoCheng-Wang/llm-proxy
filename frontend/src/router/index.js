@@ -13,7 +13,7 @@ const routes = [
   { path: '/', name: 'Dashboard', component: Dashboard, meta: { auth: true } },
   { path: '/port/:id', name: 'PortDetail', component: PortDetail, meta: { auth: true } },
   { path: '/admin', name: 'Admin', component: Admin, meta: { auth: true, admin: true } },
-  { path: '/json-viewer', name: 'JsonViewer', component: JsonViewer, meta: { auth: true } },
+  { path: '/json-viewer', name: 'JsonViewer', component: JsonViewer },
 ]
 
 const router = createRouter({
