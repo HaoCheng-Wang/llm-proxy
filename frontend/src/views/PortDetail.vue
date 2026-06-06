@@ -53,8 +53,15 @@
       </div>
     </div>
 
+    <!-- Loading -->
+    <div v-if="initialLoading" class="loading-container">
+      <div class="spinner"></div>
+      <p class="loading-text">正在从后端拉取交互记录...</p>
+      <p class="loading-sub">后端从数据库读取请求/响应记录，发送到浏览器并在页面中缓存，首次加载可能需要数秒</p>
+    </div>
+
     <!-- Requests List -->
-    <div v-if="requests.length > 0">
+    <div v-else-if="requests.length > 0">
       <div class="flex-between mb-16">
         <h3 style="font-size:16px">
           交互记录 ({{ requests.length }})
@@ -209,7 +216,8 @@ const polling = ref(false)
 const loadingMore = ref(false)
 const hasMore = ref(false)
 const scrollLocked = ref(false)
-const methodFilter = ref('api')
+const methodFilter = ref('all')
+const initialLoading = ref(true)
 
 // API requests = POST/PUT/PATCH/DELETE (intelligent agent calls)
 // Other = GET/OPTIONS/HEAD (browser scans, probes, etc.)
@@ -257,6 +265,8 @@ async function loadData() {
     newCount.value = 0
   } catch (e) {
     showToast('加载数据失败', 'error')
+  } finally {
+    initialLoading.value = false
   }
 }
 
