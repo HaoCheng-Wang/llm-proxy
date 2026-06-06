@@ -6,6 +6,7 @@ import Dashboard from '../views/Dashboard.vue'
 import PortDetail from '../views/PortDetail.vue'
 import JsonTreeViewer from '../views/JsonTreeViewer.vue'
 import Admin from '../views/Admin.vue'
+import ChangePassword from '../views/ChangePassword.vue'
 
 const routes = [
   { path: '/login', name: 'Login', component: Login, meta: { guest: true } },
@@ -14,6 +15,7 @@ const routes = [
   { path: '/port/:id', name: 'PortDetail', component: PortDetail, meta: { auth: true } },
   { path: '/json-viewer/:portId/:requestId', name: 'JsonTreeViewer', component: JsonTreeViewer, meta: { auth: true } },
   { path: '/admin', name: 'Admin', component: Admin, meta: { auth: true, admin: true } },
+  { path: '/change-password', name: 'ChangePassword', component: ChangePassword, meta: { auth: true } },
 ]
 
 const router = createRouter({

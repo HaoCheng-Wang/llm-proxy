@@ -14,6 +14,11 @@ class UserLogin(BaseModel):
     password: str
 
 
+class ChangePasswordRequest(BaseModel):
+    old_password: str = Field(..., min_length=1, max_length=100)
+    new_password: str = Field(..., min_length=1, max_length=100)
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"

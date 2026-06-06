@@ -262,6 +262,7 @@ llm-proxy/
         ├── views/
         │   ├── Login.vue         # 登录页
         │   ├── Register.vue      # 注册页
+        │   ├── ChangePassword.vue# 修改密码页
         │   ├── Dashboard.vue     # 端口列表 + 使用说明
         │   ├── PortDetail.vue    # 交互记录详情
         │   ├── JsonTreeViewer.vue# JSON 树形查看（新标签页）
@@ -289,6 +290,7 @@ llm-proxy/
 | `POST` | `/api/auth/register` | 注册（需管理员审批后才能登录） |
 | `POST` | `/api/auth/login` | 登录，返回 JWT token |
 | `GET` | `/api/auth/me` | 当前用户信息 |
+| `POST` | `/api/auth/change-password` | 修改密码（需提供当前密码） |
 
 ### 端口管理
 

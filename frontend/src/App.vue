@@ -9,6 +9,7 @@
         </nav>
       </div>
       <div class="header-right">
+        <router-link to="/change-password" class="nav-link" style="margin-right:8px">修改密码</router-link>
         <span class="username">{{ auth.username }}</span>
         <span v-if="auth.isAdmin" class="badge badge-active">管理员</span>
         <button class="btn btn-outline btn-sm" @click="handleLogout">退出</button>
