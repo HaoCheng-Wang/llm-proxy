@@ -209,7 +209,7 @@ const polling = ref(false)
 const loadingMore = ref(false)
 const hasMore = ref(false)
 const scrollLocked = ref(false)
-const methodFilter = ref('all')
+const methodFilter = ref('api')
 
 // API requests = POST/PUT/PATCH/DELETE (intelligent agent calls)
 // Other = GET/OPTIONS/HEAD (browser scans, probes, etc.)
