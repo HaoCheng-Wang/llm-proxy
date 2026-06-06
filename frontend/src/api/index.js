@@ -34,6 +34,7 @@ export default {
   login: (data) => http.post('/auth/login', data).then(r => r.data),
   register: (data) => http.post('/auth/register', data).then(r => r.data),
   getMe: () => http.get('/auth/me').then(r => r.data),
+  changePassword: (data) => http.post('/auth/change-password', data).then(r => r.data),
 
   // Ports
   listPorts: () => http.get('/ports').then(r => r.data),
