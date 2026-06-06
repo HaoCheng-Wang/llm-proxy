@@ -138,12 +138,10 @@ nohup uv run python backend/main.py > back.log 2>&1 & echo $! > back.pid
 ```bash
 cd frontend
 npm install
-nohup npx vite --port 3999 > ../front.log 2>&1 & echo $! > ../front.pid
+npm run dev
 ```
 
-> 前端以后台方式运行，日志输出到项目根目录下的 `front.log`，进程 ID 写入 `front.pid`。
-> 查看日志：`tail -f front.log`
-> 停止前端：`kill $(cat front.pid)`
+> 前端在终端前台运行，日志直接输出到终端。停止前端：`Ctrl+C`。
 
 前端 Vite 开发服务器会自动代理 `/api` 到 `localhost:3998`。
 
