@@ -19,3 +19,10 @@ dependencies = [
     "httpx>=0.28.0",
     "starlette>=0.41.0",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "stress: Stress/load tests that may take longer to run",
+]
