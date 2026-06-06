@@ -13,7 +13,7 @@ import sys
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from database import init_database
+from database import init_database, setup_schema
 import database
 from models import User
 from auth import hash_password
@@ -127,6 +127,12 @@ def health_check():
 # ---- Run ----
 if __name__ == "__main__":
     import uvicorn
+
+    # Run DDL once in the main process before forking workers.
+    # This avoids concurrent DDL errors when API_WORKERS > 1.
+    print("[Main] Running schema setup (pre-fork)...")
+    setup_schema()
+
     uvicorn.run(
         "main:app",
         host="0.0.0.0",

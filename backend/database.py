@@ -59,11 +59,40 @@ def _init_engine():
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
-def _migrate_columns():
-    """Ensure request storage columns use LONGTEXT; add missing columns and indexes."""
-    if engine is None:
-        return
-    with engine.connect() as conn:
+
+def setup_schema():
+    """Run DDL once in the main process **before** uvicorn forks workers.
+
+    Creates a short-lived engine, ensures the database and all tables /
+    columns / indexes exist, then disposes the engine.  This guarantees
+    that concurrent worker startups never collide on DDL statements.
+
+    Called from ``main.py`` before ``uvicorn.run(…)``.
+    """
+    _ensure_database()
+    _ddl_engine = create_engine(
+        DATABASE_URL,
+        connect_args={
+            "connect_timeout": 10,
+            "read_timeout": 30,
+            "write_timeout": 30,
+        },
+    )
+    try:
+        import models  # noqa: F401
+        Base.metadata.create_all(bind=_ddl_engine)
+        print("[DB] All tables verified")
+
+        # Run column migration with the temp engine
+        _migrate_columns_on_engine(_ddl_engine)
+    finally:
+        _ddl_engine.dispose()
+        print("[DB] Schema setup complete (DDL engine disposed)")
+
+
+def _migrate_columns_on_engine(eng):
+    """Like ``_migrate_columns()`` but accepts an explicit engine argument."""
+    with eng.connect() as conn:
         try:
             conn.execute(text(
                 "ALTER TABLE requests ADD COLUMN response_body_raw LONGTEXT NULL"
@@ -83,7 +112,6 @@ def _migrate_columns():
             except Exception:
                 conn.rollback()
 
-        # Add indexes for faster queries (idempotent - ignore if already exists)
         for idx_name, idx_sql in [
             ("ix_requests_port_id", "CREATE INDEX ix_requests_port_id ON requests (port_id)"),
             ("ix_requests_created_at", "CREATE INDEX ix_requests_created_at ON requests (created_at)"),
@@ -99,13 +127,14 @@ def _migrate_columns():
 
 
 def init_database():
-    """Full initialization: DB → tables → migrations."""
-    _ensure_database()
+    """Per-worker startup: create a dedicated connection pool for this process.
+
+    All DDL (schema + migrations) has already been applied by
+    ``setup_schema()`` in the parent process before fork, so this is
+    safe to call concurrently from every uvicorn worker.
+    """
     _init_engine()
-    import models  # noqa: F401
-    Base.metadata.create_all(bind=engine)
-    print(f"[DB] All tables verified (pool_size={DB_POOL_SIZE}, max_overflow={DB_MAX_OVERFLOW})")
-    _migrate_columns()
+    print(f"[DB] Engine ready (pool_size={DB_POOL_SIZE}, max_overflow={DB_MAX_OVERFLOW})")
 
 
 def get_db():

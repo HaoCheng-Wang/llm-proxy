@@ -112,17 +112,23 @@ uv sync
 
 ```bash
 # 方式 A（conda 环境）
-python backend/main.py
+nohup python backend/main.py > back.log 2>&1 & echo $! > back.pid
 
 # 方式 B（uv 环境）
-uv run python backend/main.py
+nohup uv run python backend/main.py > back.log 2>&1 & echo $! > back.pid
 ```
 
-输出示例：
+> 后端以后台方式运行，日志输出到 `back.log`，进程 ID 写入 `back.pid`。
+> 查看日志：`tail -f back.log`
+> 停止后端：`kill $(cat back.pid)`
+
+输出示例（`tail -f back.log`）：
 ```
+[Main] Running schema setup (pre-fork)...
 [DB] Database 'llm_proxy' is ready
-[DB] All tables verified (pool_size=20, max_overflow=40)
-[DB] Column migration complete
+[DB] All tables verified
+[DB] Schema setup complete (DDL engine disposed)
+[DB] Engine ready (pool_size=20, max_overflow=40)
   Created admin user: admin
 [Main] Management API ready on port 3998
 ```
@@ -132,8 +138,12 @@ uv run python backend/main.py
 ```bash
 cd frontend
 npm install
-npm run dev
+nohup npm run dev > ../front.log 2>&1 & echo $! > ../front.pid
 ```
+
+> 前端以后台方式运行，日志输出到项目根目录下的 `front.log`，进程 ID 写入 `front.pid`。
+> 查看日志：`tail -f front.log`
+> 停止前端：`kill $(cat front.pid)`
 
 前端 Vite 开发服务器会自动代理 `/api` 到 `localhost:3998`。
 
