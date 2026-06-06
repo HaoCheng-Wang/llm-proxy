@@ -138,7 +138,7 @@ nohup uv run python backend/main.py > back.log 2>&1 & echo $! > back.pid
 ```bash
 cd frontend
 npm install
-nohup npm run dev > ../front.log 2>&1 & echo $! > ../front.pid
+nohup npx vite --port 3999 > ../front.log 2>&1 & echo $! > ../front.pid
 ```
 
 > 前端以后台方式运行，日志输出到项目根目录下的 `front.log`，进程 ID 写入 `front.pid`。
