@@ -1,12 +1,3 @@
-# ---- Stage 1: Build Vue frontend ----
-FROM node:22-alpine AS frontend-builder
-WORKDIR /src/frontend
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm ci 2>/dev/null || npm install
-COPY frontend/ ./
-RUN npm run build
-
-# ---- Stage 2: Python backend ----
 FROM python:3.14-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
@@ -22,9 +13,6 @@ RUN uv venv /app/.venv \
 
 # Copy backend source
 COPY backend/ ./backend/
-
-# Copy built frontend assets
-COPY --from=frontend-builder /src/frontend/dist ./frontend/dist
 
 EXPOSE 3998 3999
 
