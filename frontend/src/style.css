@@ -588,6 +588,37 @@ table tr:hover td {
   color: #85929e;
 }
 
+/* ---- Loading Spinner ---- */
+.loading-container {
+  text-align: center;
+  padding: 60px 24px;
+}
+
+.spinner {
+  width: 40px;
+  height: 40px;
+  margin: 0 auto 16px;
+  border: 3px solid rgba(52, 152, 219, 0.2);
+  border-top-color: #3498db;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.loading-text {
+  color: #85929e;
+  font-size: 14px;
+}
+
+.loading-sub {
+  color: #566573;
+  font-size: 12px;
+  margin-top: 6px;
+}
+
 /* ---- Utilities ---- */
 .flex { display: flex; }
 .flex-between { display: flex; justify-content: space-between; align-items: center; }
