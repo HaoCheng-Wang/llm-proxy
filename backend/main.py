@@ -9,7 +9,6 @@ Architecture: Shared Proxy — all traffic flows through a single endpoint.
     1 = logical port number identifying the proxy configuration
 """
 import sys
-import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,11 +18,10 @@ from models import User
 from auth import hash_password
 from config import (
     DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD,
-    API_PORT, CORS_ORIGINS, STREAM_RECONSTRUCTION_INTERVAL,
+    API_PORT, CORS_ORIGINS,
 )
 from proxy_manager import ProxyManager
 from proxy_app import close_shared_client
-from stream_reconstructor import stream_reconstruction_worker
 
 
 # ---- Lifecycle ----
@@ -43,25 +41,11 @@ async def lifespan(app: FastAPI):
     print("[Main] Loading proxy configurations from database...")
     await proxy_manager.restore_from_database()
 
-    # Start the stream reconstruction background worker.
-    # This task runs forever (cancelled on shutdown) and periodically
-    # assembles completed SSE streams into final Request records.
-    reconstruction_task = asyncio.create_task(
-        stream_reconstruction_worker(STREAM_RECONSTRUCTION_INTERVAL)
-    )
-
     print(f"[Main] Management API + Shared Proxy ready on port {API_PORT}")
     print(f"[Main] Proxy URL format: http://<server>:{API_PORT}/<port_number>/v1/...")
     yield
 
     # Shutdown
-    print("[Main] Stopping stream reconstruction worker...")
-    reconstruction_task.cancel()
-    try:
-        await reconstruction_task
-    except asyncio.CancelledError:
-        pass
-
     print("[Main] Closing shared HTTP client...")
     await close_shared_client()
 
@@ -70,6 +54,9 @@ async def lifespan(app: FastAPI):
         database.engine.dispose()
     if database._log_engine:
         database._log_engine.dispose()
+
+    print("[Main] Shutting down DB executor thread pool...")
+    database.shutdown_db_executor()
 
     print("[Main] Shutdown complete.")
 

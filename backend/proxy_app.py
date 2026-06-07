@@ -12,11 +12,6 @@ import traceback
 import asyncio
 import httpx
 import certifi
-from urllib.parse import urlparse
-from starlette.applications import Starlette
-from starlette.routing import Route
-from starlette.requests import Request
-from starlette.responses import Response, JSONResponse, StreamingResponse
 import database
 from models import Port, Request as RequestModel
 from config import PORT_CACHE_TTL, HTTPX_MAX_CONNECTIONS, HTTPX_MAX_KEEPALIVE_CONNECTIONS
@@ -32,40 +27,14 @@ def _sanitize_text(value: str | None) -> str | None:
         value.encode("utf-8")
         return value
     except UnicodeEncodeError:
-        # 收集所有 surrogate 字符的信息
-        surrogates = []
-        for i, ch in enumerate(value):
-            if "\uD800" <= ch <= "\uDFFF":
-                surrogates.append((i, ch))
-        
-        # 输出第一个 surrogate 的详细信息
-        if surrogates:
-            pos, ch = surrogates[0]
-            ctx_start = max(0, pos - 40)
-            ctx_end = min(len(value), pos + 40)
-            
-            # 用 surrogatepass 编码获取原始字节
-            try:
-                raw_bytes = value.encode("utf-8", errors="surrogatepass")
-                # 找到 surrogate 对应的字节位置（大约）
-                byte_pos = len(value[:pos].encode("utf-8", errors="surrogatepass"))
-                raw_hex = raw_bytes[byte_pos:byte_pos+3].hex()
-            except:
-                raw_hex = "N/A"
-            
-            print(
-                f"[Sanitize] Found {len(surrogates)} surrogate(s). "
-                f"First at position {pos}: U+{ord(ch):04X} (raw bytes: {raw_hex})",
-                file=sys.stderr,
-            )
-            print(
-                f"[Sanitize] Context: {value[ctx_start:ctx_end]!r}",
-                file=sys.stderr,
-            )
-        
+        # Count surrogates for a concise single-line warning
+        surrogate_count = sum(
+            1 for ch in value if "\uD800" <= ch <= "\uDFFF"
+        )
         cleaned = value.encode("utf-8", errors="replace").decode("utf-8")
         print(
-            f"[Sanitize] Replaced surrogates, {len(value)} → {len(cleaned)} chars",
+            f"[Sanitize] Replaced {surrogate_count} surrogate(s), "
+            f"{len(value)} → {len(cleaned)} chars",
             file=sys.stderr,
         )
         return cleaned
@@ -125,7 +94,10 @@ def refresh_port_cache(db=None):
 
 
 def _maybe_refresh_cache():
-    """Refresh cache from DB if TTL has expired."""
+    """Refresh cache from DB if TTL has expired.
+
+    Safe to call from the event loop (never from a thread-pool thread).
+    """
     if time.time() - _cache_updated_at > PORT_CACHE_TTL:
         refresh_port_cache()
 
@@ -136,10 +108,14 @@ def get_target_url(port_number: int) -> str | None:
     WARNING: This is a SYNC function — it may perform blocking DB queries.
     Use ``aget_target_url()`` from async contexts to avoid blocking the event loop.
     """
-    # Check cache first (with TTL auto-refresh)
+    # Check cache first (with TTL auto-refresh).
+    # Capture the dict reference ONCE to avoid a TOCTOU race where
+    # refresh_port_cache (running in a thread) replaces the dict between
+    # the membership check and the subscript lookup.
     _maybe_refresh_cache()
-    if port_number in _port_target_cache:
-        return _port_target_cache[port_number]
+    cache = _port_target_cache
+    if port_number in cache:
+        return cache[port_number]
 
     # Cache miss — query DB and update cache
     db = database.SessionLocal()
@@ -173,14 +149,19 @@ async def aget_target_url(port_number: int) -> str | None:
     to avoid blocking the asyncio event loop on synchronous DB operations.
     """
     # ── Fast path: cache hit ──
+    # Capture the dict reference ONCE to avoid a TOCTOU race where
+    # refresh_port_cache (running in a thread via _arefresh_port_cache)
+    # replaces the dict between the membership check and the subscript lookup.
     if time.time() - _cache_updated_at <= PORT_CACHE_TTL:
-        if port_number in _port_target_cache:
-            return _port_target_cache[port_number]
+        cache = _port_target_cache
+        if port_number in cache:
+            return cache[port_number]
     else:
         # Cache TTL expired — refresh async (DB query in thread)
         await _arefresh_port_cache()
-        if port_number in _port_target_cache:
-            return _port_target_cache[port_number]
+        cache = _port_target_cache
+        if port_number in cache:
+            return cache[port_number]
 
     # ── Slow path: cache miss — async DB lookup ──
     loop = asyncio.get_running_loop()
@@ -208,7 +189,8 @@ def _save_to_db(port_number: int, method: str, path: str,
                 req_headers: str, req_body: str | None,
                 resp_headers: str, resp_body: str | None,
                 status_code: int, duration_ms: int,
-                resp_body_raw: str | None = None):
+                resp_body_raw: str | None = None,
+                reconstruction_error: bool = False):
     """Save a request/response record to the database. Runs in a thread.
     Retries up to 3 times on transient connection errors.
 
@@ -244,6 +226,7 @@ def _save_to_db(port_number: int, method: str, path: str,
                 response_body_raw=_sanitize_text(resp_body_raw),
                 status_code=status_code,
                 duration_ms=duration_ms,
+                reconstruction_error=reconstruction_error,
             )
             db.add(record)
             db.commit()
@@ -266,7 +249,8 @@ async def _save_record_async(port_number: int, method: str, path: str,
                               req_headers: str, req_body: str | None,
                               resp_headers: str, resp_body: str | None,
                               status_code: int, duration_ms: int,
-                              resp_body_raw: str | None = None):
+                              resp_body_raw: str | None = None,
+                              reconstruction_error: bool = False):
     """Async wrapper — runs the sync DB save in the dedicated log thread pool.
 
     Uses ``database._db_executor`` (configured via DB_SAVE_WORKERS) so that
@@ -281,6 +265,7 @@ async def _save_record_async(port_number: int, method: str, path: str,
         resp_headers, resp_body,
         status_code, duration_ms,
         resp_body_raw,
+        reconstruction_error,
     )
 
 
@@ -332,10 +317,11 @@ def _serialize_body(body_bytes: bytes, label: str = "body") -> str | None:
 #  SSE format auto-detection
 # ──────────────────────────────────────────────
 
-# Anthropic Messages API event types
+# Anthropic Messages API event types (including error and ping for detection)
 _ANTHROPIC_EVENT_TYPES = frozenset({
     "message_start", "content_block_start", "content_block_delta",
-    "content_block_stop", "message_delta", "message_stop", "ping",
+    "content_block_stop", "message_delta", "message_stop",
+    "ping", "error",
 })
 
 # OpenAI Responses API event type prefixes
@@ -406,6 +392,7 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
     BLOCK_SERVER_TOOL_USE = "server_tool_use"
     BLOCK_THINKING = "thinking"
     BLOCK_COMPACTION = "compaction"
+    BLOCK_SEARCH_TOOL = "search_tool"
 
     blocks: dict[int, dict] = {}
     # Each block: {"type": str, "text": str, "thinking": str, "signature": str,
@@ -472,6 +459,15 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
                     blocks[idx]["text"] = cb.get("text", "")
                     # Citations may accumulate
                     blocks[idx]["citations"] = []
+                elif block_type in (BLOCK_SEARCH_TOOL,):
+                    blocks[idx].update({
+                        "id": cb.get("id", ""),
+                        "name": cb.get("name", ""),
+                        "input_json": "",
+                    })
+                else:
+                    # Unknown future block type — accumulate as generic text
+                    blocks[idx]["_text"] = cb.get("text", "")
 
             # ── content_block_delta ──
             elif event_type == CB_DELTA:
@@ -512,6 +508,12 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
                 elif delta_type == DELTA_COMPACTION:
                     blocks[idx]["content"] = delta.get("content", "")
                     blocks[idx]["encrypted_content"] = delta.get("encrypted_content", "")
+                else:
+                    # Unknown delta type — concatenate all string values as text
+                    for dk, dv in delta.items():
+                        if dk != "type" and isinstance(dv, str):
+                            blocks[idx].setdefault("text", "")
+                            blocks[idx]["text"] += dv
 
             # ── content_block_stop ── (no data needed, index is enough)
             elif event_type == CB_STOP:
@@ -533,6 +535,17 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
             # ── message_stop ── (end of stream, no data)
             elif event_type == MSG_STOP:
                 pass
+
+            # ── error ── (upstream API reported an error — capture it)
+            elif event_type == "error":
+                err_info = event.get("error", {})
+                stop_reason = "error"
+                stop_details = {"api_error": err_info}
+                print(
+                    f"[Proxy] Anthropic SSE stream contains error event: "
+                    f"{err_info}",
+                    file=sys.stderr,
+                )
 
         # ── Build reconstructed message ──
         content_blocks = []
@@ -560,7 +573,7 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
                     "encrypted_content": b.get("encrypted_content", ""),
                 })
 
-            elif block_type in (BLOCK_TOOL_USE, BLOCK_SERVER_TOOL_USE):
+            elif block_type in (BLOCK_TOOL_USE, BLOCK_SERVER_TOOL_USE, BLOCK_SEARCH_TOOL):
                 tool_block = {
                     "type": block_type,
                     "id": b.get("id", ""),
@@ -574,6 +587,18 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
                     except json.JSONDecodeError:
                         tool_block["input"] = raw_input
                 content_blocks.append(tool_block)
+
+            else:
+                # Unknown block type — emit as-is with any accumulated content
+                plain = {"type": block_type}
+                if b.get("text"):
+                    plain["text"] = b["text"]
+                for key in ("id", "name", "thinking", "signature"):
+                    if b.get(key):
+                        plain[key] = b[key]
+                if b.get("_text"):
+                    plain["content"] = b["_text"]
+                content_blocks.append(plain)
 
         # Merge input + output usage (preserve all fields from both)
         usage = None
@@ -1089,201 +1114,40 @@ def _reconstruct_sse_to_json(raw_sse: str) -> str | None:
             fmt = _detect_sse_format(first_chunk)
 
             if fmt == "anthropic":
-                return _parse_anthropic_sse(raw_sse)
+                result = _parse_anthropic_sse(raw_sse)
+                if result is not None:
+                    return result
+                print(
+                    "[Proxy] Anthropic parser returned None, "
+                    "falling back to universal",
+                    file=sys.stderr,
+                )
             elif fmt == "openai_responses":
-                return _parse_openai_responses_sse(raw_sse)
+                result = _parse_openai_responses_sse(raw_sse)
+                if result is not None:
+                    return result
+                print(
+                    "[Proxy] OpenAI Responses parser returned None, "
+                    "falling back to universal",
+                    file=sys.stderr,
+                )
             elif fmt == "gemini":
-                return _parse_gemini_sse(raw_sse)
+                result = _parse_gemini_sse(raw_sse)
+                if result is not None:
+                    return result
             elif fmt == "openai_chat":
-                return _parse_openai_chat_sse(raw_sse)
-            else:
-                return _parse_generic_sse(raw_sse)
+                result = _parse_openai_chat_sse(raw_sse)
+                if result is not None:
+                    return result
+            # Always try universal as ultimate fallback
+            return _parse_generic_sse(raw_sse)
         except (json.JSONDecodeError, Exception):
             continue
 
     return None
 
 
-async def proxy_endpoint(request: Request):
-    """Main proxy handler — intercepts, forwards, records.
-    Handles both regular JSON and streaming (SSE) responses."""
-    start_time = time.time()
 
-    # Determine the port this request came in on
-    port_number = request.scope.get("server", (None, None))[1]
-    if not port_number:
-        return JSONResponse({"error": "Cannot determine port"}, status_code=500)
-
-    # Look up target URL
-    target_url = get_target_url(port_number)
-    if not target_url:
-        return JSONResponse(
-            {"error": f"No active proxy configured for port {port_number}"},
-            status_code=404
-        )
-
-    # Build target URL
-    path = request.url.path
-    query_string = str(request.url.query)
-    target_full_url = f"{target_url.rstrip('/')}{path}"
-    if query_string:
-        target_full_url += f"?{query_string}"
-
-    # Read request body
-    try:
-        body = await request.body()
-    except Exception:
-        body = b""
-
-    # Serialize request
-    req_headers_dict = dict(request.headers)
-    req_headers_json = json.dumps(req_headers_dict, ensure_ascii=False, indent=2)
-    req_body_str = _serialize_body(body, label="request")
-
-    # Prepare forward headers
-    forward_headers = {
-        k: v for k, v in req_headers_dict.items()
-        if k.lower() not in EXCLUDE_HEADERS
-    }
-    parsed_target = urlparse(target_url)
-    forward_headers["host"] = parsed_target.netloc
-    # Let httpx set accept-encoding properly
-    forward_headers.pop("accept-encoding", None)
-
-    # Forward the request
-    status_code = 502
-    resp_body_str = None
-    resp_headers_json = "{}"
-    resp_content_type = "application/json"
-    is_streaming = False
-    stream_owned_by_generator = False
-    stream_ctx = None
-
-    try:
-        client = get_shared_client()
-
-        # Use client.stream() for ALL requests to avoid httpx buffering.
-        # httpx.AsyncClient.request() buffers the entire response body before
-        # returning, which causes streaming (SSE) responses to arrive all at
-        # once at the downstream client.  client.stream() returns immediately
-        # after receiving response headers — chunks then arrive in real-time.
-        stream_ctx = client.stream(
-            method=request.method,
-            url=target_full_url,
-            headers=forward_headers,
-            content=body if body else None,
-        )
-        response = await stream_ctx.__aenter__()
-
-        status_code = response.status_code
-        resp_headers_json = json.dumps(dict(response.headers), ensure_ascii=False, indent=2)
-        resp_content_type = response.headers.get("content-type", "application/json")
-
-        # Check if the response is streaming (SSE)
-        is_streaming = "text/event-stream" in resp_content_type
-
-        if is_streaming:
-            # --- STREAMING: forward chunks in real-time, accumulate for recording ---
-            # The stream_ctx lifecycle is transferred to the generator.  Its
-            # finally block calls __aexit__, so do NOT close it here on the
-            # success path.  Set a flag so the outer finally block also knows
-            # to skip cleanup on this path.
-            stream_owned_by_generator = True
-
-            async def stream_generator():
-                chunks = []
-                try:
-                    async for chunk in response.aiter_bytes():
-                        chunks.append(chunk)
-                        yield chunk
-                    # After streaming completes, reconstruct JSON and save
-                    full_body = b"".join(chunks)
-                    raw_sse_text = full_body.decode("utf-8", errors="replace")
-                    reconstructed_json = _reconstruct_sse_to_json(raw_sse_text)
-
-                    await _save_record_async(
-                        port_number, request.method,
-                        path + ("?" + query_string if query_string else ""),
-                        req_headers_json, req_body_str,
-                        resp_headers_json,
-                        reconstructed_json,           # response_body
-                        status_code,
-                        int((time.time() - start_time) * 1000),
-                        resp_body_raw=raw_sse_text,   # response_body_raw
-                    )
-                finally:
-                    # Always close the httpx stream context when done
-                    await stream_ctx.__aexit__(None, None, None)
-
-            response_headers = {"X-Proxy-Port": str(port_number)}
-            return StreamingResponse(
-                stream_generator(),
-                status_code=status_code,
-                media_type=resp_content_type,
-                headers=response_headers,
-            )
-        else:
-            # --- NON-STREAMING: read full response, save, return ---
-            full_body = b""
-            async for chunk in response.aiter_bytes():
-                full_body += chunk
-            await stream_ctx.__aexit__(None, None, None)
-            stream_owned_by_generator = False  # already closed above
-            resp_body_str = _serialize_body(full_body, label="response")
-
-    except httpx.TimeoutException:
-        status_code = 504
-        resp_body_str = '{"error": "Upstream timeout"}'
-        is_streaming = False
-    except httpx.ConnectError as e:
-        status_code = 502
-        inner = e.__cause__ or e.__context__ or None
-        inner_str = f"{type(inner).__name__}: {inner}" if inner else "no further detail"
-        resp_body_str = json.dumps({"error": f"Cannot connect: {inner_str}"})
-        is_streaming = False
-    except Exception as e:
-        status_code = 502
-        resp_body_str = json.dumps({"error": f"Proxy error: {str(e)}"})
-        is_streaming = False
-    finally:
-        # Close the httpx stream on error paths, or on the non-streaming
-        # success path that somehow didn't close (defensive).
-        # On the streaming success path, the generator's finally block owns
-        # cleanup — skip it here.
-        if stream_ctx is not None and not stream_owned_by_generator:
-            try:
-                await stream_ctx.__aexit__(None, None, None)
-            except Exception:
-                pass
-
-    duration_ms = int((time.time() - start_time) * 1000)
-
-    # Save non-streaming record in background — don't block the response
-    if not is_streaming:
-        asyncio.create_task(_save_record_async(
-            port_number, request.method,
-            path + ("?" + query_string if query_string else ""),
-            req_headers_json, req_body_str,
-            resp_headers_json, resp_body_str,
-            status_code, duration_ms,
-        ))
-
-    # Return response with original content-type
-    response_headers = {"X-Proxy-Port": str(port_number)}
-    if resp_body_str and status_code != 204:
-        return Response(
-            content=resp_body_str,
-            status_code=status_code,
-            media_type=resp_content_type,
-            headers=response_headers,
-        )
-    return Response(status_code=status_code, headers=response_headers)
-
-
-def create_proxy_app() -> Starlette:
-    """Create a Starlette app that acts as a reverse proxy."""
-    routes = [
-        Route("/{path:path}", endpoint=proxy_endpoint,
-              methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]),
-    ]
-    return Starlette(routes=routes)
+# NOTE: The old per-port proxy endpoint (proxy_endpoint / create_proxy_app)
+# was removed in favour of the shared-proxy architecture in shared_proxy.py.
+# All proxy traffic now flows through shared_proxy_endpoint().

@@ -35,7 +35,7 @@ flowchart LR
 | 服务器 | 单进程 FastAPI + asyncio，一个端口处理千级并发 |
 | 配置存储 | MySQL，所有状态持久化，内存缓存 + TTL 加速 |
 | 安全 | JWT 认证 + bcrypt + SSRF 防护 + CORS |
-| 流式处理 | Write-Ahead 逐 chunk 写 MySQL，后台 Worker 异步重建 JSON |
+| 流式处理 | SpooledTemporaryFile 流内缓冲，流结束一次性写入 MySQL |
 
 ### 路由优先级
 
@@ -132,36 +132,29 @@ sequenceDiagram
     Note over P,D: 后台写入，不阻塞响应
 ```
 
-### 4. 代理转发（流式 SSE — Write-Ahead 架构）
+### 4. 代理转发（流式 SSE — SpooledTemporaryFile 架构）
 
 ```mermaid
 sequenceDiagram
     participant C as 智能体
     participant P as LLM Proxy
     participant D as MySQL
-    participant W as 重建 Worker
     participant U as 上游 LLM API
 
     C->>P: POST /12345/v1/chat/completions
-    P->>D: INSERT stream_sessions (元数据)
     P->>U: httpx.stream 转发
 
     loop 逐 chunk
         U-->>P: SSE chunk
         P-->>C: yield chunk (立即透传)
-        P--)D: asyncio.create_task → INSERT stream_chunks(seq=N)
+        P->>P: SpooledTemporaryFile.write(chunk)
+        Note over P: ≤10MB 内存, >10MB 溢写临时文件
     end
 
-    Note over P: await asyncio.wait(pending_tasks)
-    P->>D: UPDATE stream_sessions SET is_complete=1
-
-    loop 每 5 秒轮询
-        W->>D: SELECT WHERE is_complete=1 AND is_processed=0
-        W->>D: SELECT chunks ORDER BY seq
-        W->>W: b"".join → SSE 重建 JSON
-        W->>D: INSERT requests (response_body + response_body_raw)
-        W->>D: DELETE chunks + DELETE session
-    end
+    P->>P: resp_buf.read() → 完整 SSE body
+    P->>P: _reconstruct_sse_to_json() → 重组 JSON
+    P--)D: asyncio.create_task → INSERT requests
+    Note over P,D: 一次 INSERT, 不阻塞客户端
 ```
 
 ### 5. 数据入库（关键保证）
@@ -185,7 +178,6 @@ sequenceDiagram
 - 端口被删除 → 记录仍写入，`port_id=NULL`
 - SSE 重建失败 → `response_body_raw` 保留原始数据，`reconstruction_error=True`
 - DB 写入失败 → 3 次重试
-- Worker 异常 → 兜底逻辑直接保存原始 SSE 文本
 
 ### 6. 代理端口生命周期
 
@@ -231,21 +223,10 @@ users                        ports                       requests
                             │ created_at       │        │ response_body        │
                             └──────────────────┘        │ response_body_raw    │
                                                         │ status_code          │
-stream_sessions               stream_chunks             │ duration_ms          │
-┌──────────────────┐         ┌──────────────────┐       │ reconstruction_error │
-│ id (PK)          │──┐      │ id (PK)          │       │ created_at           │
-│ stream_id (UQ)   │  │ 1:N  │ stream_id (FK)   │       └──────────────────────┘
-│ port_number      │──┘      │ seq              │
-│ method           │         │ chunk_data       │
-│ path             │         └──────────────────┘
-│ request_headers  │
-│ request_body     │         stream_sessions + stream_chunks 是 Write-Ahead 临时表
-│ response_headers │         Worker 重建后自动清理
-│ status_code      │
-│ is_complete      │
-│ is_processed     │
-│ error_message    │
-└──────────────────┘
+                                                        │ duration_ms          │
+                                                        │ reconstruction_error │
+                                                        │ created_at           │
+                                                        └──────────────────────┘
 ```
 
 ## 安全设计
@@ -273,8 +254,8 @@ stream_sessions               stream_chunks             │ duration_ms         
 | 上游连接数 | httpx 共享连接池 | 200 总连接 / 50 keep-alive |
 | 端口查找 | 内存缓存 + TTL | 5 秒过期，缓存命中率 99.9%+ |
 | 请求体 OOM | SpooledTemporaryFile | ≤10MB 内存，>10MB 溢写磁盘 |
-| 流式内存累积 | Write-Ahead 逐 chunk 写 MySQL | 代理进程零内存/零磁盘累积 |
-| 流式重建 | 后台 Worker 异步处理 | 每 5 秒批处理 10 条 |
+| 流式内存累积 | SpooledTemporaryFile | ≤10MB 内存, >10MB 自动溢写临时文件 |
+| 流式重建 | 流结束后立即同步重组 | 无需后台 Worker, 即写即见 |
 
 ### 为什么不需要多进程
 
@@ -287,7 +268,7 @@ stream_sessions               stream_chunks             │ duration_ms         
 
 如需高可用，应使用多容器 + 负载均衡，而非单机多进程。
 
-## SSE 流式处理
+## SSE 流式处理（SpooledTemporaryFile 架构）
 
 ### 格式支持
 
@@ -299,69 +280,29 @@ stream_sessions               stream_chunks             │ duration_ms         
 | Google Gemini | `candidates[]` 存在 | 累积 parts[].text |
 | 通用/未知 | 以上均不匹配 | 深度合并 + content 字段提取 + 递归遍历 |
 
-### Write-Ahead 时序保证
+### 流内缓冲
 
-```mermaid
-sequenceDiagram
-    participant G as stream_generator
-    participant T as asyncio Task Pool
-    participant D as MySQL
-
-    loop 每个 chunk
-        G->>G: yield chunk (客户端立即收到)
-        G->>T: create_task(INSERT stream_chunks)
-        Note over T: 后台并行执行
-    end
-
-    G->>T: await asyncio.wait(pending_tasks)
-    Note over G,T: 确保所有 INSERT 完成后才继续
-
-    G->>T: create_task(UPDATE is_complete=1)
-    Note over G,T: 通知 Worker
-```
-
-`asyncio.wait(pending_tasks)` 保证 Worker 永远不会看到不完整的 chunk 集合。
-
-### 重建 Worker 设计
-
-流式 SSE 的重建由一个后台 asyncio task 负责，运行在 FastAPI 的 lifespan 内。
-
-**为什么要单独的 Worker？**
-
-代理进程的核心职责是实时透传——收到 chunk 立即 `yield`，不能停顿。而 SSE 重建（拼接所有 chunk、JSON 解析、写入 `requests` 表）是重操作，必须和转发异步解耦。
-
-**Worker 生命周期**
+每个流式请求创建一个独立的 `SpooledTemporaryFile` 对象：
 
 ```
-FastAPI startup
-    │
-    └─ asyncio.create_task(stream_reconstruction_worker(5))
-            │
-            └─ while True:
-                │
-                ├─ loop.run_in_executor(_db_executor, _process_completed_streams)
-                │       │
-                │       ├─ SELECT is_complete=1 AND is_processed=0 LIMIT 10
-                │       ├─ 对每个 session：
-                │       │   ├─ GET_LOCK('recon_{stream_id}', 0)  ← 多机互斥
-                │       │   ├─ SELECT * FROM stream_chunks ORDER BY seq
-                │       │   ├─ b"".join(chunks) → _reconstruct_sse_to_json()
-                │       │   ├─ INSERT INTO requests
-                │       │   ├─ DELETE FROM stream_chunks
-                │       │   ├─ DELETE FROM stream_sessions
-                │       │   └─ RELEASE_LOCK
-                │       └─ 重建失败 → 兜底保存 raw_sse_text + error_message
-                │
-                └─ await asyncio.sleep(5)  ← 下一次轮询
+async for chunk in response.aiter_bytes():
+    yield chunk                        # ① 立即发给客户端
+    resp_buf.write(chunk)              # ② 写入缓冲区
+
+# 流结束
+resp_buf.seek(0)
+full_body = resp_buf.read()           # ③ 读出完整 SSE
+reconstructed = _reconstruct_sse_to_json(full_body)  # ④ 重组 JSON
+asyncio.create_task(_save_record_async(...))          # ⑤ 一次性写入 requests
 ```
 
-**为什么 Worker 也跑在 `_db_executor` 线程池里？**
+**为什么不在流进行中写 MySQL？**
 
-SSE 解析（`_reconstruct_sse_to_json`）和 `b"".join(chunks)` 都是同步 CPU 操作。直接放在 asyncio 协程中会阻塞事件循环。所以整个 `_process_completed_streams` 通过 `run_in_executor` 投递到专用线程池。
+每个 SSE 流可能产生数百到数千个 chunk，每个 chunk 几十到几百字节。逐 chunk INSERT 会产生大量数据库写入（redo log、undo log、binlog、索引维护），对 MySQL 造成不必要的压力。SpooledTemporaryFile 在流中进行零 I/O（内存模式），流结束后一次性写入 —— 从 N 次 INSERT 降为 1 次。
 
-**多机互斥**
+**溢出到磁盘**
 
-多个代理实例各有一个 Worker，通过 MySQL 命名锁 `GET_LOCK('recon_{stream_id}', 0)` 互斥。参数 `0` 表示不等待，拿不到锁直接跳过，保证同一个 stream 不会被两个 Worker 重复处理。
+SpooledTemporaryFile 在小于 `PROXY_BODY_MEMORY_LIMIT`（默认 10 MB）时完全在内存中操作。超过上限时自动透明地溢出到磁盘临时文件。LLM API 的响应通常远小于 10 MB，因此绝大多数流不会触及磁盘。
 
 ### 数据库连接池设计
 
@@ -375,8 +316,8 @@ SSE 解析（`_reconstruct_sse_to_json`）和 `b"".join(chunks)` 都是同步 CP
 │
 └─ _log_engine (DB_LOG_POOL_SIZE=10, DB_LOG_MAX_OVERFLOW=20)
     连接同一个 MySQL
-    用途：代理日志写入 → 写 requests、stream_chunks、stream_sessions
-    调用方：代理转发线程 + 重建 Worker
+    用途：代理日志写入 → 写 requests
+    调用方：代理转发线程
 ```
 
 **为什么要两套？**
@@ -389,23 +330,21 @@ flowchart LR
         C[查看历史]
     end
     subgraph 代理日志
-        D[100个SSE流同时结束]
-        E[写stream_chunks]
-        F[重建Worker]
+        D[100个流同时结束]
+        E[INSERT requests]
     end
     A --> engine[(engine 20)]
     B --> engine
     C --> engine
     D --> log[(log_engine 10)]
     E --> log
-    F --> log
 ```
 
-如果共用一套连接池，100 个 SSE 流同时结束的瞬间——每个流一次 `INSERT stream_chunks` + `UPDATE is_complete`——会瞬间耗尽池中所有连接。此时管理员尝试登录，发现**无连接可用**，只能排队等 30 秒超时。两套池完全隔离后，日志写入再繁忙，管理接口始终有 20 个空闲连接待命。
+如果共用一套连接池，100 个 SSE 流同时结束的瞬间——每个流一次 `INSERT requests`——可能暂时耗尽池中连接。此时管理员尝试登录，发现**无连接可用**，只能排队等 30 秒超时。两套池完全隔离后，日志写入再繁忙，管理接口始终有 20 个空闲连接待命。
 
 **日志专用线程池**
 
-代理日志写入（`_save_to_db`、`_insert_chunk_async` 等）使用 `database._db_executor`（`DB_SAVE_WORKERS=8` 个线程），而非 asyncio 的默认线程池。这样日志写入任务之间互不争抢，且不会占满 asyncio 默认线程池影响其他操作。
+代理日志写入（`_save_to_db`）使用 `database._db_executor`（`DB_SAVE_WORKERS=8` 个线程），而非 asyncio 的默认线程池。这样日志写入任务之间互不争抢，且不会占满 asyncio 默认线程池影响其他操作。
 
 ### 请求头转发规则
 
@@ -432,9 +371,9 @@ flowchart LR
 flowchart LR
     A[请求体/响应体 bytes] --> B[decode UTF-8 严格模式]
     B -->|成功| C[正常写入 MySQL]
-    B -->|UnicodeEncodeError| D[检测 surrogate 位置]
+    B -->|UnicodeEncodeError| D[统计 surrogate 数量]
     D --> E["replace 模式: 替换为 U+FFFD"]
-    E --> F["输出日志: Surrogate U+XXXX at pos N, raw bytes: XX, context: ..."]
+    E --> F["输出日志: Replaced N surrogate(s)"]
     F --> C
 ```
 
@@ -443,9 +382,7 @@ flowchart LR
 **日志示例**：
 ```
 [Proxy] WARNING: request body contains surrogate characters after JSON serialization — sanitizing
-[Sanitize] Found 1 surrogate(s). First at position 676735: U+DDD1 (raw bytes: edb791)
-[Sanitize] Context: '...已删除代理...'
-[Sanitize] Replaced surrogates, 1898074 → 1898074 chars
+[Sanitize] Replaced 1 surrogate(s), 1898074 → 1898074 chars
 ```
 
 清洗后的数据前端可正常展示，非法字符位置显示为 ``。
@@ -679,7 +616,6 @@ server {
 | 机制 | 实现 |
 |------|------|
 | 端口分配互斥 | `SELECT GET_LOCK('llm_proxy_port_alloc', 10)` — MySQL 服务端命名锁 |
-| 流式重建互斥 | `SELECT GET_LOCK('recon_{stream_id}', 0)` — 每 stream 独立锁，多 Worker 不抢 |
 | 端口缓存 | 每实例独立内存缓存，TTL 各自到期刷新，最终一致 |
 
 #### 单机 vs 多机参数建议
@@ -710,12 +646,11 @@ llm-proxy/
 │   ├── main.py              # 入口：启动 FastAPI + 注册路由 + lifespan
 │   ├── config.py            # 读取 .env 环境变量
 │   ├── database.py          # 自动建库建表 + 双连接池 + 迁移
-│   ├── models.py            # ORM 模型（User / Port / Request / StreamSession / StreamChunk）
+│   ├── models.py            # ORM 模型（User / Port / Request）
 │   ├── schemas.py           # Pydantic 请求/响应模型
 │   ├── auth.py              # JWT 认证 + bcrypt 密码哈希
 │   ├── proxy_app.py         # 代理核心：转发、SSE 格式解析、DB 记录
 │   ├── shared_proxy.py      # 共享代理端点 /{port_number}/{path}
-│   ├── stream_reconstructor.py  # Write-Ahead 流式日志 + 后台 Worker 重建
 │   ├── proxy_manager.py     # 端口配置查询 + 缓存刷新
 │   ├── requirements.txt     # pip 依赖
 │   └── routers/
@@ -834,8 +769,7 @@ llm-proxy/
 | `PORT_CACHE_TTL` | 5 | 端口缓存刷新间隔（秒） |
 | `HTTPX_MAX_CONNECTIONS` | 200 | httpx 总连接数 |
 | `HTTPX_MAX_KEEPALIVE_CONNECTIONS` | 50 | httpx keep-alive |
-| `PROXY_BODY_MEMORY_LIMIT` | 10485760 | 请求/响应体内存上限（字节） |
-| `STREAM_RECONSTRUCTION_INTERVAL` | 5 | 流式重建轮询间隔（秒） |
+| `PROXY_BODY_MEMORY_LIMIT` | 10485760 | 请求/响应体内存缓冲上限（字节） |
 
 ## 生产环境安全建议
 
