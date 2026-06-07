@@ -61,16 +61,12 @@ def refresh_port_cache(db=None):
     if db is None:
         db = database.SessionLocal()
         try:
-            ports = db.query(Port).filter(
-                Port.is_active.is_(True), Port.deleted_at.is_(None)
-            ).all()
+            ports = db.query(Port).filter(Port.is_active.is_(True)).all()
             _port_target_cache = {p.port_number: p.target_url for p in ports}
         finally:
             db.close()
     else:
-        ports = db.query(Port).filter(
-            Port.is_active.is_(True), Port.deleted_at.is_(None)
-        ).all()
+        ports = db.query(Port).filter(Port.is_active.is_(True)).all()
         _port_target_cache = {p.port_number: p.target_url for p in ports}
     _cache_updated_at = time.time()
 
@@ -140,8 +136,7 @@ async def aget_target_url(port_number: int) -> str | None:
         try:
             port = db.query(Port).filter(
                 Port.port_number == port_number,
-                Port.is_active.is_(True),
-                Port.deleted_at.is_(None),
+                Port.is_active.is_(True)
             ).first()
             if port:
                 # Update cache so subsequent lookups are fast
@@ -174,16 +169,13 @@ def _save_to_db(port_number: int, method: str, path: str,
                 Port.port_number == port_number,
                 Port.is_active.is_(True)
             ).first()
-            port_id = port.id if port else None
-            if not port_id:
-                print(
-                    f"[Proxy] WARNING: port {port_number} not active — "
-                    f"saving record with port_id=NULL",
-                    file=sys.stderr,
-                )
+            if not port:
+                print(f"[Proxy] WARNING: port {port_number} not found in DB, cannot save record",
+                      file=sys.stderr)
+                return
 
             record = RequestModel(
-                port_id=port_id,
+                port_id=port.id,
                 method=method,
                 path=path,
                 request_headers=req_headers,

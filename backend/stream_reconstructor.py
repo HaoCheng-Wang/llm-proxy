@@ -203,9 +203,7 @@ def _process_completed_streams() -> int:
 def _reconstruct_one_stream(db, session: StreamSession) -> None:
     """Read all chunks for *session*, reconstruct SSE → JSON, save Request record.
 
-    The raw SSE text is always saved to ``response_body_raw`` regardless of
-    reconstruction success or port availability.  This guarantees the proxy
-    never loses data — the user can always see the original SSE in the UI.
+    After successful reconstruction the raw chunks are deleted to reclaim space.
     """
     # ── Read all chunks in order ──
     chunks = (
@@ -221,30 +219,14 @@ def _reconstruct_one_stream(db, session: StreamSession) -> None:
         db.commit()
         return
 
-    # ── Concatenate raw SSE (always preserved) ──
+    # ── Concatenate raw SSE ──
     full_body = b"".join(c.chunk_data for c in chunks)
     raw_sse_text = full_body.decode("utf-8", errors="replace")
 
-    # ── Reconstruct JSON (best-effort) ──
+    # ── Reconstruct JSON (format auto-detected) ──
     reconstructed_json = _reconstruct_sse_to_json(raw_sse_text)
 
-    # Detect reconstruction failure: None means all parsers failed;
-    # raw SSE text (starts with "data:") means generic fallback was returned.
-    reconstruction_error = (
-        reconstructed_json is None
-        or reconstructed_json.lstrip().startswith("data:")
-    )
-    if reconstruction_error:
-        print(
-            f"[Reconstructor] SSE reconstruction issue for {session.stream_id} "
-            f"— raw SSE saved to response_body_raw",
-            file=sys.stderr,
-        )
-        # Keep the raw text as response_body so the UI always shows something
-        if reconstructed_json is None:
-            reconstructed_json = raw_sse_text
-
-    # ── Resolve port_id (may be None if port was deleted) ──
+    # ── Look up port_id from port_number ──
     port = (
         db.query(Port)
         .filter(
@@ -253,18 +235,23 @@ def _reconstruct_one_stream(db, session: StreamSession) -> None:
         )
         .first()
     )
-    port_id = port.id if port else None
-
-    if not port_id:
+    if not port:
         print(
             f"[Reconstructor] Port {session.port_number} not active/deleted "
-            f"— stream {session.stream_id} saved with port_id=NULL",
+            f"— discarding stream {session.stream_id}",
             file=sys.stderr,
         )
+        # Clean up orphaned chunks and session
+        db.query(StreamChunk).filter(
+            StreamChunk.stream_id == session.stream_id
+        ).delete()
+        db.delete(session)
+        db.commit()
+        return
 
-    # ── Always save raw SSE data, even when port or reconstruction fails ──
+    # ── Create final Request record ──
     record = RequestModel(
-        port_id=port_id,
+        port_id=port.id,
         method=session.method,
         path=session.path,
         request_headers=session.request_headers,
@@ -274,7 +261,6 @@ def _reconstruct_one_stream(db, session: StreamSession) -> None:
         response_body_raw=raw_sse_text,
         status_code=session.status_code,
         duration_ms=session.duration_ms,
-        reconstruction_error=reconstruction_error,
     )
     db.add(record)
 

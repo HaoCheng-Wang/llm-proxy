@@ -27,7 +27,6 @@ class Port(Base):
     target_url = Column(String(500), nullable=False)
     description = Column(String(200), default="")
     is_active = Column(Boolean, default=True)
-    deleted_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     user = relationship("User", back_populates="ports")
@@ -44,7 +43,7 @@ class Request(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
-    port_id = Column(Integer, ForeignKey("ports.id"), nullable=True, index=True)
+    port_id = Column(Integer, ForeignKey("ports.id"), nullable=False, index=True)  # Added index
     method = Column(String(10), nullable=False)
     path = Column(String(1000), nullable=False)
     request_headers = Column(LONGTEXT, nullable=True)
@@ -54,7 +53,6 @@ class Request(Base):
     response_body_raw = Column(LONGTEXT, nullable=True)
     status_code = Column(Integer, nullable=True)
     duration_ms = Column(Integer, nullable=True)
-    reconstruction_error = Column(Boolean, default=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), index=True)  # Added index
 
     port = relationship("Port", back_populates="requests")
