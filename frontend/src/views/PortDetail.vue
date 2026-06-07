@@ -3,19 +3,22 @@
     <!-- Header -->
     <div class="flex-between mb-16">
       <div>
-        <button class="btn btn-outline btn-sm" @click="$router.push('/')" style="margin-right:12px">
+        <button class="btn btn-outline btn-sm" @click="goBack" style="margin-right:12px">
           ← 返回
         </button>
         <h2 v-if="data.port" style="display:inline;font-size:20px">
           代理 {{ data.port.port_number }}
-          <span :class="['badge', data.port.is_active ? 'badge-active' : 'badge-inactive']" style="margin-left:8px">
+          <span v-if="data.port.deleted_at" class="badge badge-deleted" style="margin-left:8px">
+            已删除
+          </span>
+          <span v-else :class="['badge', data.port.is_active ? 'badge-active' : 'badge-inactive']" style="margin-left:8px">
             {{ data.port.is_active ? '运行中' : '已停用' }}
           </span>
         </h2>
       </div>
       <div class="flex gap-8" style="position:relative">
         <!-- Live indicator -->
-        <span v-if="data.port?.is_active" class="live-indicator" :class="{ 'live-pulse': polling }">
+        <span v-if="data.port?.is_active &amp;&amp; !data.port?.deleted_at" class="live-indicator" :class="{ 'live-pulse': polling }">
           <span class="live-dot"></span> 实时
         </span>
         <!-- Copy dropdown -->
@@ -214,10 +217,11 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted, inject, nextTick } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import api from '../api'
 
 const route = useRoute()
+const router = useRouter()
 const showToast = inject('showToast')
 const displayIp = ref('your-server-ip')
 const apiPort = ref(3998)
@@ -411,6 +415,14 @@ function getStatusClass(code) {
   if (code < 400) return 'status-3xx'
   if (code < 500) return 'status-4xx'
   return 'status-5xx'
+}
+
+function goBack() {
+  if (data.value.port?.deleted_at) {
+    router.push('/admin/deleted-ports')
+  } else {
+    router.push('/')
+  }
 }
 
 function toggleCopyMenu() { copyMenuOpen.value = !copyMenuOpen.value }

@@ -24,6 +24,9 @@
               <td class="text-sm text-muted">{{ formatTime(port.deleted_at) }}</td>
               <td>
                 <div class="flex gap-8">
+                  <button class="btn btn-outline btn-sm" @click="$router.push(`/port/${port.id}`)">
+                    查看详情
+                  </button>
                   <button class="btn btn-success btn-sm" @click="restorePort(port)">恢复</button>
                   <button class="btn btn-danger btn-sm" @click="permanentDelete(port)">彻底删除</button>
                 </div>
