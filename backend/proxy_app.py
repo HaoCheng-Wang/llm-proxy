@@ -41,11 +41,13 @@ def _sanitize_text(value: str | None) -> str | None:
 
 
 # Shared httpx client with connection pooling — reused across all proxy requests.
-# Limits: 100 total connections, 20 per host. Handles 100+ concurrent users.
+# Created eagerly at startup (via init_shared_client()) so the first proxy
+# request doesn't pay lazy-init overhead (certifi loading, etc.).
 _shared_client: httpx.AsyncClient | None = None
 
 
-def get_shared_client() -> httpx.AsyncClient:
+def init_shared_client() -> httpx.AsyncClient:
+    """Create (or return existing) shared httpx client.  Call at startup."""
     global _shared_client
     if _shared_client is None:
         _shared_client = httpx.AsyncClient(
@@ -56,7 +58,17 @@ def get_shared_client() -> httpx.AsyncClient:
             ),
             follow_redirects=False,
             verify=certifi.where(),
+            http2=True,
         )
+    return _shared_client
+
+
+def get_shared_client() -> httpx.AsyncClient:
+    """Get the shared httpx client (must be initialized at startup)."""
+    global _shared_client
+    if _shared_client is None:
+        # Defensive fallback — should not happen in normal operation
+        init_shared_client()
     return _shared_client
 
 
@@ -274,6 +286,22 @@ EXCLUDE_HEADERS = {
     "host", "content-length", "connection", "transfer-encoding",
     "content-encoding",  # httpx decompresses for us
 }
+
+# Symbols exported for use by shared_proxy and main
+__all__ = [
+    "init_shared_client",
+    "get_shared_client",
+    "close_shared_client",
+    "refresh_port_cache",
+    "get_target_url",
+    "aget_target_url",
+    "_serialize_body",
+    "_save_to_db",
+    "_save_record_async",
+    "_sanitize_text",
+    "_reconstruct_sse_to_json",
+    "EXCLUDE_HEADERS",
+]
 
 
 def _serialize_body(body_bytes: bytes, label: str = "body") -> str | None:
@@ -987,6 +1015,9 @@ def _parse_generic_sse(raw_sse: str) -> str | None:
     2. If that fails or produces empty content, fall back to text extraction
     3. If nothing works, return raw SSE text
     """
+    if not raw_sse:
+        return None
+
     # Try universal deep merge first
     result = _reconstruct_sse_universal(raw_sse)
     if result and result != "{}":

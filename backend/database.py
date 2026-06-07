@@ -1,8 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import pymysql
 from sqlalchemy import create_engine, text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 from config import (
     DATABASE_URL,
     DB_POOL_SIZE, DB_MAX_OVERFLOW, DB_SAVE_WORKERS,

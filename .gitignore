@@ -39,6 +39,3 @@ Desktop.ini
 
 # === Certificates ===
 backend/certs/
-
-# === Tests ===
-tests/

@@ -21,7 +21,7 @@ from config import (
     API_PORT, CORS_ORIGINS,
 )
 from proxy_manager import ProxyManager
-from proxy_app import close_shared_client
+from proxy_app import close_shared_client, init_shared_client
 
 
 # ---- Lifecycle ----
@@ -40,6 +40,11 @@ async def lifespan(app: FastAPI):
 
     print("[Main] Loading proxy configurations from database...")
     await proxy_manager.restore_from_database()
+
+    # Pre-create the shared httpx client (HTTP/2, connection pool, certifi).
+    # Avoids lazy-init overhead on the first proxy request.
+    print("[Main] Initializing shared HTTP client...")
+    init_shared_client()
 
     print(f"[Main] Management API + Shared Proxy ready on port {API_PORT}")
     print(f"[Main] Proxy URL format: http://<server>:{API_PORT}/<port_number>/v1/...")
