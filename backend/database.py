@@ -170,6 +170,17 @@ def _migrate_columns_on_engine(eng):
         except Exception:
             conn.rollback()
 
+        # Add reconstruction_error flag to requests for SSE failure tracking
+        try:
+            conn.execute(text(
+                "ALTER TABLE requests ADD COLUMN reconstruction_error BOOLEAN "
+                "NOT NULL DEFAULT FALSE"
+            ))
+            conn.commit()
+            print("[DB] Added column: requests.reconstruction_error")
+        except Exception:
+            conn.rollback()
+
         for col in ["request_headers", "request_body", "response_headers",
                      "response_body", "response_body_raw"]:
             try:

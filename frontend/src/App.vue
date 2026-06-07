@@ -6,6 +6,7 @@
         <nav class="flex gap-16">
           <router-link to="/" class="nav-link">Dashboard</router-link>
           <router-link v-if="auth.isAdmin" to="/admin" class="nav-link-admin">👑 用户管理</router-link>
+          <router-link v-if="auth.isAdmin" to="/admin/deleted-ports" class="nav-link-deleted">🗑 已删除代理</router-link>
         </nav>
       </div>
       <div class="header-right">
@@ -77,5 +78,20 @@ function handleLogout() {
   color: #f1c40f;
   background: rgba(243, 156, 18, 0.18);
   border-color: rgba(241, 196, 15, 0.5);
+}
+
+.nav-link-deleted {
+  color: #e74c3c;
+  font-size: 14px;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid rgba(231, 76, 60, 0.3);
+  background: rgba(231, 76, 60, 0.06);
+  transition: all 0.2s;
+}
+.nav-link-deleted:hover, .nav-link-deleted.router-link-active {
+  color: #ec7063;
+  background: rgba(231, 76, 60, 0.15);
+  border-color: rgba(236, 112, 99, 0.5);
 }
 </style>

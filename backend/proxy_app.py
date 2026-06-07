@@ -97,7 +97,8 @@ def get_target_url(port_number: int) -> str | None:
     try:
         port = db.query(Port).filter(
             Port.port_number == port_number,
-            Port.is_active.is_(True)
+            Port.is_active.is_(True),
+            Port.deleted_at.is_(None),
         ).first()
         if port:
             _port_target_cache[port.port_number] = port.target_url
@@ -172,7 +173,8 @@ def _save_to_db(port_number: int, method: str, path: str,
         try:
             port = db.query(Port).filter(
                 Port.port_number == port_number,
-                Port.is_active.is_(True)
+                Port.is_active.is_(True),
+                Port.deleted_at.is_(None),
             ).first()
             port_id = port.id if port else None
             if not port_id:

@@ -99,11 +99,7 @@ function getStatusClass(code) {
 }
 
 function goBack() {
-  if (window.history.length > 1) {
-    router.back()
-  } else {
-    router.push('/')
-  }
+  window.close()
 }
 
 onMounted(async () => {
