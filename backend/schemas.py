@@ -61,7 +61,6 @@ class PortInfo(BaseModel):
     target_url: str
     description: str
     is_active: bool
-    deleted_at: Optional[datetime] = None
     created_at: datetime
     request_count: int = 0
     username: str = ""  # creator username (visible to admin)
@@ -73,7 +72,7 @@ class PortInfo(BaseModel):
 # ---- Request ----
 class RequestInfo(BaseModel):
     id: int
-    port_id: Optional[int] = None
+    port_id: int
     method: str
     path: str
     request_headers: Optional[str]
@@ -83,7 +82,6 @@ class RequestInfo(BaseModel):
     response_body_raw: Optional[str] = None
     status_code: Optional[int]
     duration_ms: Optional[int]
-    reconstruction_error: bool = False
     created_at: datetime
 
     class Config:
@@ -103,12 +101,3 @@ class UserApproval(BaseModel):
 
 class AdminUserList(BaseModel):
     users: List[UserInfo]
-
-
-class DeletedPortInfo(PortInfo):
-    """Extended port info for admin's deleted-ports view."""
-    creator_username: str = ""
-
-
-class DeletedPortList(BaseModel):
-    ports: List[PortInfo]

@@ -139,37 +139,6 @@ def _migrate_columns_on_engine(eng):
         except Exception:
             conn.rollback()
 
-        # Make port_id nullable so orphaned requests (from deleted ports)
-        # can still be saved with raw response data intact.
-        try:
-            conn.execute(text(
-                "ALTER TABLE requests MODIFY COLUMN port_id INT NULL"
-            ))
-            conn.commit()
-            print("[DB] Altered port_id to nullable")
-        except Exception:
-            conn.rollback()
-
-        # Add reconstruction_error flag for SSE streams
-        try:
-            conn.execute(text(
-                "ALTER TABLE requests ADD COLUMN reconstruction_error TINYINT(1) NOT NULL DEFAULT 0"
-            ))
-            conn.commit()
-            print("[DB] Added column: reconstruction_error")
-        except Exception:
-            conn.rollback()
-
-        # Add deleted_at column to ports for soft-delete
-        try:
-            conn.execute(text(
-                "ALTER TABLE ports ADD COLUMN deleted_at DATETIME NULL"
-            ))
-            conn.commit()
-            print("[DB] Added column: ports.deleted_at")
-        except Exception:
-            conn.rollback()
-
         for col in ["request_headers", "request_body", "response_headers",
                      "response_body", "response_body_raw"]:
             try:
