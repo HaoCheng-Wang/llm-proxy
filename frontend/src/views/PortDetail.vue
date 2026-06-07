@@ -7,9 +7,9 @@
           ← 返回
         </button>
         <h2 v-if="data.port" style="display:inline;font-size:20px">
-          端口 {{ data.port.port_number }}
+          代理 {{ data.port.port_number }}
           <span :class="['badge', data.port.is_active ? 'badge-active' : 'badge-inactive']" style="margin-left:8px">
-            {{ data.port.is_active ? '运行中' : '已停止' }}
+            {{ data.port.is_active ? '运行中' : '已停用' }}
           </span>
         </h2>
       </div>
@@ -43,12 +43,12 @@
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:14px">
         <div><span class="text-muted">目标地址：</span>{{ data.port.target_url }}</div>
         <div><span class="text-muted">描述：</span>{{ data.port.description || '-' }}</div>
-        <div><span class="text-muted">端口号：</span><code>{{ data.port.port_number }}</code></div>
+        <div><span class="text-muted">编号：</span><code>{{ data.port.port_number }}</code></div>
         <div><span class="text-muted">总请求数：</span>{{ data.port.request_count }}</div>
         <div><span class="text-muted">创建时间：</span>{{ formatTime(data.port.created_at) }}</div>
         <div>
           <span class="text-muted">代理地址：</span>
-          <code>http://{{ displayIp }}:{{ data.port.port_number }}</code>
+          <code>http://{{ displayIp }}:{{ apiPort }}/{{ data.port.port_number }}</code>
         </div>
       </div>
     </div>
@@ -80,7 +80,7 @@
               📤 API请求 ({{ apiCount }})
             </button>
             <button class="btn btn-sm method-filter-btn" :class="{ active: methodFilter === 'other' }" @click="methodFilter = 'other'"
-                    title="非 API 请求 — 包括端口扫描探测、浏览器预检（OPTIONS）、健康检查（HEAD）、网站图标（favicon）、爬虫抓取等触发的 GET/OPTIONS/HEAD 请求，通常可忽略">
+                    title="非 API 请求 — 包括扫描探测、浏览器预检（OPTIONS）、健康检查（HEAD）、网站图标（favicon）、爬虫抓取等触发的 GET/OPTIONS/HEAD 请求，通常可忽略">
               🌐 其他 ({{ otherCount }})
             </button>
           </div>
@@ -172,7 +172,7 @@
 
     <div v-else class="card empty-state">
       <h3>暂无交互记录</h3>
-      <p>配置智能体连接到该端口后，所有API通信将在此显示</p>
+      <p>配置智能体连接到该代理后，所有API通信将在此显示</p>
     </div>
 
     <!-- Load More -->
@@ -204,6 +204,7 @@ import api from '../api'
 const route = useRoute()
 const showToast = inject('showToast')
 const displayIp = ref('your-server-ip')
+const apiPort = ref(3998)
 const portId = route.params.id
 
 const data = ref({ port: null, requests: [] })
@@ -496,7 +497,7 @@ async function handleDeleteRequest(req) {
 }
 
 async function clearHistory() {
-  if (!confirm(`确定清空端口 ${data.value.port?.port_number} 的全部交互历史吗？此操作不可恢复！`)) return
+  if (!confirm(`确定清空代理 ${data.value.port?.port_number} 的全部交互历史吗？此操作不可恢复！`)) return
   try {
     await api.clearPortHistory(portId)
     requests.value = []
@@ -520,6 +521,7 @@ onMounted(async () => {
   // Load config and data in parallel for faster initial render
   const configPromise = api.getConfig().then(cfg => {
     displayIp.value = cfg.display_ip
+    apiPort.value = cfg.api_port || 3998
   }).catch(() => { /* keep default */ })
 
   await loadData()

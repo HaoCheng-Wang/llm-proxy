@@ -1,15 +1,15 @@
 """
 LLM Proxy — Main Entry Point
 
-Starts:
-  1. FastAPI management API (multi-worker for concurrent users)
-  2. Proxy server manager that restores previously active proxy ports
-
-Usage:
-  python main.py
+Architecture: Shared Proxy — all traffic flows through a single endpoint.
+  • Management API: /api/* (auth, port CRUD, history)
+  • Proxy endpoint: /{port_number}/{path} (forwards to target)
+  • Users only change base_url, no API keys or header changes needed
+  • Example: http://server:3998/1/v1/chat/completions
+    1 = logical port number identifying the proxy configuration
 """
-import asyncio
 import sys
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,10 +19,11 @@ from models import User
 from auth import hash_password
 from config import (
     DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD,
-    API_PORT, API_WORKERS, CORS_ORIGINS,
+    API_PORT, CORS_ORIGINS, STREAM_RECONSTRUCTION_INTERVAL,
 )
 from proxy_manager import ProxyManager
 from proxy_app import close_shared_client
+from stream_reconstructor import stream_reconstruction_worker
 
 
 # ---- Lifecycle ----
@@ -39,25 +40,36 @@ async def lifespan(app: FastAPI):
     proxy_manager = ProxyManager()
     app.state.proxy_manager = proxy_manager
 
-    print("[Main] Restoring active proxies from database...")
+    print("[Main] Loading proxy configurations from database...")
     await proxy_manager.restore_from_database()
 
-    print(f"[Main] Management API ready on port {API_PORT}")
+    # Start the stream reconstruction background worker.
+    # This task runs forever (cancelled on shutdown) and periodically
+    # assembles completed SSE streams into final Request records.
+    reconstruction_task = asyncio.create_task(
+        stream_reconstruction_worker(STREAM_RECONSTRUCTION_INTERVAL)
+    )
+
+    print(f"[Main] Management API + Shared Proxy ready on port {API_PORT}")
+    print(f"[Main] Proxy URL format: http://<server>:{API_PORT}/<port_number>/v1/...")
     yield
 
     # Shutdown
-    print("[Main] Shutting down all proxies...")
+    print("[Main] Stopping stream reconstruction worker...")
+    reconstruction_task.cancel()
     try:
-        await proxy_manager.stop_all()
-    except Exception as e:
-        print(f"[Main] Warning during proxy shutdown: {e}")
+        await reconstruction_task
+    except asyncio.CancelledError:
+        pass
 
     print("[Main] Closing shared HTTP client...")
     await close_shared_client()
 
-    print("[Main] Disposing database connection pool...")
+    print("[Main] Disposing database connection pools...")
     if database.engine:
         database.engine.dispose()
+    if database._log_engine:
+        database._log_engine.dispose()
 
     print("[Main] Shutdown complete.")
 
@@ -118,6 +130,12 @@ app.include_router(admin_router)
 app.include_router(ports_router)
 app.include_router(config_router)
 
+# Shared proxy endpoint — routes all /{port_number}/{path} traffic.
+# This MUST be registered after /api/ routes so that /api/* paths
+# are matched first (static routes take priority over parameterized).
+from shared_proxy import router as shared_proxy_router  # noqa: E402
+app.include_router(shared_proxy_router)
+
 
 @app.get("/api/health")
 def health_check():
@@ -128,15 +146,13 @@ def health_check():
 if __name__ == "__main__":
     import uvicorn
 
-    # Run DDL once in the main process before forking workers.
-    # This avoids concurrent DDL errors when API_WORKERS > 1.
-    print("[Main] Running schema setup (pre-fork)...")
+    # Run DDL once before starting server
+    print("[Main] Running schema setup...")
     setup_schema()
 
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=API_PORT,
-        workers=API_WORKERS,
         reload=False,
     )
