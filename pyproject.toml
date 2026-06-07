@@ -25,4 +25,5 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "stress: Stress/load tests that may take longer to run",
+    "slow: Tests that are intentionally slow (large inputs, exhaustive coverage)",
 ]
