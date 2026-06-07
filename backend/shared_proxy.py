@@ -78,8 +78,9 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
     try:
         async for chunk in request.stream():
             req_buf.write(chunk)
-    except Exception:
-        pass  # empty body or read error — forward whatever we have
+    except Exception as e:
+        print(f"[Proxy] WARNING: Failed to read request body: {e}", file=sys.stderr)
+        # empty body or read error — forward whatever we have
     req_buf.seek(0)
     body = req_buf.read()
     req_buf.close()
@@ -87,7 +88,7 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
     # Serialize request for logging
     req_headers_dict = dict(request.headers)
     req_headers_json = json.dumps(req_headers_dict, ensure_ascii=False, indent=2)
-    req_body_str = _serialize_body(body)
+    req_body_str = _serialize_body(body, label="request")
 
     # Prepare forward headers (same logic as per-port proxy)
     forward_headers = {
@@ -176,9 +177,10 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                             if _session_task is not None and not _session_task.done():
                                 try:
                                     await _session_task
-                                except Exception:
+                                except Exception as e:
                                     # Session creation failed — skip chunk insertion
                                     # to avoid orphan data
+                                    print(f"[StreamReconstructor] Session creation failed for stream {sid}, skipping chunk {seq_num}: {e}", file=sys.stderr)
                                     return
                             # Now insert the chunk
                             await _insert_chunk_async(sid, seq_num, s)
@@ -194,10 +196,13 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                     # Do NOT await pending_tasks here — the generator must exit
                     # immediately so StreamingResponse closes the connection.
                     async def _finish_stream():
-                        if pending_tasks:
-                            await asyncio.wait(pending_tasks)
-                        duration_ms = int((time.time() - start_time) * 1000)
-                        await _mark_stream_complete(stream_id, duration_ms)
+                        try:
+                            if pending_tasks:
+                                await asyncio.wait(pending_tasks)
+                            duration_ms = int((time.time() - start_time) * 1000)
+                            await _mark_stream_complete(stream_id, duration_ms)
+                        except Exception as e:
+                            print(f"[StreamReconstructor] Failed to finish stream {stream_id}: {e}", file=sys.stderr)
 
                     asyncio.create_task(_finish_stream())
                 finally:
@@ -222,7 +227,7 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                 resp_buf.close()
             await stream_ctx.__aexit__(None, None, None)
             stream_owned_by_generator = False
-            resp_body_str = _serialize_body(full_body)
+            resp_body_str = _serialize_body(full_body, label="response")
 
     except httpx.TimeoutException as e:
         status_code = 504
@@ -252,8 +257,8 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
         if stream_ctx is not None and not stream_owned_by_generator:
             try:
                 await stream_ctx.__aexit__(None, None, None)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Proxy] WARNING: Failed to close stream context: {e}", file=sys.stderr)
 
     duration_ms = int((time.time() - start_time) * 1000)
 

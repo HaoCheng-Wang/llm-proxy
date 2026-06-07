@@ -291,8 +291,13 @@ EXCLUDE_HEADERS = {
 }
 
 
-def _serialize_body(body_bytes: bytes) -> str | None:
-    """Convert raw body bytes to a pretty-printed string."""
+def _serialize_body(body_bytes: bytes, label: str = "body") -> str | None:
+    """Convert raw body bytes to a pretty-printed string.
+    
+    Args:
+        body_bytes: Raw bytes to serialize
+        label: Label for logging (e.g., "request", "response")
+    """
     if not body_bytes:
         return None
     try:
@@ -306,7 +311,7 @@ def _serialize_body(body_bytes: bytes) -> str | None:
                 result.encode("utf-8", errors="strict")
             except UnicodeEncodeError:
                 print(
-                    f"[Proxy] WARNING: request body contains surrogate "
+                    f"[Proxy] WARNING: {label} body contains surrogate "
                     f"characters after JSON serialization — sanitizing",
                     file=sys.stderr,
                 )
@@ -1133,7 +1138,7 @@ async def proxy_endpoint(request: Request):
     # Serialize request
     req_headers_dict = dict(request.headers)
     req_headers_json = json.dumps(req_headers_dict, ensure_ascii=False, indent=2)
-    req_body_str = _serialize_body(body)
+    req_body_str = _serialize_body(body, label="request")
 
     # Prepare forward headers
     forward_headers = {
@@ -1224,7 +1229,7 @@ async def proxy_endpoint(request: Request):
                 full_body += chunk
             await stream_ctx.__aexit__(None, None, None)
             stream_owned_by_generator = False  # already closed above
-            resp_body_str = _serialize_body(full_body)
+            resp_body_str = _serialize_body(full_body, label="response")
 
     except httpx.TimeoutException:
         status_code = 504

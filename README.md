@@ -422,6 +422,34 @@ flowchart LR
 
 `Authorization` 头（API Key）**原样透传**，代理不存储也不修改。
 
+### 编码清洗（Surrogate 字符处理）
+
+智能体发送的请求体或上游 API 的响应体中可能包含非法 UTF-8 字节（如 lone surrogate 字符 `U+D800–U+DFFF`）。这些字符在 Unicode 标准中是为 UTF-16 内部使用保留的，无法被 MySQL 的 `utf8mb4` 编码接受。
+
+**自动清洗机制**（`_sanitize_text`）：
+
+```mermaid
+flowchart LR
+    A[请求体/响应体 bytes] --> B[decode UTF-8 严格模式]
+    B -->|成功| C[正常写入 MySQL]
+    B -->|UnicodeEncodeError| D[检测 surrogate 位置]
+    D --> E["replace 模式: 替换为 U+FFFD"]
+    E --> F["输出日志: Surrogate U+XXXX at pos N, raw bytes: XX, context: ..."]
+    F --> C
+```
+
+**生效范围**：所有写入 MySQL `LONGTEXT` 列的文本字段——`request_headers`、`request_body`、`response_headers`、`response_body`、`response_body_raw`。
+
+**日志示例**：
+```
+[Proxy] WARNING: request body contains surrogate characters after JSON serialization — sanitizing
+[Sanitize] Found 1 surrogate(s). First at position 676735: U+DDD1 (raw bytes: edb791)
+[Sanitize] Context: '...已删除代理...'
+[Sanitize] Replaced surrogates, 1898074 → 1898074 chars
+```
+
+清洗后的数据前端可正常展示，非法字符位置显示为 ``。
+
 ## 部署方式
 
 ### 开发模式

@@ -78,9 +78,9 @@ async def _create_stream_session_async(
 async def _insert_chunk_async(stream_id: str, seq: int, chunk_data: bytes) -> None:
     """Fire-and-forget: write one raw SSE chunk to stream_chunks.
 
-    Errors are silently ignored — the client stream must never be interrupted
-    by a DB write failure.  If chunks are lost the reconstruction worker will
-    skip the session.
+    Errors are logged but not propagated — the client stream must never be
+    interrupted by a DB write failure. If chunks are lost the reconstruction
+    worker will skip the session.
     """
     loop = asyncio.get_running_loop()
 
@@ -90,15 +90,16 @@ async def _insert_chunk_async(stream_id: str, seq: int, chunk_data: bytes) -> No
             chunk = StreamChunk(stream_id=stream_id, seq=seq, chunk_data=chunk_data)
             db.add(chunk)
             db.commit()
-        except Exception:
+        except Exception as e:
             db.rollback()
+            print(f"[StreamReconstructor] Failed to insert chunk {seq} for stream {stream_id}: {e}", file=sys.stderr)
         finally:
             db.close()
 
     try:
         await loop.run_in_executor(database._db_executor, _insert)
-    except Exception:
-        pass  # Never let a DB write error propagate to the client
+    except Exception as e:
+        print(f"[StreamReconstructor] Failed to execute chunk insert task for stream {stream_id}: {e}", file=sys.stderr)
 
 
 async def _mark_stream_complete(stream_id: str, duration_ms: int) -> None:
@@ -121,15 +122,18 @@ async def _mark_stream_complete(stream_id: str, duration_ms: int) -> None:
                 session.is_complete = True
                 session.duration_ms = duration_ms
                 db.commit()
-        except Exception:
+            else:
+                print(f"[StreamReconstructor] WARNING: Stream session {stream_id} not found when marking complete", file=sys.stderr)
+        except Exception as e:
             db.rollback()
+            print(f"[StreamReconstructor] Failed to mark stream {stream_id} as complete: {e}", file=sys.stderr)
         finally:
             db.close()
 
     try:
         await loop.run_in_executor(database._db_executor, _mark)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[StreamReconstructor] Failed to execute mark complete task for stream {stream_id}: {e}", file=sys.stderr)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -240,8 +244,9 @@ def _process_completed_streams() -> int:
                             reconstruction_error=True,
                         )
                         db.add(record)
-                except Exception:
+                except Exception as salvage_exc:
                     db.rollback()
+                    print(f"[Reconstructor] Failed to salvage raw data for stream {session.stream_id}: {salvage_exc}", file=sys.stderr)
 
                 # Clean up chunks so they don't accumulate
                 db.query(StreamChunk).filter(
