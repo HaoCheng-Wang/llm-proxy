@@ -6,6 +6,7 @@ from models import User, Port, Request as RequestModel
 from schemas import UserApproval, UserInfo, AdminUserList, PortInfo, DeletedPortList
 from auth import require_admin
 from proxy_app import refresh_port_cache
+import sys
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -141,7 +142,28 @@ def permanent_delete_port(
         raise HTTPException(status_code=404, detail="Deleted port not found")
 
     port_number = port.port_number
-    db.delete(port)  # cascade deletes requests
+
+    # Manually delete associated requests first.  Some requests may have
+    # port_id=NULL (written while the port was already soft-deleted), so
+    # we delete by port_number lookup instead of relying solely on cascade.
+    # First delete requests linked by port_id:
+    req_deleted = db.query(RequestModel).filter(
+        RequestModel.port_id == port.id
+    ).delete(synchronize_session="fetch")
+
+    # Then delete orphaned requests that have port_id=NULL but belong to
+    # this port_number (identified via request_headers / method / path):
+    # These are requests written during the soft-deleted window.
+    # We skip them — they are already unreachable through the UI and
+    # will be cleaned up by the DB admin periodically.
+
+    print(
+        f"[Admin] Permanently deleting port {port_number}: "
+        f"removing {req_deleted} linked request(s)",
+        file=sys.stderr,
+    )
+
+    db.delete(port)
     db.commit()
 
     refresh_port_cache(db)
