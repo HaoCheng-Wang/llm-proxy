@@ -135,10 +135,11 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                 stream_id = _uuid_mod.uuid4().hex
                 seq = 0
 
-                # Create the stream session synchronously (one fast INSERT).
-                # Must succeed before any chunks are written.
-                try:
-                    await _create_stream_session_async(
+                # Fire-and-forget: create the stream session in the background.
+                # Do NOT await it here — the first chunk must reach the client
+                # without waiting for a DB round-trip.
+                _session_task = asyncio.create_task(
+                    _create_stream_session_async(
                         stream_id, port_number, request.method,
                         forward_path
                         + ("?" + query_string if query_string else ""),
@@ -146,10 +147,19 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                         resp_headers_json, status_code,
                         start_time,
                     )
-                except Exception:
-                    # Session creation failed — still forward the stream,
-                    # but chunks cannot be persisted.
-                    pass
+                )
+                
+                # Add error callback to log session creation failures
+                def _on_session_done(task):
+                    try:
+                        task.result()
+                        print(f"[Proxy] Stream session created: {stream_id}", file=sys.stderr)
+                    except Exception as e:
+                        print(f"[Proxy] Stream session creation FAILED: {stream_id} - {e}", file=sys.stderr)
+                        import traceback
+                        traceback.print_exc(file=sys.stderr)
+                
+                _session_task.add_done_callback(_on_session_done)
 
                 try:
                     # Use a set to track in-flight chunk write tasks so we can
@@ -159,22 +169,37 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                     async for chunk in response.aiter_bytes():
                         yield chunk  # ← client gets it immediately
 
+                        # Create a task that waits for session to be ready,
+                        # then inserts the chunk. This is fully non-blocking.
+                        async def _insert_with_session(sid, s, seq_num):
+                            # Wait for session to be created (non-blocking for generator)
+                            if _session_task is not None and not _session_task.done():
+                                try:
+                                    await _session_task
+                                except Exception:
+                                    # Session creation failed — skip chunk insertion
+                                    # to avoid orphan data
+                                    return
+                            # Now insert the chunk
+                            await _insert_chunk_async(sid, seq_num, s)
+
                         task = asyncio.create_task(
-                            _insert_chunk_async(stream_id, seq, chunk)
+                            _insert_with_session(stream_id, chunk, seq)
                         )
                         pending_tasks.add(task)
                         task.add_done_callback(pending_tasks.discard)
                         seq += 1
 
-                    # All chunks yielded — ensure every chunk is persisted
-                    # before signaling the reconstruction worker.
-                    if pending_tasks:
-                        await asyncio.wait(pending_tasks)
+                    # All chunks yielded — schedule completion in background.
+                    # Do NOT await pending_tasks here — the generator must exit
+                    # immediately so StreamingResponse closes the connection.
+                    async def _finish_stream():
+                        if pending_tasks:
+                            await asyncio.wait(pending_tasks)
+                        duration_ms = int((time.time() - start_time) * 1000)
+                        await _mark_stream_complete(stream_id, duration_ms)
 
-                    duration_ms = int((time.time() - start_time) * 1000)
-                    asyncio.create_task(
-                        _mark_stream_complete(stream_id, duration_ms)
-                    )
+                    asyncio.create_task(_finish_stream())
                 finally:
                     await stream_ctx.__aexit__(None, None, None)
 

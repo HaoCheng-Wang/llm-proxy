@@ -171,6 +171,19 @@ def _migrate_columns_on_engine(eng):
         except Exception:
             conn.rollback()
 
+        # Add missing columns to stream_sessions for Write-Ahead logging
+        for col_sql in [
+            "ALTER TABLE stream_sessions ADD COLUMN is_complete TINYINT(1) NOT NULL DEFAULT 0",
+            "ALTER TABLE stream_sessions ADD COLUMN is_processed TINYINT(1) NOT NULL DEFAULT 0",
+            "ALTER TABLE stream_sessions ADD COLUMN error_message VARCHAR(500) NULL",
+        ]:
+            try:
+                conn.execute(text(col_sql))
+                conn.commit()
+                print(f"[DB] Added: {col_sql.split('ADD COLUMN')[1].strip().split()[0]}")
+            except Exception:
+                conn.rollback()
+
         for col in ["request_headers", "request_body", "response_headers",
                      "response_body", "response_body_raw"]:
             try:
