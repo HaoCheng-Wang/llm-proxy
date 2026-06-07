@@ -162,8 +162,14 @@ async def stream_reconstruction_worker(interval_seconds: int = 5) -> None:
 def _process_completed_streams() -> int:
     """Find completed-but-unprocessed streams and reconstruct them.
 
+    Uses MySQL named locks (GET_LOCK) per session so that multiple instances
+    of this worker (across multiple machines or processes) never process the
+    same stream concurrently.
+
     Returns the number of streams successfully processed.
     """
+    from sqlalchemy import text
+
     db = database.LogSessionLocal()
     processed = 0
     try:
@@ -178,6 +184,16 @@ def _process_completed_streams() -> int:
         )
 
         for session in sessions:
+            # Acquire a MySQL named lock unique to this stream.
+            # If another worker already holds it, skip — it's being processed.
+            lock_name = f"recon_{session.stream_id}"
+            acquired = db.execute(
+                text("SELECT GET_LOCK(:name, 0)"),
+                {"name": lock_name},
+            ).scalar()
+            if acquired != 1:
+                continue  # Another worker is handling it
+
             try:
                 _reconstruct_one_stream(db, session)
                 processed += 1
@@ -231,6 +247,12 @@ def _process_completed_streams() -> int:
                 session.error_message = str(exc)[:500]
                 session.is_processed = True
                 db.commit()
+            finally:
+                # Always release the lock so other workers aren't blocked
+                db.execute(
+                    text("SELECT RELEASE_LOCK(:name)"),
+                    {"name": lock_name},
+                )
     finally:
         db.close()
 
