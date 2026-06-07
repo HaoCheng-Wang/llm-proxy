@@ -15,7 +15,6 @@ import time
 import json
 import sys
 import asyncio
-import uuid as _uuid_mod
 import tempfile
 import httpx
 from urllib.parse import urlparse
@@ -24,15 +23,11 @@ from fastapi.responses import Response, JSONResponse, StreamingResponse
 
 from proxy_app import (
     get_shared_client,
+    _reconstruct_sse_to_json,
     aget_target_url,
     _serialize_body,
     _save_record_async,
     EXCLUDE_HEADERS,
-)
-from stream_reconstructor import (
-    _create_stream_session_async,
-    _insert_chunk_async,
-    _mark_stream_complete,
 )
 from config import PROXY_BODY_MEMORY_LIMIT
 
@@ -102,6 +97,7 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
     # Forward the request
     status_code = 502
     resp_body_str = None
+    resp_body_raw_str = None
     resp_headers_json = "{}"
     resp_content_type = "application/json"
     is_streaming = False
@@ -126,86 +122,51 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
         is_streaming = "text/event-stream" in resp_content_type
 
         if is_streaming:
-            # --- STREAMING: transparent forward + write-ahead to MySQL ---
-            # Each chunk is yielded to the client immediately *and* written
-            # to stream_chunks in the background.  Zero per-stream memory.
-            # A background worker reassembles→reconstructs→saves later.
+            # --- STREAMING: SpooledTemporaryFile per stream ---
+            # Each chunk is yielded to the client immediately *and* buffered
+            # in a SpooledTemporaryFile (memory up to PROXY_BODY_MEMORY_LIMIT,
+            # then spills to disk).  After the stream ends the full body is
+            # reconstructed → saved to requests in a single fire-and-forget write.
+            # No MySQL write-ahead, no background worker, no zombie cleanup.
             stream_owned_by_generator = True
 
             async def stream_generator():
-                stream_id = _uuid_mod.uuid4().hex
-                seq = 0
+                resp_buf = tempfile.SpooledTemporaryFile(
+                    max_size=PROXY_BODY_MEMORY_LIMIT,
+                )
+                try:
+                    async for chunk in response.aiter_bytes():
+                        yield chunk           # ← client gets it immediately
+                        resp_buf.write(chunk)  # buffer (memory or disk)
 
-                # Fire-and-forget: create the stream session in the background.
-                # Do NOT await it here — the first chunk must reach the client
-                # without waiting for a DB round-trip.
-                _session_task = asyncio.create_task(
-                    _create_stream_session_async(
-                        stream_id, port_number, request.method,
+                    # Stream ended normally — reconstruct JSON and save
+                    resp_buf.seek(0)
+                    full_body = resp_buf.read()
+                    raw_sse_text = full_body.decode("utf-8", errors="replace")
+                    reconstructed_json = _reconstruct_sse_to_json(raw_sse_text)
+
+                    # Detect reconstruction failure: None means all parsers exhausted;
+                    # raw SSE text (starts with "data:") means generic fallback returned.
+                    reconstruction_error = (
+                        reconstructed_json is None
+                        or reconstructed_json.lstrip().startswith("data:")
+                    )
+                    if reconstruction_error and reconstructed_json is None:
+                        reconstructed_json = raw_sse_text
+
+                    duration_ms = int((time.time() - start_time) * 1000)
+                    asyncio.create_task(_save_record_async(
+                        port_number, request.method,
                         forward_path
                         + ("?" + query_string if query_string else ""),
                         req_headers_json, req_body_str,
-                        resp_headers_json, status_code,
-                        start_time,
-                    )
-                )
-                
-                # Add error callback to log session creation failures
-                def _on_session_done(task):
-                    try:
-                        task.result()
-                        print(f"[Proxy] Stream session created: {stream_id}", file=sys.stderr)
-                    except Exception as e:
-                        print(f"[Proxy] Stream session creation FAILED: {stream_id} - {e}", file=sys.stderr)
-                        import traceback
-                        traceback.print_exc(file=sys.stderr)
-                
-                _session_task.add_done_callback(_on_session_done)
-
-                try:
-                    # Use a set to track in-flight chunk write tasks so we can
-                    # wait for all of them before marking the stream complete.
-                    pending_tasks: set[asyncio.Task] = set()
-
-                    async for chunk in response.aiter_bytes():
-                        yield chunk  # ← client gets it immediately
-
-                        # Create a task that waits for session to be ready,
-                        # then inserts the chunk. This is fully non-blocking.
-                        async def _insert_with_session(sid, s, seq_num):
-                            # Wait for session to be created (non-blocking for generator)
-                            if _session_task is not None and not _session_task.done():
-                                try:
-                                    await _session_task
-                                except Exception as e:
-                                    # Session creation failed — skip chunk insertion
-                                    # to avoid orphan data
-                                    print(f"[StreamReconstructor] Session creation failed for stream {sid}, skipping chunk {seq_num}: {e}", file=sys.stderr)
-                                    return
-                            # Now insert the chunk
-                            await _insert_chunk_async(sid, seq_num, s)
-
-                        task = asyncio.create_task(
-                            _insert_with_session(stream_id, chunk, seq)
-                        )
-                        pending_tasks.add(task)
-                        task.add_done_callback(pending_tasks.discard)
-                        seq += 1
-
-                    # All chunks yielded — schedule completion in background.
-                    # Do NOT await pending_tasks here — the generator must exit
-                    # immediately so StreamingResponse closes the connection.
-                    async def _finish_stream():
-                        try:
-                            if pending_tasks:
-                                await asyncio.wait(pending_tasks)
-                            duration_ms = int((time.time() - start_time) * 1000)
-                            await _mark_stream_complete(stream_id, duration_ms)
-                        except Exception as e:
-                            print(f"[StreamReconstructor] Failed to finish stream {stream_id}: {e}", file=sys.stderr)
-
-                    asyncio.create_task(_finish_stream())
+                        resp_headers_json, reconstructed_json,
+                        status_code, duration_ms,
+                        resp_body_raw=raw_sse_text,
+                        reconstruction_error=reconstruction_error,
+                    ))
                 finally:
+                    resp_buf.close()
                     await stream_ctx.__aexit__(None, None, None)
 
             response_headers = {"X-Proxy-Port": str(port_number)}
@@ -228,6 +189,10 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
             await stream_ctx.__aexit__(None, None, None)
             stream_owned_by_generator = False
             resp_body_str = _serialize_body(full_body, label="response")
+            try:
+                resp_body_raw_str = full_body.decode("utf-8", errors="replace")
+            except Exception:
+                resp_body_raw_str = resp_body_str
 
     except httpx.TimeoutException as e:
         status_code = 504
@@ -264,12 +229,16 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
 
     # Save non-streaming record in background
     if not is_streaming:
+        # For non-streaming responses, resp_body_str holds the pretty-printed
+        # JSON; resp_body_raw_str holds the raw decoded response body so
+        # response_body_raw is populated consistently with the streaming path.
         asyncio.create_task(_save_record_async(
             port_number, request.method,
             forward_path + ("?" + query_string if query_string else ""),
             req_headers_json, req_body_str,
             resp_headers_json, resp_body_str,
             status_code, duration_ms,
+            resp_body_raw=resp_body_raw_str or resp_body_str,
         ))
 
     # Return response with original content-type

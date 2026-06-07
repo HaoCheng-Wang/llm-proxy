@@ -85,16 +85,12 @@ PORT_CACHE_TTL = int(os.getenv("PORT_CACHE_TTL", "5"))
 HTTPX_MAX_CONNECTIONS = int(os.getenv("HTTPX_MAX_CONNECTIONS", "200"))
 HTTPX_MAX_KEEPALIVE_CONNECTIONS = int(os.getenv("HTTPX_MAX_KEEPALIVE_CONNECTIONS", "50"))
 
-# 代理 请求体 / 非流式响应体 的内存缓冲上限（字节）。
-# 小于此值在内存中处理，超过则溢出到磁盘临时文件。
-# 默认 10 MB — LLM API 请求体通常远小于此值。
-#
-# 流式 SSE 响应不经过此缓冲区 — 使用 write-ahead 机制逐 chunk 写入 MySQL，
-# 由后台 Worker 异步重建。
+# 代理 请求体 / 响应体 的内存缓冲上限（字节）。
+# 小于此值在内存中处理，超过则溢出到磁盘临时文件（SpooledTemporaryFile）。
+# 流式和非流式路径均使用此缓冲区。
+# 默认 10 MB — LLM API 请求/响应体通常远小于此值。
 PROXY_BODY_MEMORY_LIMIT = int(os.getenv("PROXY_BODY_MEMORY_LIMIT", str(10 * 1024 * 1024)))
 
-# 流式重建 Worker 的轮询间隔（秒）。
-STREAM_RECONSTRUCTION_INTERVAL = int(os.getenv("STREAM_RECONSTRUCTION_INTERVAL", "5"))
 
 # 将独立字段导出，供 database.py 直接使用（不走 URL 解析）
 _DB_USER_FOR_AUTO = _DB_USER

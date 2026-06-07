@@ -43,7 +43,3 @@ class ProxyManager:
         refresh_port_cache()
         active_count = len(self.get_active_ports())
         print(f"[ProxyManager] Loaded {active_count} active proxy configurations")
-
-    async def stop_all(self):
-        """No-op — shared proxy has no per-port servers to stop."""
-        print("[ProxyManager] Shared proxy — no servers to stop")

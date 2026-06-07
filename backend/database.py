@@ -91,16 +91,6 @@ def _init_log_engine():
     print(f"[DB] Log engine ready (pool_size={DB_LOG_POOL_SIZE}, max_overflow={DB_LOG_MAX_OVERFLOW})")
 
 
-def get_log_db():
-    """Yield a session from the dedicated log engine (for proxy request logging)."""
-    db = LogSessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-
 def setup_schema():
     """Ensure database and all tables/columns/indexes exist.
 
@@ -171,19 +161,6 @@ def _migrate_columns_on_engine(eng):
         except Exception:
             conn.rollback()
 
-        # Add missing columns to stream_sessions for Write-Ahead logging
-        for col_sql in [
-            "ALTER TABLE stream_sessions ADD COLUMN is_complete TINYINT(1) NOT NULL DEFAULT 0",
-            "ALTER TABLE stream_sessions ADD COLUMN is_processed TINYINT(1) NOT NULL DEFAULT 0",
-            "ALTER TABLE stream_sessions ADD COLUMN error_message VARCHAR(500) NULL",
-        ]:
-            try:
-                conn.execute(text(col_sql))
-                conn.commit()
-                print(f"[DB] Added: {col_sql.split('ADD COLUMN')[1].strip().split()[0]}")
-            except Exception:
-                conn.rollback()
-
         for col in ["request_headers", "request_body", "response_headers",
                      "response_body", "response_body_raw"]:
             try:
@@ -197,12 +174,7 @@ def _migrate_columns_on_engine(eng):
         for idx_name, idx_sql in [
             ("ix_requests_port_id", "CREATE INDEX ix_requests_port_id ON requests (port_id)"),
             ("ix_requests_created_at", "CREATE INDEX ix_requests_created_at ON requests (created_at)"),
-            # stream_chunks composite index — critical for ordered chunk reads
-            ("ix_stream_chunks_stream_seq",
-             "CREATE INDEX ix_stream_chunks_stream_seq ON stream_chunks (stream_id, seq)"),
-            # stream_sessions lookup indexes
-            ("ix_stream_sessions_complete_processed",
-             "CREATE INDEX ix_stream_sessions_complete_processed ON stream_sessions (is_complete, is_processed)"),
+
         ]:
             try:
                 conn.execute(text(idx_sql))
@@ -229,6 +201,8 @@ def get_db():
         db.close()
 
 
-def run_in_db_executor(fn, *args):
-    """Run a DB operation in the shared thread pool (non-blocking)."""
-    return _db_executor.submit(fn, *args)
+def shutdown_db_executor():
+    """Gracefully shut down the dedicated DB thread pool."""
+    if _db_executor:
+        _db_executor.shutdown(wait=True)
+        print("[DB] DB executor thread pool shut down")
