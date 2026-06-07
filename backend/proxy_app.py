@@ -22,6 +22,55 @@ from models import Port, Request as RequestModel
 from config import PORT_CACHE_TTL, HTTPX_MAX_CONNECTIONS, HTTPX_MAX_KEEPALIVE_CONNECTIONS
 
 
+def _sanitize_text(value: str | None) -> str | None:
+    """Remove lone surrogate characters that MySQL's utf8mb4 cannot store."""
+    if value is None:
+        return None
+    try:
+        # "strict" mode raises UnicodeEncodeError for surrogates.
+        # "surrogatepass" would allow them through — don't use that here.
+        value.encode("utf-8")
+        return value
+    except UnicodeEncodeError:
+        # 收集所有 surrogate 字符的信息
+        surrogates = []
+        for i, ch in enumerate(value):
+            if "\uD800" <= ch <= "\uDFFF":
+                surrogates.append((i, ch))
+        
+        # 输出第一个 surrogate 的详细信息
+        if surrogates:
+            pos, ch = surrogates[0]
+            ctx_start = max(0, pos - 40)
+            ctx_end = min(len(value), pos + 40)
+            
+            # 用 surrogatepass 编码获取原始字节
+            try:
+                raw_bytes = value.encode("utf-8", errors="surrogatepass")
+                # 找到 surrogate 对应的字节位置（大约）
+                byte_pos = len(value[:pos].encode("utf-8", errors="surrogatepass"))
+                raw_hex = raw_bytes[byte_pos:byte_pos+3].hex()
+            except:
+                raw_hex = "N/A"
+            
+            print(
+                f"[Sanitize] Found {len(surrogates)} surrogate(s). "
+                f"First at position {pos}: U+{ord(ch):04X} (raw bytes: {raw_hex})",
+                file=sys.stderr,
+            )
+            print(
+                f"[Sanitize] Context: {value[ctx_start:ctx_end]!r}",
+                file=sys.stderr,
+            )
+        
+        cleaned = value.encode("utf-8", errors="replace").decode("utf-8")
+        print(
+            f"[Sanitize] Replaced surrogates, {len(value)} → {len(cleaned)} chars",
+            file=sys.stderr,
+        )
+        return cleaned
+
+
 # Shared httpx client with connection pooling — reused across all proxy requests.
 # Limits: 100 total connections, 20 per host. Handles 100+ concurrent users.
 _shared_client: httpx.AsyncClient | None = None
@@ -188,11 +237,11 @@ def _save_to_db(port_number: int, method: str, path: str,
                 port_id=port_id,
                 method=method,
                 path=path,
-                request_headers=req_headers,
-                request_body=req_body,
-                response_headers=resp_headers,
-                response_body=resp_body,
-                response_body_raw=resp_body_raw,
+                request_headers=_sanitize_text(req_headers),
+                request_body=_sanitize_text(req_body),
+                response_headers=_sanitize_text(resp_headers),
+                response_body=_sanitize_text(resp_body),
+                response_body_raw=_sanitize_text(resp_body_raw),
                 status_code=status_code,
                 duration_ms=duration_ms,
             )
@@ -250,10 +299,27 @@ def _serialize_body(body_bytes: bytes) -> str | None:
         text = body_bytes.decode("utf-8")
         try:
             parsed = json.loads(text)
-            return json.dumps(parsed, ensure_ascii=False, indent=2)
+            result = json.dumps(parsed, ensure_ascii=False, indent=2)
+            # The decoded text may contain surrogates left by surrogateescape
+            # during stream reads.  Sanitize before handing off to DB writers.
+            try:
+                result.encode("utf-8", errors="strict")
+            except UnicodeEncodeError:
+                print(
+                    f"[Proxy] WARNING: request body contains surrogate "
+                    f"characters after JSON serialization — sanitizing",
+                    file=sys.stderr,
+                )
+                result = result.encode("utf-8", errors="replace").decode("utf-8")
+            return result
         except (json.JSONDecodeError, Exception):
             return text
     except UnicodeDecodeError:
+        print(
+            f"[Proxy] WARNING: request body is not valid UTF-8 — "
+            f"storing as binary placeholder ({len(body_bytes)} bytes)",
+            file=sys.stderr,
+        )
         return f"[binary data, {len(body_bytes)} bytes]"
 
 

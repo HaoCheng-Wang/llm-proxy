@@ -20,8 +20,11 @@ from datetime import datetime, timezone
 
 import database
 from models import StreamSession, StreamChunk, Port, Request as RequestModel
-from proxy_app import _reconstruct_sse_to_json
+from proxy_app import _reconstruct_sse_to_json, _sanitize_text
 
+
+# Previously defined in this file — now imported from proxy_app to break
+# the circular dependency.  Removed the local definition.
 
 # ═══════════════════════════════════════════════════════════════
 #  Chunk write helpers — called from the streaming generator
@@ -54,10 +57,10 @@ async def _create_stream_session_async(
                 stream_id=stream_id,
                 port_number=port_number,
                 method=method,
-                path=path,
-                request_headers=req_headers,
-                request_body=req_body,
-                response_headers=resp_headers,
+                path=_sanitize_text(path),
+                request_headers=_sanitize_text(req_headers),
+                request_body=_sanitize_text(req_body),
+                response_headers=_sanitize_text(resp_headers),
                 status_code=status_code,
                 started_at=started_at,
             )
@@ -230,8 +233,8 @@ def _process_completed_streams() -> int:
                             request_headers=session.request_headers,
                             request_body=session.request_body,
                             response_headers=session.response_headers,
-                            response_body=raw_sse_text,  # raw SSE as-is
-                            response_body_raw=raw_sse_text,
+                            response_body=_sanitize_text(raw_sse_text),
+                            response_body_raw=_sanitize_text(raw_sse_text),
                             status_code=session.status_code,
                             duration_ms=session.duration_ms,
                             reconstruction_error=True,
@@ -329,8 +332,8 @@ def _reconstruct_one_stream(db, session: StreamSession) -> None:
         request_headers=session.request_headers,
         request_body=session.request_body,
         response_headers=session.response_headers,
-        response_body=reconstructed_json,
-        response_body_raw=raw_sse_text,
+        response_body=_sanitize_text(reconstructed_json),
+        response_body_raw=_sanitize_text(raw_sse_text),
         status_code=session.status_code,
         duration_ms=session.duration_ms,
         reconstruction_error=reconstruction_error,
