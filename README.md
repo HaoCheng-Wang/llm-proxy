@@ -35,6 +35,7 @@ flowchart LR
 | 服务器 | 单进程 FastAPI + asyncio，一个端口处理千级并发 |
 | 配置存储 | MySQL，所有状态持久化，内存缓存 + TTL 加速 |
 | 安全 | JWT 认证 + bcrypt + SSRF 防护 + CORS |
+| 转发协议 | HTTP/2 多路复用（自动协商，回退 HTTP/1.1） |
 | 流式处理 | SpooledTemporaryFile 流内缓冲，流结束一次性写入 MySQL |
 
 ### 路由优先级
@@ -123,7 +124,7 @@ sequenceDiagram
 
     P->>P: SpooledTemporaryFile 读取请求体
     P->>P: 请求头处理 (移除 host/content-length 等)
-    P->>U: httpx 转发 (共享连接池)
+    P->>U: httpx HTTP/2 转发 (启动时预热连接池)
     U-->>P: 响应 (非 streaming)
     P->>P: SpooledTemporaryFile 累积响应体
     P->>C: 返回完整响应
@@ -251,7 +252,7 @@ users                        ports                       requests
 | 事件循环阻塞 | 所有 DB 查询在线程池执行 | `run_in_executor(_db_executor)` |
 | 管理接口 vs 日志争抢 | 双 DB 连接池完全隔离 | 管理池 20+40 / 日志池 10+20 |
 | 线程池争抢 | 代理日志使用专用线程池 | `DB_SAVE_WORKERS=8` |
-| 上游连接数 | httpx 共享连接池 | 200 总连接 / 50 keep-alive |
+| 上游连接数 | httpx HTTP/2 共享连接池（热启动） | 200 总连接 / 50 keep-alive |
 | 端口查找 | 内存缓存 + TTL | 5 秒过期，缓存命中率 99.9%+ |
 | 请求体 OOM | SpooledTemporaryFile | ≤10MB 内存，>10MB 溢写磁盘 |
 | 流式内存累积 | SpooledTemporaryFile | ≤10MB 内存, >10MB 自动溢写临时文件 |
@@ -360,6 +361,12 @@ flowchart LR
 | `accept-encoding` | 显式移除，避免上游返回压缩内容 |
 
 `Authorization` 头（API Key）**原样透传**，代理不存储也不修改。
+
+### HTTP 协议协商
+
+代理在启动时预创建共享 httpx 客户端，避免首个请求的冷启动延迟。连接上游 API 时通过 TLS ALPN **自动协商 HTTP/2**：如果上游支持 HTTP/2（OpenAI / Anthropic / Google 均支持），使用多路复用——同一条 TCP 连接上并发处理多个请求，零额外握手开销；不支持则自动回退到 HTTP/1.1。
+
+HTTP/2 支持需安装 `h2` 包（`pip install h2>=4.0`）。未安装时自动降级为 HTTP/1.1，不影响功能。
 
 ### 编码清洗（Surrogate 字符处理）
 
@@ -639,7 +646,9 @@ llm-proxy/
 ├── Dockerfile.frontend      # 前端构建 + nginx
 ├── docker-compose.yml       # 2 容器编排
 ├── nginx.conf               # 前端 nginx 配置
-├── pyproject.toml           # uv 项目定义 + Python 依赖声明
+├── pyproject.toml           # uv 项目定义 + Python 依赖声明 + pytest 配置
+├── test_backend.py           # 77 个单元测试（配置 / Auth / SSE 解析器 / 模型等）
+├── test_integration.py       # 23 个集成+压力测试（端点逻辑 / 并发 / 大数据量）
 ├── README.md
 │
 ├── backend/                 # Python FastAPI 后端
@@ -649,7 +658,7 @@ llm-proxy/
 │   ├── models.py            # ORM 模型（User / Port / Request）
 │   ├── schemas.py           # Pydantic 请求/响应模型
 │   ├── auth.py              # JWT 认证 + bcrypt 密码哈希
-│   ├── proxy_app.py         # 代理核心：转发、SSE 格式解析、DB 记录
+│   ├── proxy_app.py         # 代理核心：HTTP/2 共享客户端、SSE 格式解析、DB 记录
 │   ├── shared_proxy.py      # 共享代理端点 /{port_number}/{path}
 │   ├── proxy_manager.py     # 端口配置查询 + 缓存刷新
 │   ├── requirements.txt     # pip 依赖

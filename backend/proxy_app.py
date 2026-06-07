@@ -50,6 +50,18 @@ def init_shared_client() -> httpx.AsyncClient:
     """Create (or return existing) shared httpx client.  Call at startup."""
     global _shared_client
     if _shared_client is None:
+        # Try HTTP/2 first; fall back to HTTP/1.1 if h2 is not installed.
+        http2 = True
+        try:
+            import h2  # noqa: F401
+        except ImportError:
+            http2 = False
+            print(
+                "[Proxy] h2 not installed — using HTTP/1.1. "
+                "Install with: pip install httpx[http2]",
+                file=sys.stderr,
+            )
+
         _shared_client = httpx.AsyncClient(
             timeout=httpx.Timeout(300.0, connect=15.0),
             limits=httpx.Limits(
@@ -58,7 +70,7 @@ def init_shared_client() -> httpx.AsyncClient:
             ),
             follow_redirects=False,
             verify=certifi.where(),
-            http2=True,
+            http2=http2,
         )
     return _shared_client
 
