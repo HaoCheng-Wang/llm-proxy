@@ -168,6 +168,23 @@ POST /api/ports {target_url, description}
 - DB 写入失败 → 3 次重试
 - Worker 异常 → 兜底逻辑直接保存原始 SSE 文本
 
+### 6. 代理端口生命周期
+
+```
+用户创建 → [运行中] ←→ 停用
+                │
+                ├─ 编辑（修改目标地址/描述/编号）
+                │
+                └─ 软删除 → [已删除，数据保留]
+                              │
+                              ├─ 恢复 → [运行中]
+                              └─ 彻底删除 → 数据永久清除
+```
+
+**软删除机制**：删除端口时仅设置 `deleted_at` 时间戳和 `is_active=False`，不删除数据库记录。管理员可在「已删除代理」页面查看、恢复或彻底删除。软删除期间产生的交互记录仍写入 `requests` 表（`port_id=NULL`），数据不会丢失。
+
+**停用 vs 软删除**：停用只是 `is_active=False`，代理编号保留且可重新启用。软删除后代理从缓存移除，编号不可再用。
+
 ## 数据模型
 
 ```
@@ -261,6 +278,106 @@ async for 退出 → await asyncio.wait(pending_tasks)  ← 确保所有 INSERT 
 ```
 
 `asyncio.wait(pending_tasks)` 保证 Worker 永远不会看到不完整的 chunk 集合。
+
+### 重建 Worker 设计
+
+流式 SSE 的重建由一个后台 asyncio task 负责，运行在 FastAPI 的 lifespan 内。
+
+**为什么要单独的 Worker？**
+
+代理进程的核心职责是实时透传——收到 chunk 立即 `yield`，不能停顿。而 SSE 重建（拼接所有 chunk、JSON 解析、写入 `requests` 表）是重操作，必须和转发异步解耦。
+
+**Worker 生命周期**
+
+```
+FastAPI startup
+    │
+    └─ asyncio.create_task(stream_reconstruction_worker(5))
+            │
+            └─ while True:
+                │
+                ├─ loop.run_in_executor(_db_executor, _process_completed_streams)
+                │       │
+                │       ├─ SELECT is_complete=1 AND is_processed=0 LIMIT 10
+                │       ├─ 对每个 session：
+                │       │   ├─ GET_LOCK('recon_{stream_id}', 0)  ← 多机互斥
+                │       │   ├─ SELECT * FROM stream_chunks ORDER BY seq
+                │       │   ├─ b"".join(chunks) → _reconstruct_sse_to_json()
+                │       │   ├─ INSERT INTO requests
+                │       │   ├─ DELETE FROM stream_chunks
+                │       │   ├─ DELETE FROM stream_sessions
+                │       │   └─ RELEASE_LOCK
+                │       └─ 重建失败 → 兜底保存 raw_sse_text + error_message
+                │
+                └─ await asyncio.sleep(5)  ← 下一次轮询
+```
+
+**为什么 Worker 也跑在 `_db_executor` 线程池里？**
+
+SSE 解析（`_reconstruct_sse_to_json`）和 `b"".join(chunks)` 都是同步 CPU 操作。直接放在 asyncio 协程中会阻塞事件循环。所以整个 `_process_completed_streams` 通过 `run_in_executor` 投递到专用线程池。
+
+**多机互斥**
+
+多个代理实例各有一个 Worker，通过 MySQL 命名锁 `GET_LOCK('recon_{stream_id}', 0)` 互斥。参数 `0` 表示不等待，拿不到锁直接跳过，保证同一个 stream 不会被两个 Worker 重复处理。
+
+### 数据库连接池设计
+
+整个系统使用 **两套独立的 SQLAlchemy 连接池**：
+
+```
+┌─ engine (DB_POOL_SIZE=20, DB_MAX_OVERFLOW=40)
+│   连接同一个 MySQL
+│   用途：FastAPI 管理路由 → 用户登录、端口 CRUD、历史查询
+│   调用方：浏览器触发的 /api/* 请求
+│
+└─ _log_engine (DB_LOG_POOL_SIZE=10, DB_LOG_MAX_OVERFLOW=20)
+    连接同一个 MySQL
+    用途：代理日志写入 → 写 requests、stream_chunks、stream_sessions
+    调用方：代理转发线程 + 重建 Worker
+```
+
+**为什么要两套？**
+
+```mermaid
+flowchart LR
+    subgraph 管理接口
+        A[用户登录]
+        B[创建代理]
+        C[查看历史]
+    end
+    subgraph 代理日志
+        D[100个SSE流同时结束]
+        E[写stream_chunks]
+        F[重建Worker]
+    end
+    A --> engine[(engine 20)]
+    B --> engine
+    C --> engine
+    D --> log[(log_engine 10)]
+    E --> log
+    F --> log
+```
+
+如果共用一套连接池，100 个 SSE 流同时结束的瞬间——每个流一次 `INSERT stream_chunks` + `UPDATE is_complete`——会瞬间耗尽池中所有连接。此时管理员尝试登录，发现**无连接可用**，只能排队等 30 秒超时。两套池完全隔离后，日志写入再繁忙，管理接口始终有 20 个空闲连接待命。
+
+**日志专用线程池**
+
+代理日志写入（`_save_to_db`、`_insert_chunk_async` 等）使用 `database._db_executor`（`DB_SAVE_WORKERS=8` 个线程），而非 asyncio 的默认线程池。这样日志写入任务之间互不争抢，且不会占满 asyncio 默认线程池影响其他操作。
+
+### 请求头转发规则
+
+代理转发到上游 LLM API 时，以下请求头会被**移除**：
+
+| 移除的头 | 原因 |
+|----------|------|
+| `host` | 替换为目标 API 的 host（如 `api.openai.com`） |
+| `content-length` | httpx 自动计算，手动传递可能不匹配 |
+| `connection` | httpx 自行管理 keep-alive |
+| `transfer-encoding` | httpx 自行处理分块传输 |
+| `content-encoding` | httpx 自动解压响应，无需透传 |
+| `accept-encoding` | 显式移除，避免上游返回压缩内容 |
+
+`Authorization` 头（API Key）**原样透传**，代理不存储也不修改。
 
 ## 部署方式
 
@@ -419,7 +536,88 @@ services:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
 ```
 
-> 后端只需监听一个端口（默认 3998）。前端在 Docker 构建阶段自动编译，无需本地安装 Node.js。所有配置项写在 `.env` 文件里，容器挂载后 `config.py` 通过 python-dotenv 读取。
+> 后端只需监听一个端口（默认 3998）。前端在 Docker 构建阶段自动编译，无需本地安装 Node.js。
+
+### 多机水平扩展
+
+当单机连接数或 CPU 不足时，可部署多台代理实例，前面加 Nginx 负载均衡。
+
+#### 架构
+
+```
+                    Nginx (round-robin / least_conn)
+                   /        |        \
+          Proxy 1       Proxy 2       Proxy 3
+         :3998         :3998          :3998
+              \          |           /
+               └─────────┼─────────┘
+                     MySQL（读写权限）
+```
+
+#### 必备条件
+
+- MySQL 独立部署，所有代理实例连接同一个库
+- 所有实例的 `.env` 中 `SECRET_KEY` **必须完全一致**（共享 JWT）
+- `DATABASE_HOST` 指向同一台 MySQL
+
+#### 配置步骤
+
+**1. 每台机器部署代理实例**
+
+```bash
+git clone https://github.com/HaoCheng-Wang/llm-proxy.git
+cd llm-proxy
+cp .env.example .env
+vim .env   # 统一 DATABASE_HOST、SECRET_KEY，可调 HTTPX_MAX_CONNECTIONS
+docker compose up -d
+```
+
+**2. 配置 Nginx 负载均衡**
+
+```nginx
+upstream llm_proxy_backend {
+    # 轮询模式，可改为 least_conn 优先分给连接最少的实例
+    server 192.168.1.10:3998;
+    server 192.168.1.11:3998;
+    server 192.168.1.12:3998;
+}
+
+server {
+    listen 3998;
+    location / {
+        proxy_pass http://llm_proxy_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 300s;   # 匹配 SSE 长连接
+    }
+}
+```
+
+**3. 前端指向 Nginx**
+
+修改 `frontend/vite.config.js`（开发）或 `nginx.conf`（生产）中的 API 代理目标为 Nginx 地址。
+
+#### 多机安全机制
+
+| 机制 | 实现 |
+|------|------|
+| 端口分配互斥 | `SELECT GET_LOCK('llm_proxy_port_alloc', 10)` — MySQL 服务端命名锁 |
+| 流式重建互斥 | `SELECT GET_LOCK('recon_{stream_id}', 0)` — 每 stream 独立锁，多 Worker 不抢 |
+| 端口缓存 | 每实例独立内存缓存，TTL 各自到期刷新，最终一致 |
+
+#### 单机 vs 多机参数建议
+
+| 参数 | 单机（默认） | 3 台 × 多机 |
+|------|:--:|:--:|
+| `HTTPX_MAX_CONNECTIONS` | 200 | 200（每台） |
+| `DB_POOL_SIZE` | 20 | 10（每台，总 30） |
+| `DB_LOG_POOL_SIZE` | 10 | 8（每台，总 24） |
+| `DB_SAVE_WORKERS` | 8 | 8（每台） |
+| MySQL `max_connections` | 100 | 200+ |
+
+> 多机部署时降低每台的 DB 连接池，避免总连接数超出 MySQL 上限。总 DB 连接 ≈ 台数 × (DB_POOL_SIZE + DB_LOG_POOL_SIZE)。
 
 ## 项目结构
 
@@ -475,7 +673,25 @@ llm-proxy/
             └── ChangePassword.vue # 修改密码
 ```
 
+## 前端功能
+
+| 功能 | 实现 |
+|------|------|
+| 实时刷新 | 端口详情页每 2 秒轮询 `GET /api/ports/{id}?since_id=N`，仅拉取新记录 |
+| 交互筛选 | 按请求方法分类：`📤 API请求`（POST/PUT/PATCH/DELETE）vs `🌐 其他`（GET/OPTIONS/HEAD） |
+| JSON 树形查看 | 基于 `vue-json-pretty`，请求和响应 JSON 各有独立树形查看按钮，支持折叠/展开/搜索 |
+| 重建异常审查 | 当 `reconstruction_error=True` 时显示橙色警告横幅，提供"查看完整 SSE 原始文本"按钮 |
+| 一键导出 | 可选仅导出 JSON 数据或完整交互含 HTTP 头；支持从后端直接导出全部 API 请求 JSON |
+| 分页加载 | 首次加载 10 条，支持"加载更多"和"加载全部"，上限 100 条/次 |
+| 滚动保护 | 阅读交互记录时新数据到达不跳动滚动位置 |
+
 ## API 接口
+
+### 通用
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/health` | 健康检查 |
 
 ### 认证
 
