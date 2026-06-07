@@ -19,6 +19,7 @@ from starlette.requests import Request
 from starlette.responses import Response, JSONResponse, StreamingResponse
 import database
 from models import Port, Request as RequestModel
+from config import PORT_CACHE_TTL, HTTPX_MAX_CONNECTIONS, HTTPX_MAX_KEEPALIVE_CONNECTIONS
 
 
 # Shared httpx client with connection pooling — reused across all proxy requests.
@@ -31,7 +32,10 @@ def get_shared_client() -> httpx.AsyncClient:
     if _shared_client is None:
         _shared_client = httpx.AsyncClient(
             timeout=httpx.Timeout(300.0, connect=15.0),
-            limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
+            limits=httpx.Limits(
+                max_connections=HTTPX_MAX_CONNECTIONS,
+                max_keepalive_connections=HTTPX_MAX_KEEPALIVE_CONNECTIONS,
+            ),
             follow_redirects=False,
             verify=certifi.where(),
         )
@@ -45,13 +49,15 @@ async def close_shared_client():
         _shared_client = None
 
 
-# In-memory cache of port -> target_url mappings for fast lookup
+# In-memory cache of port_number → target_url mappings.
+# Refreshed from DB on startup and after PORT_CACHE_TTL seconds.
 _port_target_cache: dict[int, str] = {}
+_cache_updated_at: float = 0.0
 
 
 def refresh_port_cache(db=None):
     """Refresh the port -> target_url cache from database."""
-    global _port_target_cache
+    global _port_target_cache, _cache_updated_at
     if db is None:
         db = database.SessionLocal()
         try:
@@ -62,13 +68,27 @@ def refresh_port_cache(db=None):
     else:
         ports = db.query(Port).filter(Port.is_active.is_(True)).all()
         _port_target_cache = {p.port_number: p.target_url for p in ports}
+    _cache_updated_at = time.time()
+
+
+def _maybe_refresh_cache():
+    """Refresh cache from DB if TTL has expired."""
+    if time.time() - _cache_updated_at > PORT_CACHE_TTL:
+        refresh_port_cache()
 
 
 def get_target_url(port_number: int) -> str | None:
-    """Get target URL for a port. Falls back to DB if not in cache."""
+    """Get target URL for a port. Auto-refreshes stale cache, falls back to DB.
+
+    WARNING: This is a SYNC function — it may perform blocking DB queries.
+    Use ``aget_target_url()`` from async contexts to avoid blocking the event loop.
+    """
+    # Check cache first (with TTL auto-refresh)
+    _maybe_refresh_cache()
     if port_number in _port_target_cache:
         return _port_target_cache[port_number]
 
+    # Cache miss — query DB and update cache
     db = database.SessionLocal()
     try:
         port = db.query(Port).filter(
@@ -83,17 +103,67 @@ def get_target_url(port_number: int) -> str | None:
         db.close()
 
 
+async def _arefresh_port_cache():
+    """Async wrapper: refresh the port→target_url cache in a thread.
+
+    Avoids blocking the asyncio event loop when called from async handlers.
+    """
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, refresh_port_cache)
+
+
+async def aget_target_url(port_number: int) -> str | None:
+    """Async version of ``get_target_url`` — runs DB queries in a thread pool.
+
+    This is the function to use from async contexts (e.g. FastAPI route handlers)
+    to avoid blocking the asyncio event loop on synchronous DB operations.
+    """
+    # ── Fast path: cache hit ──
+    if time.time() - _cache_updated_at <= PORT_CACHE_TTL:
+        if port_number in _port_target_cache:
+            return _port_target_cache[port_number]
+    else:
+        # Cache TTL expired — refresh async (DB query in thread)
+        await _arefresh_port_cache()
+        if port_number in _port_target_cache:
+            return _port_target_cache[port_number]
+
+    # ── Slow path: cache miss — async DB lookup ──
+    loop = asyncio.get_running_loop()
+
+    def _db_lookup():
+        db = database.SessionLocal()
+        try:
+            port = db.query(Port).filter(
+                Port.port_number == port_number,
+                Port.is_active.is_(True)
+            ).first()
+            if port:
+                # Update cache so subsequent lookups are fast
+                _port_target_cache[port.port_number] = port.target_url
+                return port.target_url
+            return None
+        finally:
+            db.close()
+
+    return await loop.run_in_executor(None, _db_lookup)
+
+
 def _save_to_db(port_number: int, method: str, path: str,
                 req_headers: str, req_body: str | None,
                 resp_headers: str, resp_body: str | None,
                 status_code: int, duration_ms: int,
                 resp_body_raw: str | None = None):
     """Save a request/response record to the database. Runs in a thread.
-    Retries up to 3 times on transient connection errors."""
+    Retries up to 3 times on transient connection errors.
+
+    Uses the dedicated log engine (LogSessionLocal) so that burst writes from
+    proxy logging never compete with FastAPI management API connections.
+    """
     import time as _time
     last_error = None
     for attempt in range(3):
-        db = database.SessionLocal()
+        db = database.LogSessionLocal()
         try:
             port = db.query(Port).filter(
                 Port.port_number == port_number,
@@ -138,10 +208,14 @@ async def _save_record_async(port_number: int, method: str, path: str,
                               resp_headers: str, resp_body: str | None,
                               status_code: int, duration_ms: int,
                               resp_body_raw: str | None = None):
-    """Async wrapper — runs the sync DB save in a thread to avoid blocking."""
+    """Async wrapper — runs the sync DB save in the dedicated log thread pool.
+
+    Uses ``database._db_executor`` (configured via DB_SAVE_WORKERS) so that
+    burst log writes never compete with asyncio's default thread pool.
+    """
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(
-        None,
+        database._db_executor,
         _save_to_db,
         port_number, method, path,
         req_headers, req_body,
@@ -1001,45 +1075,64 @@ async def proxy_endpoint(request: Request):
     resp_headers_json = "{}"
     resp_content_type = "application/json"
     is_streaming = False
+    stream_owned_by_generator = False
+    stream_ctx = None
 
     try:
         client = get_shared_client()
-        resp = await client.request(
+
+        # Use client.stream() for ALL requests to avoid httpx buffering.
+        # httpx.AsyncClient.request() buffers the entire response body before
+        # returning, which causes streaming (SSE) responses to arrive all at
+        # once at the downstream client.  client.stream() returns immediately
+        # after receiving response headers — chunks then arrive in real-time.
+        stream_ctx = client.stream(
             method=request.method,
             url=target_full_url,
             headers=forward_headers,
             content=body if body else None,
         )
-        status_code = resp.status_code
-        resp_headers_json = json.dumps(dict(resp.headers), ensure_ascii=False, indent=2)
-        resp_content_type = resp.headers.get("content-type", "application/json")
+        response = await stream_ctx.__aenter__()
+
+        status_code = response.status_code
+        resp_headers_json = json.dumps(dict(response.headers), ensure_ascii=False, indent=2)
+        resp_content_type = response.headers.get("content-type", "application/json")
 
         # Check if the response is streaming (SSE)
         is_streaming = "text/event-stream" in resp_content_type
 
         if is_streaming:
             # --- STREAMING: forward chunks in real-time, accumulate for recording ---
-            chunks = []
-            async def stream_generator():
-                nonlocal chunks
-                async for chunk in resp.aiter_bytes():
-                    chunks.append(chunk)
-                    yield chunk
-                # After streaming completes, reconstruct full JSON and save asynchronously
-                full_body = b"".join(chunks)
-                raw_sse_text = full_body.decode("utf-8", errors="replace")
-                reconstructed_json = _reconstruct_sse_to_json(raw_sse_text)
+            # The stream_ctx lifecycle is transferred to the generator.  Its
+            # finally block calls __aexit__, so do NOT close it here on the
+            # success path.  Set a flag so the outer finally block also knows
+            # to skip cleanup on this path.
+            stream_owned_by_generator = True
 
-                await _save_record_async(
-                    port_number, request.method,
-                    path + ("?" + query_string if query_string else ""),
-                    req_headers_json, req_body_str,
-                    resp_headers_json,
-                    reconstructed_json,           # response_body
-                    status_code,
-                    int((time.time() - start_time) * 1000),
-                    resp_body_raw=raw_sse_text,   # response_body_raw
-                )
+            async def stream_generator():
+                chunks = []
+                try:
+                    async for chunk in response.aiter_bytes():
+                        chunks.append(chunk)
+                        yield chunk
+                    # After streaming completes, reconstruct JSON and save
+                    full_body = b"".join(chunks)
+                    raw_sse_text = full_body.decode("utf-8", errors="replace")
+                    reconstructed_json = _reconstruct_sse_to_json(raw_sse_text)
+
+                    await _save_record_async(
+                        port_number, request.method,
+                        path + ("?" + query_string if query_string else ""),
+                        req_headers_json, req_body_str,
+                        resp_headers_json,
+                        reconstructed_json,           # response_body
+                        status_code,
+                        int((time.time() - start_time) * 1000),
+                        resp_body_raw=raw_sse_text,   # response_body_raw
+                    )
+                finally:
+                    # Always close the httpx stream context when done
+                    await stream_ctx.__aexit__(None, None, None)
 
             response_headers = {"X-Proxy-Port": str(port_number)}
             return StreamingResponse(
@@ -1050,18 +1143,37 @@ async def proxy_endpoint(request: Request):
             )
         else:
             # --- NON-STREAMING: read full response, save, return ---
-            resp_bytes = resp.content
-            resp_body_str = _serialize_body(resp_bytes)
+            full_body = b""
+            async for chunk in response.aiter_bytes():
+                full_body += chunk
+            await stream_ctx.__aexit__(None, None, None)
+            stream_owned_by_generator = False  # already closed above
+            resp_body_str = _serialize_body(full_body)
 
     except httpx.TimeoutException:
         status_code = 504
         resp_body_str = '{"error": "Upstream timeout"}'
-    except httpx.ConnectError:
+        is_streaming = False
+    except httpx.ConnectError as e:
         status_code = 502
-        resp_body_str = '{"error": "Cannot connect to upstream server"}'
+        inner = e.__cause__ or e.__context__ or None
+        inner_str = f"{type(inner).__name__}: {inner}" if inner else "no further detail"
+        resp_body_str = json.dumps({"error": f"Cannot connect: {inner_str}"})
+        is_streaming = False
     except Exception as e:
         status_code = 502
         resp_body_str = json.dumps({"error": f"Proxy error: {str(e)}"})
+        is_streaming = False
+    finally:
+        # Close the httpx stream on error paths, or on the non-streaming
+        # success path that somehow didn't close (defensive).
+        # On the streaming success path, the generator's finally block owns
+        # cleanup — skip it here.
+        if stream_ctx is not None and not stream_owned_by_generator:
+            try:
+                await stream_ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
 
     duration_ms = int((time.time() - start_time) * 1000)
 

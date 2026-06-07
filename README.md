@@ -4,12 +4,13 @@
 
 ## 功能
 
-- **多端口代理** (4000–5000)：每用户端口数可通过 `MAX_PORTS_PER_USER` 环境变量配置（默认 10），被占端口自动跳过
+- **路径路由代理**：所有用户共用一个端口（默认 3998），通过 URL 路径区分代理配置
+- **兼容性零修改**：用户只需修改 base_url，API Key、请求头等完全不动
 - **全量截获**：请求头/体、响应头/体、状态码、耗时，流式 SSE 自动重组为完整 JSON，原始 SSE 文本保留
-- **实时刷新**：前端每 2 秒轮询，新交互即时出现，无需手动刷新
-- **交互分类筛选**：API 请求（POST/PUT/PATCH/DELETE）与其他请求（端口扫描、浏览器预检、健康检查等）分开展示，悬停可查看详情
-- **JSON 树形查看**：请求/响应 JSON 各有独立的树形查看按钮，点击在新标签页中打开专用查看页面，支持折叠/展开、搜索过滤
-- **一键导出**：可选仅导出 JSON 数据或完整交互含 HTTP 头；支持从后端直接导出全量 API 请求，无需前端加载
+- **实时刷新**：前端每 2 秒轮询，新交互即时出现
+- **交互分类筛选**：API 请求（POST/PUT/PATCH/DELETE）与其他请求（端口扫描、浏览器预检、健康检查等）分开展示
+- **JSON 树形查看**：请求/响应 JSON 各有独立的树形查看按钮，支持折叠/展开、搜索过滤
+- **一键导出**：可选仅导出 JSON 数据或完整交互含 HTTP 头
 - **用户系统**：注册→管理员审批→登录，数据按用户隔离
 - **管理员面板**：查看全部端口及创建者，审批/删除用户
 
@@ -32,28 +33,45 @@
 智能体 (Agent)
     │
     ▼
-http://your-server-ip:4000/v1/chat/completions
-    │
-┌───┴───────────────────────────────┐
-│         LLM Proxy 宿主机            │
-│                                    │
-│  ┌─────────────────────────────┐  │
-│  │  ProxyManager               │  │
-│  │  每个端口一个独立代理进程      │  │
-│  │  4000~5000 动态分配          │  │
-│  └──────────┬──────────────────┘  │
-│             │                      │
-│  ┌──────────┴──────────────────┐  │
-│  │  FastAPI 管理 API (:3998)    │  │
-│  │  用户认证、端口管理、历史查询  │  │
-│  └──────────┬──────────────────┘  │
-│             │                      │
-│         MySQL                     │
-└─────────────┼─────────────────────┘
-              │
-              ▼
-    大模型 API (OpenAI / DMXAPI / ...)
+POST http://server:3998/12345/v1/chat/completions
+    │                    ↑   ↑
+    │                   共享  代理编号
+    │                   入口  (5位随机数)
+    ▼
+┌──────────────────────────────────────────┐
+│           LLM Proxy (FastAPI :3998)       │
+│                                          │
+│  路由匹配：                               │
+│    /api/*        → 管理接口              │
+│    /{number}/*   → 共享代理端点           │
+│        │                                 │
+│        ├─ 从 URL 提取 port_number        │
+│        ├─ 查缓存/DB → target_url         │
+│        ├─ httpx 转发到目标 LLM API        │
+│        ├─ SSE 流实时透传 + 累积拼接        │
+│        └─ 异步写入 MySQL                  │
+│                   │                      │
+│               MySQL                      │
+└───────────────────┼──────────────────────┘
+                    │
+                    ▼
+           LLM API (OpenAI / Anthropic / Gemini / ...)
 ```
+
+**核心设计：端口号是数据库中的逻辑标识符，不是 TCP 端口。**
+
+系统在 `:3998`（默认）监听一个端口。代理请求通过 URL 路径区分——`/12345/v1/...` 转发到编号 12345 的目标地址，`/67890/v1/...` 转发到编号 67890 的目标地址。编号为系统随机分配的 5 位数字（10000–99999）。管理接口（`/api/*`）和代理共享同一端口，路由优先级保证互不冲突。
+
+### 设计特点
+
+| 特性 | 实现 |
+|------|------|
+| 编号 | 5 位随机数，永不冲突 |
+| 服务器 | 单进程 FastAPI，asyncio 处理数千并发 |
+| 配置存储 | MySQL，所有状态有持久化保障 |
+| 端口缓存 | 内存缓存 + TTL 自动刷新 |
+| 安全 | JWT 认证 + SSRF 防护 + CORS |
+| 连接池 | 管理接口和日志写入使用独立 DB 连接池，互不争抢 |
 
 ---
 
@@ -124,13 +142,13 @@ nohup uv run python backend/main.py > back.log 2>&1 & echo $! > back.pid
 
 输出示例（`tail -f back.log`）：
 ```
-[Main] Running schema setup (pre-fork)...
+[Main] Running schema setup...
 [DB] Database 'llm_proxy' is ready
 [DB] All tables verified
 [DB] Schema setup complete (DDL engine disposed)
 [DB] Engine ready (pool_size=20, max_overflow=40)
   Created admin user: admin
-[Main] Management API ready on port 3998
+[Main] Management API + Shared Proxy ready on port 3998
 ```
 
 ### 5. 启动前端（终端 2）
@@ -154,8 +172,12 @@ npm run dev
 ### 7. 使用流程
 
 1. 管理员登录 → 进入「用户管理」→ 批准新注册的用户
-2. 用户登录 → 点击「创建新端口」→ 输入目标 API 地址（如 `https://api.openai.com`）
-3. 在智能体中，把 API Base URL 改为 `http://<你的IP>:<分配的端口>`，路径部分保持不变（如原来用 `/v1/chat/completions`，现在仍然用 `/v1/chat/completions`）
+2. 用户登录 → 点击「创建代理」→ 输入目标 API 地址（如 `https://api.openai.com`）
+3. 在智能体中，把 API Base URL 改为 `http://<你的IP>:3998/<分配的端口号>`，**路径部分保持不变**：
+   - 原来：`https://api.openai.com/v1/chat/completions`
+   - 改为：`http://<IP>:3998/12345/v1/chat/completions`
+                            ↑ 系统随机分配的 5 位编号
+   - API Key 等其他配置**不需要任何修改**
 4. 在「查看详情」页面实时查看所有交互记录
 
 ---
@@ -205,8 +227,8 @@ docker compose down
 
 ```yaml
 services:
-  backend:              # Python + 代理管理器
-    network_mode: host  # 直接绑宿主机网卡，端口动态分配
+  backend:              # Python FastAPI + 共享代理
+    network_mode: host  # 只需监听 :3998 一个端口
     volumes:
       - ./.env:/app/.env:ro  # 挂载配置文件，config.py 自动读取
 
@@ -216,7 +238,7 @@ services:
       - ./nginx.conf    # 挂载 nginx 配置
 ```
 
-> `network_mode: host` 让代理端口直接绑定宿主机网卡，被占端口自动跳过，不会卡住启动。前端在 Docker 构建阶段自动编译，无需本地安装 Node.js。所有配置项写在 `.env` 文件里，容器挂载后 `config.py` 通过 python-dotenv 读取，无需在 docker-compose.yml 重复声明。
+> 后端只需监听一个端口（默认 3998）。前端在 Docker 构建阶段自动编译，无需本地安装 Node.js。所有配置项写在 `.env` 文件里，容器挂载后 `config.py` 通过 python-dotenv 读取。
 
 所有环境变量的详细说明见 `.env.example`。
 
@@ -239,14 +261,15 @@ llm-proxy/
 ├── README.md
 │
 ├── backend/                 # Python FastAPI 后端
-│   ├── main.py              # 入口：启动管理 API + 初始化数据库
+│   ├── main.py              # 入口：启动 FastAPI + 注册共享代理路由
 │   ├── config.py            # 读取 .env 环境变量
 │   ├── database.py          # 自动建库建表 + 连接池 + 索引迁移
 │   ├── models.py            # SQLAlchemy ORM 模型
 │   ├── schemas.py           # Pydantic 请求/响应模型
 │   ├── auth.py              # JWT 认证 + bcrypt 密码哈希
-│   ├── proxy_app.py         # 代理核心：拦截、转发、记录
-│   ├── proxy_manager.py     # 多端口动态管理
+│   ├── proxy_app.py         # 代理核心：转发、SSE 解析、DB 记录
+│   ├── shared_proxy.py      # 共享代理端点 /{port_number}/{path}
+│   ├── proxy_manager.py     # 端口配置查询 + 缓存刷新
 │   ├── requirements.txt     # pip 依赖（与 pyproject.toml 同步）
 │   └── routers/
 │       ├── __init__.py
@@ -290,6 +313,12 @@ llm-proxy/
 ---
 
 ## API 接口
+
+### 代理转发
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `任意` | `/{port_number}/{path:path}` | **共享代理端点** — 例如 `POST /12345/v1/chat/completions` 会将请求转发到编号 12345 配置的 target_url。编号为 5 位随机数。 |
 
 ### 认证
 

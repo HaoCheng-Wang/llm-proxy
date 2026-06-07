@@ -1,17 +1,16 @@
-import json
-import asyncio
 import ipaddress
 import socket
 from urllib.parse import urlparse
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, text
+from sqlalchemy.exc import IntegrityError
 from database import get_db
 from models import User, Port, Request as RequestModel
-from schemas import PortCreate, PortInfo, PortHistory, RequestInfo
-from auth import get_current_user, require_approved
-from config import PROXY_PORT_START, PROXY_PORT_END, MAX_PORTS_PER_USER, ALLOW_INTERNAL_TARGETS
-from proxy_manager import ProxyManager, refresh_port_cache
+from schemas import PortCreate, PortUpdate, PortInfo, PortHistory, RequestInfo
+from auth import require_approved
+from config import ALLOW_INTERNAL_TARGETS
+from proxy_app import refresh_port_cache
 
 router = APIRouter(prefix="/api/ports", tags=["ports"])
 
@@ -63,67 +62,80 @@ def _validate_target_url(url: str) -> None:
         )
 
 
-def get_proxy_manager(request: Request) -> ProxyManager:
-    """Get the ProxyManager instance from the app state."""
-    return request.app.state.proxy_manager
-
-
 @router.post("", response_model=PortInfo)
-async def create_port(
+def create_port(
     data: PortCreate,
     current_user: User = Depends(require_approved),
     db: Session = Depends(get_db),
-    proxy_manager: ProxyManager = Depends(get_proxy_manager),
 ):
-    """Create a new proxy port for the current user."""
-    # Check port limit per user
-    user_port_count = db.query(Port).filter(
-        Port.user_id == current_user.id,
-        Port.is_active.is_(True)
-    ).count()
-    if user_port_count >= MAX_PORTS_PER_USER:
-        raise HTTPException(status_code=400, detail=f"Maximum {MAX_PORTS_PER_USER} active ports per user")
+    """Create a new proxy for the current user.
 
-    # Find an available port
-    used_ports = {p[0] for p in db.query(Port.port_number).filter(Port.is_active.is_(True)).all()}
-    used_ports.update(proxy_manager.get_active_ports())
+    In the shared-proxy architecture, this only creates a DB record.
+    A random 5-digit proxy number is assigned (10000–99999).
+    Retries up to 10 times on IntegrityError / collision.
+    """
+    import random
 
-    assigned_port = None
-    for port_num in range(PROXY_PORT_START, PROXY_PORT_END + 1):
-        if port_num not in used_ports:
-            assigned_port = port_num
-            break
+    # Acquire a MySQL named lock to serialize port allocation.
+    lock_acquired = db.execute(
+        text("SELECT GET_LOCK('llm_proxy_port_alloc', 10)")
+    ).scalar()
+    if lock_acquired != 1:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy processing port allocation, please try again"
+        )
 
-    if assigned_port is None:
-        raise HTTPException(status_code=503, detail="No available ports in range 4000-5000")
-
-    # Strip trailing slash from target_url
-    target_url = data.target_url.rstrip("/")
-
-    # Validate target URL (SSRF protection)
-    _validate_target_url(target_url)
-
-    # Create port record in DB
-    port = Port(
-        port_number=assigned_port,
-        user_id=current_user.id,
-        target_url=target_url,
-        description=data.description,
-        is_active=True,
-    )
-    db.add(port)
-    db.commit()
-    db.refresh(port)
-
-    # Start the proxy server
     try:
-        await proxy_manager.start_proxy(assigned_port)
-        refresh_port_cache(db)
-    except OSError as e:
-        # If port fails to start, still keep the record but mark inactive
-        port.is_active = False
-        db.commit()
-        raise HTTPException(status_code=500, detail=f"Failed to start proxy on port {assigned_port}: {e}")
+        # Get all currently-active port numbers to avoid assignment collisions
+        active_numbers = set(
+            p[0] for p in db.query(Port.port_number)
+            .filter(Port.is_active.is_(True)).all()
+        )
+
+        # Random 5-digit number, retry with new random if collision
+        assigned_port = None
+        for _ in range(10):
+            candidate = random.randint(10000, 99999)
+            if candidate not in active_numbers:
+                assigned_port = candidate
+                break
+
+        if assigned_port is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Unable to allocate a free proxy number. Please try again."
+            )
+
+        # Strip trailing slash from target_url
+        target_url = data.target_url.rstrip("/")
+
+        # Validate target URL (SSRF protection)
+        _validate_target_url(target_url)
+
+        # Create port record in DB (active immediately — shared proxy handles traffic)
+        port = Port(
+            port_number=assigned_port,
+            user_id=current_user.id,
+            target_url=target_url,
+            description=data.description,
+            is_active=True,
+        )
+        db.add(port)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(
+                status_code=503,
+                detail="Proxy number conflict. Please try again."
+            )
+    finally:
+        # Always release the MySQL named lock, even on error.
+        db.execute(text("SELECT RELEASE_LOCK('llm_proxy_port_alloc')"))
+
+    db.refresh(port)
+    refresh_port_cache(db)
 
     return PortInfo(
         id=port.id,
@@ -185,18 +197,17 @@ def list_ports(
 @router.get("/active-ports", response_model=list[int])
 def get_active_port_numbers(
     current_user: User = Depends(require_approved),
-    proxy_manager: ProxyManager = Depends(get_proxy_manager),
     db: Session = Depends(get_db),
 ):
     """Get all active port numbers (admin sees all, users see theirs)."""
     if current_user.role == "admin":
-        return proxy_manager.get_active_ports()
+        ports = db.query(Port.port_number).filter(Port.is_active.is_(True)).all()
     else:
-        user_ports = db.query(Port.port_number).filter(
+        ports = db.query(Port.port_number).filter(
             Port.user_id == current_user.id,
             Port.is_active.is_(True)
         ).all()
-        return [p[0] for p in user_ports if proxy_manager.is_running(p[0])]
+    return [p[0] for p in ports]
 
 
 @router.get("/{port_id}", response_model=PortHistory)
@@ -267,13 +278,12 @@ def get_port_history(
 
 
 @router.delete("/{port_id}", response_model=dict)
-async def delete_port(
+def delete_port(
     port_id: int,
     current_user: User = Depends(require_approved),
     db: Session = Depends(get_db),
-    proxy_manager: ProxyManager = Depends(get_proxy_manager),
 ):
-    """Stop and delete a proxy port."""
+    """Delete a proxy port and its request history."""
     port = db.query(Port).filter(Port.id == port_id).first()
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
@@ -281,26 +291,21 @@ async def delete_port(
     if current_user.role != "admin" and port.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    # Stop the proxy server
-    if proxy_manager.is_running(port.port_number):
-        await proxy_manager.stop_proxy(port.port_number)
-
-    # Delete port and its request history
+    port_number = port.port_number
     db.delete(port)
     db.commit()
-    refresh_port_cache(db)
 
-    return {"message": f"Port {port.port_number} has been deleted."}
+    refresh_port_cache(db)
+    return {"message": f"Port {port_number} has been deleted."}
 
 
 @router.post("/{port_id}/stop", response_model=dict)
-async def stop_port(
+def stop_port(
     port_id: int,
     current_user: User = Depends(require_approved),
     db: Session = Depends(get_db),
-    proxy_manager: ProxyManager = Depends(get_proxy_manager),
 ):
-    """Stop a proxy port without deleting it. Owner or admin only."""
+    """Deactivate a proxy port (shared proxy will reject traffic to it)."""
     port = db.query(Port).filter(Port.id == port_id).first()
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
@@ -311,25 +316,20 @@ async def stop_port(
     if not port.is_active:
         raise HTTPException(status_code=400, detail="Port is already stopped")
 
-    # Stop the proxy server
-    if proxy_manager.is_running(port.port_number):
-        await proxy_manager.stop_proxy(port.port_number)
-
     port.is_active = False
     db.commit()
-    refresh_port_cache(db)
 
+    refresh_port_cache(db)
     return {"message": f"Port {port.port_number} has been stopped."}
 
 
 @router.post("/{port_id}/start", response_model=dict)
-async def start_port(
+def start_port(
     port_id: int,
     current_user: User = Depends(require_approved),
     db: Session = Depends(get_db),
-    proxy_manager: ProxyManager = Depends(get_proxy_manager),
 ):
-    """Start a previously stopped proxy port. Owner or admin only."""
+    """Reactivate a previously stopped proxy port."""
     port = db.query(Port).filter(Port.id == port_id).first()
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
@@ -340,24 +340,106 @@ async def start_port(
     if port.is_active:
         raise HTTPException(status_code=400, detail="Port is already running")
 
-    # Check port limit
-    user_port_count = db.query(Port).filter(
-        Port.user_id == port.user_id,
-        Port.is_active.is_(True)
-    ).count()
-    if user_port_count >= MAX_PORTS_PER_USER:
-        raise HTTPException(status_code=400, detail=f"Maximum {MAX_PORTS_PER_USER} active ports per user")
+    port.is_active = True
+    db.commit()
 
-    # Start the proxy server
-    try:
-        await proxy_manager.start_proxy(port.port_number)
-        port.is_active = True
-        db.commit()
-        refresh_port_cache(db)
-    except OSError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start proxy on port {port.port_number}: {e}")
-
+    refresh_port_cache(db)
     return {"message": f"Port {port.port_number} has been started."}
+
+
+@router.put("/{port_id}", response_model=PortInfo)
+def update_port(
+    port_id: int,
+    data: PortUpdate,
+    current_user: User = Depends(require_approved),
+    db: Session = Depends(get_db),
+):
+    """Edit a port's description, target URL, and/or port number.
+
+    In the shared-proxy architecture, changes take effect immediately
+    (no server restart needed). Target URL changes apply on the next request.
+    """
+    port = db.query(Port).filter(Port.id == port_id).first()
+    if not port:
+        raise HTTPException(status_code=404, detail="Port not found")
+
+    if current_user.role != "admin" and port.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    new_port_number = data.port_number
+    _port_lock_held = False
+
+    # ── Validate port_number change ──
+    if new_port_number is not None and new_port_number != port.port_number:
+        if new_port_number <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Port number must be a positive integer"
+            )
+        # Acquire MySQL lock to prevent concurrent update races
+        lock_acquired = db.execute(
+            text("SELECT GET_LOCK('llm_proxy_port_alloc', 10)")
+        ).scalar()
+        if lock_acquired != 1:
+            raise HTTPException(
+                status_code=503,
+                detail="Server is busy processing port allocation, please try again"
+            )
+        _port_lock_held = True
+
+        # Check DB for conflicts
+        existing = db.query(Port).filter(
+            Port.port_number == new_port_number,
+            Port.id != port.id
+        ).first()
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Port {new_port_number} is already assigned to another proxy."
+            )
+
+    try:
+        # ── Apply changes ──
+        if data.target_url is not None:
+            port.target_url = data.target_url.rstrip("/")
+            _validate_target_url(port.target_url)
+
+        if data.description is not None:
+            port.description = data.description
+
+        if new_port_number is not None and new_port_number != port.port_number:
+            port.port_number = new_port_number
+
+        # ── Commit changes ──
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="Port number conflict — another request allocated this port."
+            )
+
+        refresh_port_cache(db)
+    finally:
+        if _port_lock_held:
+            db.execute(text("SELECT RELEASE_LOCK('llm_proxy_port_alloc')"))
+
+    # Get request count
+    request_count = db.query(func.count(RequestModel.id)).filter(
+        RequestModel.port_id == port.id
+    ).scalar() or 0
+
+    return PortInfo(
+        id=port.id,
+        port_number=port.port_number,
+        target_url=port.target_url,
+        description=port.description or "",
+        is_active=port.is_active,
+        created_at=port.created_at,
+        request_count=request_count,
+        username=current_user.username,
+    )
 
 
 @router.delete("/{port_id}/history", response_model=dict)

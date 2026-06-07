@@ -43,11 +43,7 @@ if not SECRET_KEY:
 # 网络
 # ---------------------------------------------------------------------------
 API_PORT = int(os.getenv("API_PORT", "3998"))
-API_WORKERS = int(os.getenv("API_WORKERS", "2"))
 DISPLAY_IP = os.getenv("DISPLAY_IP", "your-server-ip")
-PROXY_PORT_START = int(os.getenv("PROXY_PORT_START", "4000"))
-PROXY_PORT_END = int(os.getenv("PROXY_PORT_END", "5000"))
-MAX_PORTS_PER_USER = int(os.getenv("MAX_PORTS_PER_USER", "10"))
 
 # CORS 允许的源，逗号分隔。留空则仅允许 localhost 开发地址。
 # 示例: CORS_ORIGINS=https://example.com,https://admin.example.com
@@ -77,6 +73,28 @@ ALLOW_INTERNAL_TARGETS = os.getenv("ALLOW_INTERNAL_TARGETS", "true").lower() == 
 DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "20"))
 DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "40"))
 DB_SAVE_WORKERS = int(os.getenv("DB_SAVE_WORKERS", "8"))
+
+# 代理请求日志专用连接池（与 FastAPI 管理接口分离，避免互相影响）
+DB_LOG_POOL_SIZE = int(os.getenv("DB_LOG_POOL_SIZE", "10"))
+DB_LOG_MAX_OVERFLOW = int(os.getenv("DB_LOG_MAX_OVERFLOW", "20"))
+
+# 端口→目标URL缓存TTL（秒），到期后下次查询从DB刷新
+PORT_CACHE_TTL = int(os.getenv("PORT_CACHE_TTL", "5"))
+
+# httpx 连接池上限（代理转发时使用）
+HTTPX_MAX_CONNECTIONS = int(os.getenv("HTTPX_MAX_CONNECTIONS", "200"))
+HTTPX_MAX_KEEPALIVE_CONNECTIONS = int(os.getenv("HTTPX_MAX_KEEPALIVE_CONNECTIONS", "50"))
+
+# 代理 请求体 / 非流式响应体 的内存缓冲上限（字节）。
+# 小于此值在内存中处理，超过则溢出到磁盘临时文件。
+# 默认 10 MB — LLM API 请求体通常远小于此值。
+#
+# 流式 SSE 响应不经过此缓冲区 — 使用 write-ahead 机制逐 chunk 写入 MySQL，
+# 由后台 Worker 异步重建。
+PROXY_BODY_MEMORY_LIMIT = int(os.getenv("PROXY_BODY_MEMORY_LIMIT", str(10 * 1024 * 1024)))
+
+# 流式重建 Worker 的轮询间隔（秒）。
+STREAM_RECONSTRUCTION_INTERVAL = int(os.getenv("STREAM_RECONSTRUCTION_INTERVAL", "5"))
 
 # 将独立字段导出，供 database.py 直接使用（不走 URL 解析）
 _DB_USER_FOR_AUTO = _DB_USER

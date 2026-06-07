@@ -79,7 +79,7 @@ async function approveUser(userId, approved) {
 }
 
 async function handleDelete(user) {
-  if (!confirm(`确定删除用户 "${user.username}" 吗？其所有端口和数据将被清除。`)) return
+  if (!confirm(`确定删除用户 "${user.username}" 吗？其所有代理和数据将被清除。`)) return
   try {
     await api.deleteUser(user.id)
     showToast('用户已删除', 'success')

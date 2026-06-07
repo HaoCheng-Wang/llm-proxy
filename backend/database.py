@@ -6,6 +6,7 @@ from sqlalchemy.orm import sessionmaker
 from config import (
     DATABASE_URL,
     DB_POOL_SIZE, DB_MAX_OVERFLOW, DB_SAVE_WORKERS,
+    DB_LOG_POOL_SIZE, DB_LOG_MAX_OVERFLOW,
     _DB_USER_FOR_AUTO, _DB_PASS_FOR_AUTO,
     _DB_HOST_FOR_AUTO, _DB_PORT_FOR_AUTO, _DB_NAME_FOR_AUTO,
 )
@@ -14,6 +15,12 @@ Base = declarative_base()
 
 engine = None
 SessionLocal = None
+
+# ── 代理请求日志专用连接池 ──────────────────────────────
+# 与 FastAPI 管理接口的 engine 分离，避免大量流式请求结束时
+# 的批量写库操作耗尽管理接口的可用连接。
+_log_engine = None
+LogSessionLocal = None
 
 # Thread pool for non-blocking DB saves from proxy threads
 _db_executor = ThreadPoolExecutor(max_workers=DB_SAVE_WORKERS, thread_name_prefix="db-save")
@@ -59,13 +66,43 @@ def _init_engine():
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
+def _init_log_engine():
+    """Create a dedicated engine + sessionmaker for proxy request logging.
+
+    This pool is independent from the FastAPI management pool so that a burst
+    of log writes (e.g. 100 concurrent SSE streams finishing) never starves
+    the management API of database connections.
+    """
+    global _log_engine, LogSessionLocal
+    _log_engine = create_engine(
+        DATABASE_URL,
+        pool_size=DB_LOG_POOL_SIZE,
+        max_overflow=DB_LOG_MAX_OVERFLOW,
+        pool_pre_ping=True,
+        pool_recycle=600,
+        pool_timeout=30,
+        connect_args={
+            "connect_timeout": 10,
+            "read_timeout": 30,
+            "write_timeout": 30,
+        },
+    )
+    LogSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_log_engine)
+    print(f"[DB] Log engine ready (pool_size={DB_LOG_POOL_SIZE}, max_overflow={DB_LOG_MAX_OVERFLOW})")
+
+
+def get_log_db():
+    """Yield a session from the dedicated log engine (for proxy request logging)."""
+    db = LogSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 
 def setup_schema():
-    """Run DDL once in the main process **before** uvicorn forks workers.
-
-    Creates a short-lived engine, ensures the database and all tables /
-    columns / indexes exist, then disposes the engine.  This guarantees
-    that concurrent worker startups never collide on DDL statements.
+    """Ensure database and all tables/columns/indexes exist.
 
     Called from ``main.py`` before ``uvicorn.run(…)``.
     """
@@ -115,6 +152,12 @@ def _migrate_columns_on_engine(eng):
         for idx_name, idx_sql in [
             ("ix_requests_port_id", "CREATE INDEX ix_requests_port_id ON requests (port_id)"),
             ("ix_requests_created_at", "CREATE INDEX ix_requests_created_at ON requests (created_at)"),
+            # stream_chunks composite index — critical for ordered chunk reads
+            ("ix_stream_chunks_stream_seq",
+             "CREATE INDEX ix_stream_chunks_stream_seq ON stream_chunks (stream_id, seq)"),
+            # stream_sessions lookup indexes
+            ("ix_stream_sessions_complete_processed",
+             "CREATE INDEX ix_stream_sessions_complete_processed ON stream_sessions (is_complete, is_processed)"),
         ]:
             try:
                 conn.execute(text(idx_sql))
@@ -127,13 +170,9 @@ def _migrate_columns_on_engine(eng):
 
 
 def init_database():
-    """Per-worker startup: create a dedicated connection pool for this process.
-
-    All DDL (schema + migrations) has already been applied by
-    ``setup_schema()`` in the parent process before fork, so this is
-    safe to call concurrently from every uvicorn worker.
-    """
+    """Startup: create connection pools."""
     _init_engine()
+    _init_log_engine()
     print(f"[DB] Engine ready (pool_size={DB_POOL_SIZE}, max_overflow={DB_MAX_OVERFLOW})")
 
 

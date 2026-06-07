@@ -1,8 +1,8 @@
 <template>
   <div>
     <div class="flex-between mb-16">
-      <h2 style="font-size:20px">{{ auth.isAdmin ? '📊 全部代理端口' : '我的代理端口' }}</h2>
-      <button class="btn btn-primary" @click="showCreateModal = true">+ 创建新端口</button>
+      <h2 style="font-size:20px">{{ auth.isAdmin ? '📊 全部代理' : '我的代理' }}</h2>
+      <button class="btn btn-primary" @click="showCreateModal = true">+ 创建代理</button>
     </div>
 
     <!-- Ports Table -->
@@ -11,7 +11,7 @@
         <table>
           <thead>
             <tr>
-              <th>端口号</th>
+              <th>编号</th>
               <th>代理地址</th>
               <th>目标地址</th>
               <th>描述</th>
@@ -29,7 +29,7 @@
               </td>
               <td>
                 <code style="font-size:12px;color:#aeb6bf;background:#15222b;padding:2px 6px;border-radius:4px">
-                  http://{{ displayIp }}:{{ port.port_number }}
+                  http://{{ displayIp }}:{{ apiPort }}/{{ port.port_number }}
                 </code>
               </td>
               <td>
@@ -51,11 +51,14 @@
                   <button class="btn btn-outline btn-sm" @click="$router.push(`/port/${port.id}`)">
                     查看详情
                   </button>
+                  <button class="btn btn-outline btn-sm" @click="openEdit(port)" style="color:#f39c12;border-color:rgba(243,156,18,0.4)">
+                    编辑
+                  </button>
                   <button v-if="port.is_active" class="btn btn-warning btn-sm" @click="handleStop(port)">
-                    停止
+                    停用
                   </button>
                   <button v-else class="btn btn-success btn-sm" @click="handleStart(port)">
-                    启动
+                    启用
                   </button>
                   <button class="btn btn-danger btn-sm" @click="handleDelete(port)">
                     删除
@@ -69,16 +72,16 @@
     </div>
 
     <div v-else class="card empty-state">
-      <h3>暂无代理端口</h3>
-      <p>点击"创建新端口"开始拦截和记录API通信</p>
+      <h3>暂无代理</h3>
+      <p>点击"创建代理"开始拦截和记录API通信</p>
     </div>
 
     <!-- Usage Guide -->
     <div class="card mt-24">
       <div class="card-header">📖 使用说明</div>
       <div style="font-size:14px;line-height:1.8;color:#aeb6bf">
-        <p><strong>第 1 步：创建代理端口</strong></p>
-        <p>点击 <strong>"创建新端口"</strong>，输入大模型 API 的目标地址。常见示例：</p>
+        <p><strong>第 1 步：创建代理</strong></p>
+        <p>点击 <strong>"创建代理"</strong>，输入大模型 API 的目标地址。常见示例：</p>
         <ul style="margin:4px 0 8px 20px">
           <li>OpenAI：<code>https://api.openai.com</code></li>
           <li>Ollama 本地模型：<code>http://localhost:11434</code></li>
@@ -86,23 +89,23 @@
         </ul>
         <p style="color:#e67e22">⚠️ 注意：只填域名和端口（如 <code>https://api.openai.com</code>），<strong>不要</strong>带 <code>/v1</code> 等路径，路径会在智能体配置中保留。</p>
 
-        <p><strong>第 2 步：获取分配的端口号</strong></p>
-        <p>系统会在 4000–5000 范围内自动分配一个空闲端口号，每个用户最多可创建多个端口（上限可通过环境变量配置）。</p>
+        <p><strong>第 2 步：获取分配的代理编号</strong></p>
+        <p>系统自动分配一个 5 位随机编号。此编号将放在 URL 路径中访问（例如 <code>http://{{ displayIp }}:{{ apiPort }}/12345/...</code>）。</p>
 
         <p><strong>第 3 步：修改智能体的 API 地址</strong></p>
-        <p>在你的智能体（Agent）或客户端配置中，将大模型 API 的 Base URL 改为代理地址。<strong>路径部分保持不变</strong>，只需替换域名和端口：</p>
+        <p>在你的智能体（Agent）或客户端配置中，将大模型 API 的 Base URL 改为代理地址。<strong>路径部分保持不变</strong>，只需替换域名和端口。编号放在路径中：</p>
         <ul style="margin:4px 0 8px 20px">
-          <li>原来：<code>https://api.openai.com/v1</code> → 改为：<code>http://{{ displayIp }}:&lt;端口号&gt;/v1</code></li>
-          <li>原来：<code>https://api.openai.com/v1/chat</code> → 改为：<code>http://{{ displayIp }}:&lt;端口号&gt;/v1/chat</code></li>
-          <li>原来：<code>http://localhost:11434/v1</code> → 改为：<code>http://{{ displayIp }}:&lt;端口号&gt;/v1</code></li>
+          <li>原来：<code>https://api.openai.com/v1</code> → 改为：<code>http://{{ displayIp }}:{{ apiPort }}/&lt;编号&gt;/v1</code></li>
+          <li>原来：<code>https://api.openai.com/v1/chat</code> → 改为：<code>http://{{ displayIp }}:{{ apiPort }}/&lt;编号&gt;/v1/chat</code></li>
+          <li>原来：<code>http://localhost:11434/v1</code> → 改为：<code>http://{{ displayIp }}:{{ apiPort }}/&lt;编号&gt;/v1</code></li>
         </ul>
-        <p>API Key 等其他配置保持不变。如果你的客户端支持自定义 Base URL，只需修改 Base URL 即可。</p>
+        <p>API Key 等其他配置保持不变。只需修改 Base URL，智能体代码无需其他改动。</p>
 
         <p><strong>第 4 步：开始使用</strong></p>
         <p>智能体发出的所有请求会自动转发到目标地址，同时系统会完整记录请求头/体、响应头/体、状态码和耗时。支持流式（SSE）和非流式请求。</p>
 
         <p><strong>第 5 步：查看交互记录</strong></p>
-        <p>点击 <strong>"查看详情"</strong> 进入端口详情页，可以：</p>
+        <p>点击 <strong>"查看详情"</strong> 进入代理详情页，可以：</p>
         <ul style="margin:4px 0 0 20px">
           <li>实时查看所有交互记录（每 2 秒自动刷新）</li>
           <li>展开单条记录查看完整的请求和响应 JSON</li>
@@ -116,24 +119,51 @@
     <!-- Create Port Modal -->
     <div v-if="showCreateModal" class="modal-overlay" @click.self="showCreateModal = false">
       <div class="modal">
-        <h3>创建新代理端口</h3>
+        <h3>创建新代理</h3>
         <form @submit.prevent="handleCreate">
           <div class="form-group">
             <label>目标API地址</label>
             <input v-model="createForm.target_url" class="form-input"
-                   placeholder="例如: https://api.openai.com  (只填域名和端口，不带路径)"
+                   placeholder="例如: https://api.openai.com  (只填域名，不带路径)"
                    required />
           </div>
           <div class="form-group">
             <label>描述（可选）</label>
             <input v-model="createForm.description" class="form-input"
-                   placeholder="用于区分不同用途的端口" />
+                   placeholder="用于区分不同用途的代理" />
           </div>
           <div v-if="createError" class="form-error">{{ createError }}</div>
           <div class="flex gap-8" style="justify-content:flex-end;margin-top:16px">
             <button type="button" class="btn btn-outline" @click="showCreateModal = false">取消</button>
             <button type="submit" class="btn btn-primary" :disabled="creating">
               {{ creating ? '创建中...' : '创建' }}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Edit Port Modal -->
+    <div v-if="showEditModal" class="modal-overlay" @click.self="showEditModal = false">
+      <div class="modal">
+        <h3>编辑代理配置</h3>
+        <form @submit.prevent="handleEdit">
+          <div class="form-group">
+            <label>目标API地址</label>
+            <input v-model="editForm.target_url" class="form-input"
+                   placeholder="例如: https://api.openai.com"
+                   required />
+          </div>
+          <div class="form-group">
+            <label>描述</label>
+            <input v-model="editForm.description" class="form-input"
+                   placeholder="用于区分不同用途的代理" />
+          </div>
+          <div v-if="editError" class="form-error">{{ editError }}</div>
+          <div class="flex gap-8" style="justify-content:flex-end;margin-top:16px">
+            <button type="button" class="btn btn-outline" @click="showEditModal = false">取消</button>
+            <button type="submit" class="btn btn-primary" :disabled="editing">
+              {{ editing ? '保存中...' : '保存' }}
             </button>
           </div>
         </form>
@@ -150,17 +180,23 @@ import api from '../api'
 const auth = useAuthStore()
 const showToast = inject('showToast')
 const displayIp = ref('your-server-ip')
+const apiPort = ref(3998)
 const ports = ref([])
 const showCreateModal = ref(false)
 const createForm = ref({ target_url: '', description: '' })
 const createError = ref('')
 const creating = ref(false)
 
+const showEditModal = ref(false)
+const editForm = ref({ id: null, target_url: '', description: '' })
+const editError = ref('')
+const editing = ref(false)
+
 async function loadPorts() {
   try {
     ports.value = await api.listPorts()
   } catch (e) {
-    showToast('加载端口列表失败', 'error')
+    showToast('加载代理列表失败', 'error')
   }
 }
 
@@ -171,7 +207,7 @@ async function handleCreate() {
     await api.createPort(createForm.value)
     showCreateModal.value = false
     createForm.value = { target_url: '', description: '' }
-    showToast('端口创建成功！', 'success')
+    showToast('代理创建成功！', 'success')
     await loadPorts()
   } catch (e) {
     createError.value = e.response?.data?.detail || '创建失败'
@@ -181,10 +217,10 @@ async function handleCreate() {
 }
 
 async function handleDelete(port) {
-  if (!confirm(`确定删除端口 ${port.port_number} 吗？所有历史记录将被清除。`)) return
+  if (!confirm(`确定删除代理 ${port.port_number} 吗？所有历史记录将被清除。`)) return
   try {
     await api.deletePort(port.id)
-    showToast('端口已删除', 'success')
+    showToast('代理已删除', 'success')
     await loadPorts()
   } catch (e) {
     showToast(e.response?.data?.detail || '删除失败', 'error')
@@ -192,23 +228,51 @@ async function handleDelete(port) {
 }
 
 async function handleStop(port) {
-  if (!confirm(`确定停止端口 ${port.port_number} 吗？停止后该端口的代理服务将不可用。`)) return
+  if (!confirm(`确定停用代理 ${port.port_number} 吗？停用后将无法通过此代理访问目标 API。`)) return
   try {
     await api.stopPort(port.id)
-    showToast(`端口 ${port.port_number} 已停止`, 'success')
+    showToast(`代理 ${port.port_number} 已停用`, 'success')
     await loadPorts()
   } catch (e) {
-    showToast(e.response?.data?.detail || '停止失败', 'error')
+    showToast(e.response?.data?.detail || '停用失败', 'error')
   }
 }
 
 async function handleStart(port) {
   try {
     await api.startPort(port.id)
-    showToast(`端口 ${port.port_number} 已启动`, 'success')
+    showToast(`代理 ${port.port_number} 已启用`, 'success')
     await loadPorts()
   } catch (e) {
-    showToast(e.response?.data?.detail || '启动失败', 'error')
+    showToast(e.response?.data?.detail || '启用失败', 'error')
+  }
+}
+
+function openEdit(port) {
+  editError.value = ''
+  editForm.value = {
+    id: port.id,
+    target_url: port.target_url,
+    description: port.description || '',
+  }
+  showEditModal.value = true
+}
+
+async function handleEdit() {
+  editError.value = ''
+  editing.value = true
+  try {
+    await api.updatePort(editForm.value.id, {
+      target_url: editForm.value.target_url,
+      description: editForm.value.description,
+    })
+    showEditModal.value = false
+    showToast('代理配置已更新', 'success')
+    await loadPorts()
+  } catch (e) {
+    editError.value = e.response?.data?.detail || '保存失败'
+  } finally {
+    editing.value = false
   }
 }
 
@@ -216,6 +280,7 @@ async function loadConfig() {
   try {
     const cfg = await api.getConfig()
     displayIp.value = cfg.display_ip
+    apiPort.value = cfg.api_port || 3998
   } catch (e) {
     // keep default
   }

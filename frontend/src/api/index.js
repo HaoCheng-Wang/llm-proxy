@@ -49,6 +49,7 @@ export default {
   deletePort: (portId) => http.delete(`/ports/${portId}`).then(r => r.data),
   stopPort: (portId) => http.post(`/ports/${portId}/stop`).then(r => r.data),
   startPort: (portId) => http.post(`/ports/${portId}/start`).then(r => r.data),
+  updatePort: (portId, data) => http.put(`/ports/${portId}`, data).then(r => r.data),
   clearPortHistory: (portId) => http.delete(`/ports/${portId}/history`).then(r => r.data),
   deleteRequest: (portId, requestId) => http.delete(`/ports/${portId}/history/${requestId}`).then(r => r.data),
   getSingleRequest: (portId, requestId) => http.get(`/ports/${portId}/history/${requestId}`).then(r => r.data),

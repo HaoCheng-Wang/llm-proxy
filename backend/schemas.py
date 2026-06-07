@@ -44,6 +44,17 @@ class PortCreate(BaseModel):
     description: str = Field(default="", max_length=200)
 
 
+class PortUpdate(BaseModel):
+    """Fields that can be edited on an existing port.
+
+    All fields optional — only provided fields are updated.
+    Changing port_number requires the new port to be free.
+    """
+    port_number: Optional[int] = None
+    target_url: Optional[str] = Field(None, min_length=5, max_length=500)
+    description: Optional[str] = Field(None, max_length=200)
+
+
 class PortInfo(BaseModel):
     id: int
     port_number: int
