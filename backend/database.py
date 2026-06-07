@@ -150,13 +150,14 @@ def _migrate_columns_on_engine(eng):
         except Exception:
             conn.rollback()
 
-        # Add reconstruction_error flag for SSE streams
+        # Add reconstruction_error flag to requests for SSE failure tracking
         try:
             conn.execute(text(
-                "ALTER TABLE requests ADD COLUMN reconstruction_error TINYINT(1) NOT NULL DEFAULT 0"
+                "ALTER TABLE requests ADD COLUMN reconstruction_error TINYINT(1) "
+                "NOT NULL DEFAULT 0"
             ))
             conn.commit()
-            print("[DB] Added column: reconstruction_error")
+            print("[DB] Added column: requests.reconstruction_error")
         except Exception:
             conn.rollback()
 
@@ -167,17 +168,6 @@ def _migrate_columns_on_engine(eng):
             ))
             conn.commit()
             print("[DB] Added column: ports.deleted_at")
-        except Exception:
-            conn.rollback()
-
-        # Add reconstruction_error flag to requests for SSE failure tracking
-        try:
-            conn.execute(text(
-                "ALTER TABLE requests ADD COLUMN reconstruction_error BOOLEAN "
-                "NOT NULL DEFAULT FALSE"
-            ))
-            conn.commit()
-            print("[DB] Added column: requests.reconstruction_error")
         except Exception:
             conn.rollback()
 

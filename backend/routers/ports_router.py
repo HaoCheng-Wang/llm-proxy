@@ -320,7 +320,7 @@ def stop_port(
     db: Session = Depends(get_db),
 ):
     """Deactivate a proxy port (shared proxy will reject traffic to it)."""
-    port = db.query(Port).filter(Port.id == port_id).first()
+    port = db.query(Port).filter(Port.id == port_id, Port.deleted_at.is_(None)).first()
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
 
@@ -344,7 +344,7 @@ def start_port(
     db: Session = Depends(get_db),
 ):
     """Reactivate a previously stopped proxy port."""
-    port = db.query(Port).filter(Port.id == port_id).first()
+    port = db.query(Port).filter(Port.id == port_id, Port.deleted_at.is_(None)).first()
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
 
@@ -373,7 +373,7 @@ def update_port(
     In the shared-proxy architecture, changes take effect immediately
     (no server restart needed). Target URL changes apply on the next request.
     """
-    port = db.query(Port).filter(Port.id == port_id).first()
+    port = db.query(Port).filter(Port.id == port_id, Port.deleted_at.is_(None)).first()
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
 
@@ -463,7 +463,7 @@ def clear_port_history(
     db: Session = Depends(get_db),
 ):
     """Clear all request history for a port, but keep the port active."""
-    port = db.query(Port).filter(Port.id == port_id).first()
+    port = db.query(Port).filter(Port.id == port_id, Port.deleted_at.is_(None)).first()
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
 
@@ -486,7 +486,7 @@ def delete_single_request(
     db: Session = Depends(get_db),
 ):
     """Delete a single request record."""
-    port = db.query(Port).filter(Port.id == port_id).first()
+    port = db.query(Port).filter(Port.id == port_id, Port.deleted_at.is_(None)).first()
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
 
