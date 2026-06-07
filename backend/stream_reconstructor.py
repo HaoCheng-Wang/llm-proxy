@@ -187,7 +187,44 @@ def _process_completed_streams() -> int:
                     file=sys.stderr,
                 )
                 traceback.print_exc(file=sys.stderr)
-                # Mark as processed and clean up chunks so they don't accumulate
+                # Try to salvage the raw SSE data even on unexpected errors
+                try:
+                    chunks = (
+                        db.query(StreamChunk)
+                        .filter(StreamChunk.stream_id == session.stream_id)
+                        .order_by(StreamChunk.seq)
+                        .all()
+                    )
+                    if chunks:
+                        full_body = b"".join(c.chunk_data for c in chunks)
+                        raw_sse_text = full_body.decode("utf-8", errors="replace")
+                        # Resolve port_id (may be None)
+                        port = (
+                            db.query(Port)
+                            .filter(
+                                Port.port_number == session.port_number,
+                                Port.is_active == True,  # noqa: E712
+                            )
+                            .first()
+                        )
+                        record = RequestModel(
+                            port_id=port.id if port else None,
+                            method=session.method,
+                            path=session.path,
+                            request_headers=session.request_headers,
+                            request_body=session.request_body,
+                            response_headers=session.response_headers,
+                            response_body=raw_sse_text,  # raw SSE as-is
+                            response_body_raw=raw_sse_text,
+                            status_code=session.status_code,
+                            duration_ms=session.duration_ms,
+                            reconstruction_error=True,
+                        )
+                        db.add(record)
+                except Exception:
+                    db.rollback()
+
+                # Clean up chunks so they don't accumulate
                 db.query(StreamChunk).filter(
                     StreamChunk.stream_id == session.stream_id
                 ).delete()
