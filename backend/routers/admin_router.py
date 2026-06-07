@@ -1,9 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from database import get_db
-from models import User
-from schemas import UserApproval, UserInfo, AdminUserList
+from models import User, Port, Request as RequestModel
+from schemas import UserApproval, UserInfo, AdminUserList, PortInfo, DeletedPortList
 from auth import require_admin
+from proxy_app import refresh_port_cache
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -53,3 +55,94 @@ def delete_user(user_id: int, admin: User = Depends(require_admin),
     db.delete(user)
     db.commit()
     return {"message": f"User '{username}' has been deleted."}
+
+
+# ──────────────────────────────────────────────
+#  Soft-delete port management (admin only)
+# ──────────────────────────────────────────────
+
+@router.get("/deleted-ports", response_model=DeletedPortList)
+def list_deleted_ports(
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """List all soft-deleted ports with their request counts and creator usernames."""
+    ports = (
+        db.query(Port)
+        .filter(Port.deleted_at.isnot(None))
+        .order_by(Port.deleted_at.desc())
+        .all()
+    )
+
+    if not ports:
+        return DeletedPortList(ports=[])
+
+    port_ids = [p.id for p in ports]
+    count_rows = (
+        db.query(RequestModel.port_id, func.count(RequestModel.id))
+        .filter(RequestModel.port_id.in_(port_ids))
+        .group_by(RequestModel.port_id)
+        .all()
+    )
+    count_map = {row[0]: row[1] for row in count_rows}
+
+    user_ids = {p.user_id for p in ports}
+    users = db.query(User.id, User.username).filter(User.id.in_(user_ids)).all()
+    username_map = {u.id: u.username for u in users}
+
+    result = []
+    for port in ports:
+        result.append(PortInfo(
+            id=port.id,
+            port_number=port.port_number,
+            target_url=port.target_url,
+            description=port.description or "",
+            is_active=port.is_active,
+            deleted_at=port.deleted_at,
+            created_at=port.created_at,
+            request_count=count_map.get(port.id, 0),
+            username=username_map.get(port.user_id, ""),
+        ))
+    return DeletedPortList(ports=result)
+
+
+@router.post("/ports/{port_id}/restore", response_model=dict)
+def restore_port(
+    port_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Restore a soft-deleted port — clears deleted_at, keeps is_active=False."""
+    port = db.query(Port).filter(
+        Port.id == port_id, Port.deleted_at.isnot(None)
+    ).first()
+    if not port:
+        raise HTTPException(status_code=404, detail="Deleted port not found")
+
+    port.deleted_at = None
+    port.is_active = False  # Restored but inactive — user must re-enable
+    db.commit()
+
+    refresh_port_cache(db)
+    return {"message": f"Port {port.port_number} has been restored."}
+
+
+@router.delete("/ports/{port_id}/permanent", response_model=dict)
+def permanent_delete_port(
+    port_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Permanently delete a soft-deleted port and all its request history."""
+    port = db.query(Port).filter(
+        Port.id == port_id, Port.deleted_at.isnot(None)
+    ).first()
+    if not port:
+        raise HTTPException(status_code=404, detail="Deleted port not found")
+
+    port_number = port.port_number
+    db.delete(port)  # cascade deletes requests
+    db.commit()
+
+    refresh_port_cache(db)
+    return {"message": f"Port {port_number} has been permanently deleted."}

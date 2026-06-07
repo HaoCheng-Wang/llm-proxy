@@ -1,5 +1,6 @@
 import ipaddress
 import socket
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -90,7 +91,7 @@ def create_port(
         # Get all currently-active port numbers to avoid assignment collisions
         active_numbers = set(
             p[0] for p in db.query(Port.port_number)
-            .filter(Port.is_active.is_(True)).all()
+            .filter(Port.is_active.is_(True), Port.deleted_at.is_(None)).all()
         )
 
         # Random 5-digit number, retry with new random if collision
@@ -156,9 +157,12 @@ def list_ports(
 ):
     """List ports — admin sees all users' ports, regular users see their own."""
     if current_user.role == "admin":
-        ports = db.query(Port).order_by(Port.created_at.desc()).all()
+        ports = db.query(Port).filter(Port.deleted_at.is_(None)).order_by(Port.created_at.desc()).all()
     else:
-        ports = db.query(Port).filter(Port.user_id == current_user.id).order_by(Port.created_at.desc()).all()
+        ports = db.query(Port).filter(
+            Port.user_id == current_user.id,
+            Port.deleted_at.is_(None),
+        ).order_by(Port.created_at.desc()).all()
 
     if not ports:
         return []
@@ -201,11 +205,14 @@ def get_active_port_numbers(
 ):
     """Get all active port numbers (admin sees all, users see theirs)."""
     if current_user.role == "admin":
-        ports = db.query(Port.port_number).filter(Port.is_active.is_(True)).all()
+        ports = db.query(Port.port_number).filter(
+            Port.is_active.is_(True), Port.deleted_at.is_(None)
+        ).all()
     else:
         ports = db.query(Port.port_number).filter(
             Port.user_id == current_user.id,
-            Port.is_active.is_(True)
+            Port.is_active.is_(True),
+            Port.deleted_at.is_(None),
         ).all()
     return [p[0] for p in ports]
 
@@ -254,6 +261,7 @@ def get_port_history(
             target_url=port.target_url,
             description=port.description or "",
             is_active=port.is_active,
+            deleted_at=port.deleted_at,
             created_at=port.created_at,
             request_count=request_count,
             username=creator_name,
@@ -271,6 +279,7 @@ def get_port_history(
                 response_body_raw=r.response_body_raw,
                 status_code=r.status_code,
                 duration_ms=r.duration_ms,
+                reconstruction_error=r.reconstruction_error,
                 created_at=r.created_at,
             ) for r in requests
         ]
@@ -283,8 +292,12 @@ def delete_port(
     current_user: User = Depends(require_approved),
     db: Session = Depends(get_db),
 ):
-    """Delete a proxy port and its request history."""
-    port = db.query(Port).filter(Port.id == port_id).first()
+    """Soft-delete a proxy port — marks it deleted and inactive.
+
+    The port becomes invisible to regular users but its data is preserved.
+    Admins can view, restore, or permanently delete soft-deleted ports.
+    """
+    port = db.query(Port).filter(Port.id == port_id, Port.deleted_at.is_(None)).first()
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
 
@@ -292,7 +305,8 @@ def delete_port(
         raise HTTPException(status_code=403, detail="Access denied")
 
     port_number = port.port_number
-    db.delete(port)
+    port.deleted_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    port.is_active = False
     db.commit()
 
     refresh_port_cache(db)

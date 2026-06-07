@@ -19,7 +19,9 @@ class ProxyManager:
         """Get all active port numbers from database."""
         db = database.SessionLocal()
         try:
-            ports = db.query(Port.port_number).filter(Port.is_active.is_(True)).all()
+            ports = db.query(Port.port_number).filter(
+                Port.is_active.is_(True), Port.deleted_at.is_(None)
+            ).all()
             return [p[0] for p in ports]
         finally:
             db.close()
@@ -31,6 +33,7 @@ class ProxyManager:
             return db.query(Port).filter(
                 Port.port_number == port_number,
                 Port.is_active.is_(True),
+                Port.deleted_at.is_(None),
             ).first() is not None
         finally:
             db.close()

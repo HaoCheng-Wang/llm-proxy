@@ -63,6 +63,9 @@ export default {
   listUsers: () => http.get('/admin/users').then(r => r.data),
   approveUser: (data) => http.put('/admin/users/approve', data).then(r => r.data),
   deleteUser: (userId) => http.delete(`/admin/users/${userId}`).then(r => r.data),
+  listDeletedPorts: () => http.get('/admin/deleted-ports').then(r => r.data),
+  restorePort: (portId) => http.post(`/admin/ports/${portId}/restore`).then(r => r.data),
+  permanentDeletePort: (portId) => http.delete(`/admin/ports/${portId}/permanent`).then(r => r.data),
 
   // Config
   getConfig: () => http.get('/config').then(r => r.data),

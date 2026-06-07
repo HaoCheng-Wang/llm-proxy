@@ -133,6 +133,22 @@
             </div>
           </div>
 
+          <!-- Reconstruction error warning -->
+          <div v-if="req.reconstruction_error" class="recon-error-banner">
+            <div class="recon-error-header">⚠️ 流式响应重建异常</div>
+            <p class="recon-error-msg">
+              由于 SSE 格式无法识别或解析失败，下方"响应 JSON"可能显示原始文本或为空。
+              完整 SSE 原始数据已保存在 <strong>response_body_raw</strong> 字段，可点击下面的按钮查看。
+            </p>
+            <div v-if="req.response_body_raw" style="margin-top:8px">
+              <button class="btn btn-warning btn-sm"
+                      @click.stop="toggleRawSse(req)">
+                {{ rawSseExpanded[req.id] ? '🔽 隐藏原始SSE' : '📄 查看完整SSE原始文本' }}
+              </button>
+              <pre v-if="rawSseExpanded[req.id]" class="raw-sse-text">{{ req.response_body_raw }}</pre>
+            </div>
+          </div>
+
           <!-- JSON Panels -->
           <div class="json-panels">
             <!-- Request JSON -->
@@ -211,6 +227,7 @@ const data = ref({ port: null, requests: [] })
 const requests = ref([])
 const expanded = ref({})
 const headersExpanded = ref({})
+const rawSseExpanded = ref({})
 const copyMenuOpen = ref(false)
 const newCount = ref(0)
 const polling = ref(false)
@@ -368,9 +385,14 @@ function toggleExpand(reqId) {
   expanded.value[reqId] = !expanded.value[reqId]
 }
 
+function toggleRawSse(req) {
+  rawSseExpanded.value[req.id] = !rawSseExpanded.value[req.id]
+}
+
 function collapseAll() {
   expanded.value = {}
   headersExpanded.value = {}
+  rawSseExpanded.value = {}
 }
 
 function openTreeView(req, type) {

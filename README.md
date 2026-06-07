@@ -7,12 +7,16 @@
 - **路径路由代理**：所有用户共用一个端口（默认 3998），通过 URL 路径区分代理配置
 - **兼容性零修改**：用户只需修改 base_url，API Key、请求头等完全不动
 - **全量截获**：请求头/体、响应头/体、状态码、耗时，流式 SSE 自动重组为完整 JSON，原始 SSE 文本保留
+- **Write-Ahead 流式日志**：流式 SSE 逐 chunk 写入 MySQL，后台 Worker 异步重建 JSON，代理进程无内存/磁盘累积
 - **实时刷新**：前端每 2 秒轮询，新交互即时出现
-- **交互分类筛选**：API 请求（POST/PUT/PATCH/DELETE）与其他请求（端口扫描、浏览器预检、健康检查等）分开展示
+- **交互分类筛选**：API 请求（POST/PUT/PATCH/DELETE）与其他请求（GET/OPTIONS/HEAD 等）分开展示
 - **JSON 树形查看**：请求/响应 JSON 各有独立的树形查看按钮，支持折叠/展开、搜索过滤
+- **流式重建异常审查**：当 SSE 格式无法识别或解析失败时，前端显示警告并展示完整原始 SSE 文本
 - **一键导出**：可选仅导出 JSON 数据或完整交互含 HTTP 头
 - **用户系统**：注册→管理员审批→登录，数据按用户隔离
-- **管理员面板**：查看全部端口及创建者，审批/删除用户
+- **管理员面板**：查看全部端口及创建者，审批/删除用户，管理已删除代理（恢复/彻底删除）
+- **软删除**：删除端口仅标记"已删除"，数据保留，管理员可恢复或彻底清除
+- **大请求体保护**：请求/响应体超过内存阈值自动溢出到磁盘临时文件，防止 OOM
 
 ## 关于 uv（Python 包管理器）
 
@@ -38,21 +42,29 @@ POST http://server:3998/12345/v1/chat/completions
     │                   共享  代理编号
     │                   入口  (5位随机数)
     ▼
-┌──────────────────────────────────────────┐
-│           LLM Proxy (FastAPI :3998)       │
-│                                          │
-│  路由匹配：                               │
-│    /api/*        → 管理接口              │
-│    /{number}/*   → 共享代理端点           │
-│        │                                 │
-│        ├─ 从 URL 提取 port_number        │
-│        ├─ 查缓存/DB → target_url         │
-│        ├─ httpx 转发到目标 LLM API        │
-│        ├─ SSE 流实时透传 + 累积拼接        │
-│        └─ 异步写入 MySQL                  │
-│                   │                      │
-│               MySQL                      │
-└───────────────────┼──────────────────────┘
+┌──────────────────────────────────────────────────┐
+│              LLM Proxy (FastAPI :3998)            │
+│                                                  │
+│  路由匹配：                                       │
+│    /api/*        → 管理接口                      │
+│    /{number}/*   → 共享代理端点                   │
+│        │                                         │
+│        ├─ 从 URL 提取 port_number                │
+│        ├─ 查缓存/DB → target_url                 │
+│        ├─ httpx 转发到目标 LLM API                │
+│        │                                         │
+│        ├─ 非流式：SpooledTemporaryFile → 异步写库  │
+│        └─ 流 式：逐 chunk 即时透传                 │
+│              └→ 逐 chunk 写入 stream_chunks        │
+│                   │                              │
+│           后台 Worker（每5秒）                     │
+│           ├─ 读取所有 chunk                       │
+│           ├─ SSE 重建为 JSON                      │
+│           ├─ 写入 requests 表                     │
+│           └─ 若重建异常 → 标记 + 保留原始 SSE      │
+│                   │                              │
+│               MySQL                              │
+└───────────────────┼──────────────────────────────┘
                     │
                     ▼
            LLM API (OpenAI / Anthropic / Gemini / ...)
@@ -62,6 +74,16 @@ POST http://server:3998/12345/v1/chat/completions
 
 系统在 `:3998`（默认）监听一个端口。代理请求通过 URL 路径区分——`/12345/v1/...` 转发到编号 12345 的目标地址，`/67890/v1/...` 转发到编号 67890 的目标地址。编号为系统随机分配的 5 位数字（10000–99999）。管理接口（`/api/*`）和代理共享同一端口，路由优先级保证互不冲突。
 
+### 流式处理：Write-Ahead Logging
+
+流式 SSE 请求采用 write-ahead 机制，彻底消除代理进程的内存/磁盘累积：
+
+1. 第一个 chunk 到达前，创建 `stream_sessions` 记录（元数据）
+2. 每收到一个 chunk：**立即 yield 给客户端** + **fire-and-forget 写入 `stream_chunks`**
+3. 流结束后标记 `is_complete=1`
+4. 后台 Worker 每 5 秒轮询，读取所有 chunk → 拼接 → SSE 重建 → 写入 `requests` → 清理临时数据
+5. 若 SSE 格式无法识别，标记 `reconstruction_error=1`，原始文本完整保留在 `response_body_raw`
+
 ### 设计特点
 
 | 特性 | 实现 |
@@ -69,9 +91,12 @@ POST http://server:3998/12345/v1/chat/completions
 | 编号 | 5 位随机数，永不冲突 |
 | 服务器 | 单进程 FastAPI，asyncio 处理数千并发 |
 | 配置存储 | MySQL，所有状态有持久化保障 |
-| 端口缓存 | 内存缓存 + TTL 自动刷新 |
+| 端口缓存 | 内存缓存 + TTL 自动刷新，已删除端口自动排除 |
 | 安全 | JWT 认证 + SSRF 防护 + CORS |
 | 连接池 | 管理接口和日志写入使用独立 DB 连接池，互不争抢 |
+| 流式重建 | Write-Ahead → 后台 Worker 异步重建 JSON |
+| 内存保护 | 请求/响应体 SpooledTemporaryFile 溢出到磁盘 |
+| 端口删除 | 软删除（标记 deleted_at），管理员可恢复/彻底删除 |
 
 ---
 
@@ -180,6 +205,15 @@ npm run dev
    - API Key 等其他配置**不需要任何修改**
 4. 在「查看详情」页面实时查看所有交互记录
 
+#### 管理员功能
+
+- **用户管理**：审批/取消审批/删除用户
+- **已删除代理**：查看所有被用户删除的代理，支持一键恢复或彻底删除（含全部历史记录）
+
+#### 流式重建异常提示
+
+当 SSE 流格式无法识别或解析失败时，端口详情页会显示橙色警告横幅，并提供"查看完整 SSE 原始文本"按钮。原始数据始终保留在数据库中。
+
 ---
 
 ## 方式二：Docker 生产部署
@@ -264,18 +298,19 @@ llm-proxy/
 │   ├── main.py              # 入口：启动 FastAPI + 注册共享代理路由
 │   ├── config.py            # 读取 .env 环境变量
 │   ├── database.py          # 自动建库建表 + 连接池 + 索引迁移
-│   ├── models.py            # SQLAlchemy ORM 模型
+│   ├── models.py            # SQLAlchemy ORM 模型（含 StreamSession/Chunk）
 │   ├── schemas.py           # Pydantic 请求/响应模型
 │   ├── auth.py              # JWT 认证 + bcrypt 密码哈希
 │   ├── proxy_app.py         # 代理核心：转发、SSE 解析、DB 记录
 │   ├── shared_proxy.py      # 共享代理端点 /{port_number}/{path}
+│   ├── stream_reconstructor.py  # Write-Ahead 流式日志 + 后台 Worker 重建
 │   ├── proxy_manager.py     # 端口配置查询 + 缓存刷新
 │   ├── requirements.txt     # pip 依赖（与 pyproject.toml 同步）
 │   └── routers/
 │       ├── __init__.py
 │       ├── auth_router.py   # 注册/登录/用户信息
-│       ├── admin_router.py  # 用户审批/管理
-│       ├── ports_router.py  # 端口 CRUD + 历史查询
+│       ├── admin_router.py  # 用户审批/管理 + 已删除端口管理
+│       ├── ports_router.py  # 端口 CRUD + 软删除 + 历史查询
 │       └── config_router.py # 前端配置（display_ip）
 │
 └── frontend/                # Vue 3 前端
@@ -338,11 +373,11 @@ llm-proxy/
 | `GET` | `/api/ports/active-ports` | 活跃端口号列表（内部用） |
 | `GET` | `/api/ports/{id}?since_id=N&limit=20&offset=0` | 交互历史（`since_id` 增量轮询，`limit`/`offset` 分页，默认 20 条，最大 100） |
 | `DELETE` | `/api/ports/{id}` | 删除端口 |
-| `POST` | `/api/ports/{id}/stop` | 停止端口代理 |
-| `POST` | `/api/ports/{id}/start` | 启动端口代理 |
+| `POST` | `/api/ports/{id}/stop` | 停用端口代理 |
+| `POST` | `/api/ports/{id}/start` | 启用端口代理 |
 | `DELETE` | `/api/ports/{id}/history` | 清空历史 |
 | `DELETE` | `/api/ports/{id}/history/{request_id}` | 删除单条记录 |
-| `GET` | `/api/ports/{id}/history/{request_id}` | 获取单条记录详情（树形查看页用） |
+| `GET` | `/api/ports/{id}/history/{request_id}` | 获取单条记录详情（树形查看页用，含 `reconstruction_error` 字段） |
 | `GET` | `/api/ports/{id}/export` | 导出全量数据 |
 
 ### 管理员
@@ -352,6 +387,9 @@ llm-proxy/
 | `GET` | `/api/admin/users` | 用户列表 |
 | `PUT` | `/api/admin/users/approve` | 审批/取消审批用户 |
 | `DELETE` | `/api/admin/users/{user_id}` | 删除用户 |
+| `GET` | `/api/admin/deleted-ports` | 已删除端口列表（含请求数、创建者） |
+| `POST` | `/api/admin/ports/{port_id}/restore` | 恢复已删除端口（恢复后为停用状态） |
+| `DELETE` | `/api/admin/ports/{port_id}/permanent` | 彻底删除端口及全部历史记录 |
 
 ### 配置
 
