@@ -26,9 +26,11 @@
 
 <script setup>
 import { ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 
 const auth = useAuthStore()
+const router = useRouter()
 
 const form = ref({ username: '', password: '' })
 const error = ref('')
@@ -41,8 +43,23 @@ async function handleRegister() {
   loading.value = true
   try {
     await auth.register(form.value)
-    success.value = '注册成功！请等待管理员审批后登录。'
-    form.value = { username: '', password: '' }
+    // Auto-login after registration — the backend decides whether
+    // approval is required. If login succeeds, the user is approved
+    // (or approval is disabled); if 403, they need to wait.
+    try {
+      await auth.login(form.value)
+      form.value = { username: '', password: '' }
+      router.push('/')
+    } catch (loginErr) {
+      form.value = { username: '', password: '' }
+      if (loginErr.response?.status === 403) {
+        success.value = '注册成功！请等待管理员审批后登录。'
+      } else {
+        // Login failed for another reason — go to login page
+        success.value = '注册成功！请登录。'
+        router.push('/login')
+      }
+    }
   } catch (e) {
     error.value = e.response?.data?.detail || '注册失败'
   } finally {
