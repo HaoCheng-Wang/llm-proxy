@@ -283,6 +283,7 @@ users                        ports                       requests
 | 请求体 OOM | SpooledTemporaryFile | ≤10MB 内存，>10MB 溢写磁盘 |
 | 流式内存累积 | SpooledTemporaryFile | ≤10MB 内存, >10MB 自动溢写临时文件 |
 | 流式重建 | 流结束后立即同步重组 | 无需后台 Worker, 即写即见 |
+| HTTP/2 连接回收 | 自动探测 + 首字节前静默重试 | GOAWAY 帧触发，用户无感 |
 
 ### 为什么不需要多进程
 
@@ -393,6 +394,28 @@ flowchart LR
 代理在启动时预创建共享 httpx 客户端，避免首个请求的冷启动延迟。连接上游 API 时通过 TLS ALPN **自动协商 HTTP/2**：如果上游支持 HTTP/2（OpenAI / Anthropic / Google 均支持），使用多路复用——同一条 TCP 连接上并发处理多个请求，零额外握手开销；不支持则自动回退到 HTTP/1.1。
 
 HTTP/2 支持需安装 `h2` 包（`pip install h2>=4.0`）。未安装时自动降级为 HTTP/1.1，不影响功能。
+
+### HTTP/2 连接回收与自动重试
+
+上游 LLM API（OpenAI、Anthropic 等）会定期关闭空闲或达到年龄上限的 HTTP/2 连接——向代理发送 **GOAWAY** 帧（`error_code:0`，无实际错误）。这在连接复用场景下导致经典的竞态问题：
+
+```
+代理复用连接 → 上游发送 GOAWAY → 代理发出新请求 → ConnectionTerminated
+```
+
+**重试策略**：
+
+| 路径 | 错误时机 | 行为 |
+|------|----------|------|
+| 流式（SSE） | 首字节到达前 | 关闭死连接，创建新 stream context，静默重试（用户无感） |
+| 流式（SSE） | 数据已部分发送 | 优雅终止流，日志记录 warning |
+| 非流式 | 任意时机 | 静默重试一次，第二次也失败则返回 502 |
+
+重试仅进行一次（最多 2 次尝试），使用全新 TCP 连接。关键日志（`INFO` 级别）记录在 `llm_proxy.proxy` logger 下：
+
+```
+2026-06-08 14:30:16 [INFO] llm_proxy.proxy: Retrying stream (attempt 2/2) — upstream closed connection: RemoteProtocolError: <ConnectionTerminated error_code:0>
+```
 
 ### 编码清洗（Surrogate 字符处理）
 
