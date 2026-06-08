@@ -429,34 +429,52 @@ sequenceDiagram
     end
 
     rect rgb(253, 238, 238)
-        Note over A,U: ❌ 竞态触发 — 复用已关闭的连接
+        Note over A,U: ❌ 竞态触发（第1层重试）— stream() 即失败
         A->>P: POST /12345/v1/chat/completions
-        P->>P: 从连接池取出同一个连接
+        P->>P: 从连接池取出同一个连接 → 已死亡
+        P--xU: client.stream() → RemoteProtocolError
+        Note over P: 第1层重试<br/>新建 TCP 连接
+        P->>U: HTTP/2 stream (全新连接)
+        U-->>P: 响应 (200) + SSE 流
+        P-->>A: SSE 流式透传
+    end
+
+    rect rgb(253, 238, 238)
+        Note over A,U: ❌ 竞态触发（第2层重试）— 流中途断开
+        A->>P: POST /12345/v1/chat/completions
         P->>U: HTTP/2 stream
-        U-->>P: ConnectionTerminated<br/>error_code:0
+        U-->>P: SSE chunk 1, chunk 2, ...
+        P-->>A: chunk 1, chunk 2, ...
+        U--xP: GOAWAY mid-stream → RemoteProtocolError
+        Note over P: 第2层重试（首字节前）<br/>或优雅终止（已发送数据）
     end
 
     rect rgb(240, 248, 240)
-        Note over A,U: ✅ 自动重试 — 首字节前, 用户无感
-        P->>U: 新建 TCP 连接 + HTTP/2 stream
-        U-->>P: 响应 (200) + SSE 流
-        P-->>A: SSE 流式透传
-        Note over P: 重试成功<br/>日志: Retrying stream (attempt 2/2)
+        Note over A,U: ✅ 外三层异常处理 — 兜底
+        Note over P: 两次都失败 → 返回 502<br/>日志: RemoteProtocolError
     end
 ```
 
-**重试策略**：
-
-| 路径 | 错误时机 | 行为 |
-|------|----------|------|
-| 流式（SSE） | 首字节到达前 | 关闭死连接，创建新 stream context，静默重试（用户无感） |
-| 流式（SSE） | 数据已部分发送 | 优雅终止流，日志记录 warning |
-| 非流式 | 任意时机 | 静默重试一次，第二次也失败则返回 502 |
-
-重试仅进行一次（最多 2 次尝试），使用全新 TCP 连接。关键日志（`INFO` 级别）记录在 `llm_proxy.proxy` logger 下：
+**重试策略**（三层防护，覆盖整个请求生命周期）：
 
 ```
-2026-06-08 14:30:16 [INFO] llm_proxy.proxy: Retrying stream (attempt 2/2) — upstream closed connection: RemoteProtocolError: <ConnectionTerminated error_code:0>
+请求到达 → [第1层] client.stream() / __aenter__()
+                ↓ 成功
+           [第2层] async for chunk in aiter_bytes()   ← 流式/非流式
+```
+
+| 层次 | 错误位置 | 流式（SSE） | 非流式 |
+|------|----------|-------------|--------|
+| 第1层 | `stream()` / `__aenter__()` | 静默重试一次 | 静默重试一次 |
+| 第2层 | `aiter_bytes()` 首字节前 | 关闭死连接，新建流，静默重试 | 关闭死连接，新建请求，静默重试 |
+| 第2层 | `aiter_bytes()` 数据已发 | 优雅终止流，日志 warning | — |
+| 第3层 | 两次都失败 | 返回 502 + 错误信息 | 返回 502 + 错误信息 |
+
+每一层重试仅进行一次（最多 2 次尝试），使用全新 TCP 连接。关键日志（`INFO` 级别）记录在 `llm_proxy.proxy` logger 下：
+
+```
+2026-06-08 14:30:16 [INFO] llm_proxy.proxy: Retrying stream setup (attempt 2/2) — connection may be dead: RemoteProtocolError: ...
+2026-06-08 14:30:16 [INFO] llm_proxy.proxy: Retrying stream (attempt 2/2) — upstream closed connection: RemoteProtocolError: ...
 ```
 
 ### 编码清洗（Surrogate 字符处理）
