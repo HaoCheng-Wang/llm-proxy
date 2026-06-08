@@ -108,15 +108,38 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
     stream_ctx = None
 
     try:
-        client = get_shared_client()
-
-        stream_ctx = client.stream(
-            method=request.method,
-            url=target_full_url,
-            headers=forward_headers,
-            content=body if body else None,
-        )
-        response = await stream_ctx.__aenter__()
+        # --- Initial stream creation (retry once when connection is dead) ---
+        # httpx connection pool may hand out a connection that the upstream
+        # has already GOAWAY'd.  client.stream() or __aenter__() then fails
+        # with RemoteProtocolError before any data flows — before the inner
+        # aiter_bytes() retry loops can see it.  Retry once at this level.
+        _RETRYABLE_INIT = (httpx.RemoteProtocolError, httpx.ConnectError)
+        for _init_attempt in range(2):
+            try:
+                client = get_shared_client()
+                stream_ctx = client.stream(
+                    method=request.method,
+                    url=target_full_url,
+                    headers=forward_headers,
+                    content=body if body else None,
+                )
+                response = await stream_ctx.__aenter__()
+                break  # success
+            except _RETRYABLE_INIT as e:
+                if _init_attempt == 1:
+                    raise  # re-raise to outer exception handlers
+                logger.info(
+                    "Retrying stream setup (attempt 2/2) — "
+                    "connection may be dead: %s: %s",
+                    type(e).__name__, e,
+                )
+                # Close the dead context if one was created
+                if stream_ctx is not None:
+                    try:
+                        await stream_ctx.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    stream_ctx = None
 
         status_code = response.status_code
         resp_headers_json = json.dumps(dict(response.headers), ensure_ascii=False, indent=2)
