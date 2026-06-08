@@ -68,6 +68,13 @@ DEFAULT_ADMIN_PASSWORD = os.getenv("DEFAULT_ADMIN_PASSWORD", "admin123")
 ALLOW_INTERNAL_TARGETS = os.getenv("ALLOW_INTERNAL_TARGETS", "true").lower() == "true"
 
 # ---------------------------------------------------------------------------
+# 用户注册审批
+# ---------------------------------------------------------------------------
+# 设为 true 时，新注册用户需管理员审批后才能登录使用。
+# 设为 false（默认）时，新用户注册后可直接登录，无需审批。
+REQUIRE_APPROVAL = os.getenv("REQUIRE_APPROVAL", "false").lower() == "true"
+
+# ---------------------------------------------------------------------------
 # 性能
 # ---------------------------------------------------------------------------
 DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "20"))
