@@ -9,6 +9,7 @@ Architecture: Shared Proxy — all traffic flows through a single endpoint.
     1 = logical port number identifying the proxy configuration
 """
 import sys
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +23,19 @@ from config import (
 )
 from proxy_manager import ProxyManager
 from proxy_app import close_shared_client, init_shared_client
+
+
+# Configure structured logging for the proxy module.
+# Uses uvicorn's log format when running under uvicorn, or plain stream handler
+# otherwise.  The llm_proxy.proxy logger is set to DEBUG so retry decisions
+# and connection lifecycle events always appear in the log.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stderr,
+)
+logging.getLogger("llm_proxy.proxy").setLevel(logging.DEBUG)
 
 
 # ---- Lifecycle ----
