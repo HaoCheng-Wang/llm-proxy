@@ -58,8 +58,8 @@ def _init_engine():
         pool_timeout=30,
         connect_args={
             "connect_timeout": 10,
-            "read_timeout": 30,
-            "write_timeout": 30,
+            "read_timeout": 60,
+            "write_timeout": 60,
         },
     )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -82,8 +82,8 @@ def _init_log_engine():
         pool_timeout=30,
         connect_args={
             "connect_timeout": 10,
-            "read_timeout": 30,
-            "write_timeout": 30,
+            "read_timeout": 60,
+            "write_timeout": 60,
         },
     )
     LogSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_log_engine)
@@ -100,8 +100,8 @@ def setup_schema():
         DATABASE_URL,
         connect_args={
             "connect_timeout": 10,
-            "read_timeout": 30,
-            "write_timeout": 30,
+            "read_timeout": 60,
+            "write_timeout": 60,
         },
     )
     try:
