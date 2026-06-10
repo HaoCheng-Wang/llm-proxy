@@ -4,7 +4,7 @@ import socket
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 from database import get_db
@@ -552,7 +552,12 @@ def export_port_history(
     db: Session = Depends(get_db),
 ):
     """Export all request history for a port as a JSON-serializable structure.
-    
+
+    Excludes response_body_raw (raw SSE text, the largest column) from the
+    query to keep memory usage manageable even with tens of thousands of
+    records.  method_filter="api" pushes the filter into SQL to avoid
+    transferring then discarding non-API rows.
+
     Args:
         method_filter: 'all' (default) or 'api' (POST/PUT/PATCH/DELETE only).
     """
@@ -563,14 +568,17 @@ def export_port_history(
     if current_user.role != "admin" and port.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    requests = db.query(RequestModel).filter(
-        RequestModel.port_id == port.id
-    ).order_by(RequestModel.created_at.asc()).all()
+    # ── Build query (defer the largest column, push filter to SQL) ──
+    query = (
+        db.query(RequestModel)
+        .options(defer(RequestModel.response_body_raw))
+        .filter(RequestModel.port_id == port.id)
+    )
 
-    # Apply method filter
     if method_filter == "api":
-        api_methods = {"POST", "PUT", "PATCH", "DELETE"}
-        requests = [r for r in requests if r.method.upper() in api_methods]
+        query = query.filter(RequestModel.method.in_(["POST", "PUT", "PATCH", "DELETE"]))
+
+    requests = query.order_by(RequestModel.created_at.asc()).all()
 
     export_data = {
         "port": {
