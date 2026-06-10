@@ -7,14 +7,15 @@ Supports both regular JSON responses and streaming (SSE) responses.
 from __future__ import annotations
 import time
 import json
-import sys
-import traceback
 import asyncio
+import logging
 import httpx
 import certifi
 import database
 from models import Port, Request as RequestModel
 from config import PORT_CACHE_TTL, HTTPX_MAX_KEEPALIVE_CONNECTIONS
+
+logger = logging.getLogger("llm_proxy.proxy")
 
 
 def _sanitize_text(value: str | None) -> str | None:
@@ -32,10 +33,9 @@ def _sanitize_text(value: str | None) -> str | None:
             1 for ch in value if "\uD800" <= ch <= "\uDFFF"
         )
         cleaned = value.encode("utf-8", errors="replace").decode("utf-8")
-        print(
-            f"[Sanitize] Replaced {surrogate_count} surrogate(s), "
-            f"{len(value)} → {len(cleaned)} chars",
-            file=sys.stderr,
+        logger.warning(
+            "Replaced %d surrogate(s), %d → %d chars",
+            surrogate_count, len(value), len(cleaned),
         )
         return cleaned
 
@@ -63,10 +63,10 @@ def init_shared_client() -> httpx.AsyncClient:
             verify=certifi.where(),
             http2=False,
         )
-        print(
-            "[Proxy] HTTP/1.1 client ready (max_connections=unlimited, "
-            f"keepalive={HTTPX_MAX_KEEPALIVE_CONNECTIONS}, read_timeout=120s)",
-            file=sys.stderr,
+        logger.info(
+            "HTTP/1.1 client ready (max_connections=unlimited, "
+            "keepalive=%d, read_timeout=120s)",
+            HTTPX_MAX_KEEPALIVE_CONNECTIONS,
         )
     return _shared_client
 
@@ -97,11 +97,10 @@ def init_http2_client() -> httpx.AsyncClient | None:
         try:
             import h2  # noqa: F401
         except ImportError:
-            print(
-                "[Proxy] WARNING: h2 not installed — HTTP/2 unavailable. "
+            logger.warning(
+                "h2 not installed — HTTP/2 unavailable. "
                 "Ports with prefer_http2=True will fall back to HTTP/1.1. "
                 "Install with: pip install httpx[http2]",
-                file=sys.stderr,
             )
             _http2_client = None  # sentinel: tried but failed
             return None
@@ -115,10 +114,10 @@ def init_http2_client() -> httpx.AsyncClient | None:
             verify=certifi.where(),
             http2=True,
         )
-        print(
-            "[Proxy] HTTP/2 client ready (max_connections=unlimited, "
-            f"keepalive={HTTPX_MAX_KEEPALIVE_CONNECTIONS})",
-            file=sys.stderr,
+        logger.info(
+            "HTTP/2 client ready (max_connections=unlimited, "
+            "keepalive=%d)",
+            HTTPX_MAX_KEEPALIVE_CONNECTIONS,
         )
     return _http2_client
 
@@ -271,10 +270,9 @@ def _save_to_db(port_number: int, method: str, path: str,
             ).first()
             port_id = port.id if port else None
             if not port_id:
-                print(
-                    f"[Proxy] WARNING: port {port_number} not active — "
-                    f"saving record with port_id=NULL",
-                    file=sys.stderr,
+                logger.warning(
+                    "port %d not active — saving record with port_id=NULL",
+                    port_number,
                 )
 
             record = RequestModel(
@@ -301,10 +299,11 @@ def _save_to_db(port_number: int, method: str, path: str,
         finally:
             db.close()
 
-    print(f"[Proxy] ERROR saving request record for port {port_number} after 3 retries:",
-          file=sys.stderr)
-    traceback.print_exception(type(last_error), last_error, last_error.__traceback__,
-                              file=sys.stderr)
+    logger.error(
+        "ERROR saving request record for port %d after 3 retries",
+        port_number,
+        exc_info=(type(last_error), last_error, last_error.__traceback__),
+    )
 
 
 async def _save_record_async(port_number: int, method: str, path: str,
@@ -359,7 +358,7 @@ __all__ = [
 
 def _serialize_body(body_bytes: bytes, label: str = "body") -> str | None:
     """Convert raw body bytes to a pretty-printed string.
-    
+
     Args:
         body_bytes: Raw bytes to serialize
         label: Label for logging (e.g., "request", "response")
@@ -376,20 +375,20 @@ def _serialize_body(body_bytes: bytes, label: str = "body") -> str | None:
             try:
                 result.encode("utf-8", errors="strict")
             except UnicodeEncodeError:
-                print(
-                    f"[Proxy] WARNING: {label} body contains surrogate "
-                    f"characters after JSON serialization — sanitizing",
-                    file=sys.stderr,
+                logger.warning(
+                    "%s body contains surrogate characters after JSON "
+                    "serialization — sanitizing",
+                    label,
                 )
                 result = result.encode("utf-8", errors="replace").decode("utf-8")
             return result
         except (json.JSONDecodeError, Exception):
             return text
     except UnicodeDecodeError:
-        print(
-            f"[Proxy] WARNING: request body is not valid UTF-8 — "
-            f"storing as binary placeholder ({len(body_bytes)} bytes)",
-            file=sys.stderr,
+        logger.warning(
+            "request body is not valid UTF-8 — storing as binary "
+            "placeholder (%d bytes)",
+            len(body_bytes),
         )
         return f"[binary data, {len(body_bytes)} bytes]"
 
@@ -622,10 +621,9 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
                 err_info = event.get("error", {})
                 stop_reason = "error"
                 stop_details = {"api_error": err_info}
-                print(
-                    f"[Proxy] Anthropic SSE stream contains error event: "
-                    f"{err_info}",
-                    file=sys.stderr,
+                logger.warning(
+                    "Anthropic SSE stream contains error event: %s",
+                    err_info,
                 )
 
         # ── Build reconstructed message ──
@@ -706,9 +704,7 @@ def _parse_anthropic_sse(raw_sse: str) -> str | None:
 
         return json.dumps(reconstructed, ensure_ascii=False, indent=2)
     except Exception:
-        print("[Proxy] WARNING: failed to reconstruct Anthropic SSE to JSON",
-              file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
+        logger.warning("failed to reconstruct Anthropic SSE to JSON", exc_info=True)
         return None
 
 
@@ -800,9 +796,7 @@ def _parse_openai_chat_sse(raw_sse: str) -> str | None:
 
         return json.dumps(reconstructed, ensure_ascii=False, indent=2)
     except Exception:
-        print("[Proxy] WARNING: failed to reconstruct OpenAI Chat SSE to JSON",
-              file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
+        logger.warning("failed to reconstruct OpenAI Chat SSE to JSON", exc_info=True)
         return None
 
 
@@ -900,9 +894,7 @@ def _parse_openai_responses_sse(raw_sse: str) -> str | None:
 
         return json.dumps(reconstructed, ensure_ascii=False, indent=2)
     except Exception:
-        print("[Proxy] WARNING: failed to reconstruct OpenAI Responses SSE to JSON",
-              file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
+        logger.warning("failed to reconstruct OpenAI Responses SSE to JSON", exc_info=True)
         return None
 
 
@@ -972,15 +964,13 @@ def _parse_gemini_sse(raw_sse: str) -> str | None:
 
         return json.dumps(reconstructed, ensure_ascii=False, indent=2)
     except Exception:
-        print("[Proxy] WARNING: failed to reconstruct Gemini SSE to JSON",
-              file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
+        logger.warning("failed to reconstruct Gemini SSE to JSON", exc_info=True)
         return None
 
 
 def _deep_merge(base: dict, chunk: dict) -> dict:
     """Deep merge two dicts. Strings concatenate, lists merge by index, dicts recurse.
-    
+
     This is the universal SSE reconstruction algorithm:
     - All SSE chunks share the same top-level structure
     - Incremental content is in string fields that should be concatenated
@@ -1023,17 +1013,17 @@ def _merge_lists(base_list: list, new_list: list) -> list:
 
 def _reconstruct_sse_universal(raw_sse: str) -> str | None:
     """Universal SSE reconstruction using deep merge.
-    
+
     Works for any format where all chunks share the same structure:
     - OpenAI Chat Completions
     - Google Gemini
     - Any OpenAI-compatible API (DeepSeek, Mistral, Together, etc.)
-    
+
     For event-based formats (Anthropic, OpenAI Responses), use format-specific parsers.
     """
     if not raw_sse:
         return None
-    
+
     merged = {}
     try:
         for line in raw_sse.split("\n"):
@@ -1043,26 +1033,25 @@ def _reconstruct_sse_universal(raw_sse: str) -> str | None:
             payload = line[5:].strip()
             if not payload or payload == "[DONE]":
                 continue
-            
+
             chunk = json.loads(payload)
             merged = _deep_merge(merged, chunk)
-        
+
         # Post-processing for OpenAI-like formats
         # Rename delta → message in choices (OpenAI Chat Completions pattern)
         for choice in merged.get("choices", []):
             if "delta" in choice:
                 choice["message"] = choice.pop("delta")
-        
+
         return json.dumps(merged, ensure_ascii=False, indent=2)
     except Exception:
-        print("[Proxy] WARNING: universal SSE reconstruction failed", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
+        logger.warning("universal SSE reconstruction failed", exc_info=True)
         return None
 
 
 def _parse_generic_sse(raw_sse: str) -> str | None:
     """Best-effort SSE parser for unknown formats.
-    
+
     Strategy:
     1. Try universal deep merge (works for OpenAI-like formats)
     2. If that fails or produces empty content, fall back to text extraction
@@ -1082,7 +1071,7 @@ def _parse_generic_sse(raw_sse: str) -> str | None:
                 return result
         except json.JSONDecodeError:
             pass
-    
+
     # Fallback: extract text from common paths
     all_text = ""
     try:
@@ -1136,9 +1125,7 @@ def _parse_generic_sse(raw_sse: str) -> str | None:
         # Nothing found — return raw SSE so it's at least visible
         return raw_sse
     except Exception:
-        print("[Proxy] WARNING: failed to reconstruct generic SSE to JSON",
-              file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
+        logger.warning("failed to reconstruct generic SSE to JSON", exc_info=True)
         return raw_sse
 
 
@@ -1201,19 +1188,16 @@ def _reconstruct_sse_to_json(raw_sse: str) -> str | None:
                 result = _parse_anthropic_sse(raw_sse)
                 if result is not None:
                     return result
-                print(
-                    "[Proxy] Anthropic parser returned None, "
-                    "falling back to universal",
-                    file=sys.stderr,
+                logger.warning(
+                    "Anthropic parser returned None, falling back to universal",
                 )
             elif fmt == "openai_responses":
                 result = _parse_openai_responses_sse(raw_sse)
                 if result is not None:
                     return result
-                print(
-                    "[Proxy] OpenAI Responses parser returned None, "
+                logger.warning(
+                    "OpenAI Responses parser returned None, "
                     "falling back to universal",
-                    file=sys.stderr,
                 )
             elif fmt == "gemini":
                 result = _parse_gemini_sse(raw_sse)
