@@ -100,8 +100,8 @@ def seed_admin():
         if DEFAULT_ADMIN_PASSWORD == "admin123":
             print()
             print("=" * 60)
-            print("  ⚠️  WARNING: Admin password is still the default 'admin123'")
-            print("  ⚠️  Change DEFAULT_ADMIN_PASSWORD in .env immediately!")
+            print("  [WARNING] Admin password is still the default 'admin123'")
+            print("  [WARNING] Change DEFAULT_ADMIN_PASSWORD in .env immediately!")
             print("=" * 60)
             print()
     finally:
