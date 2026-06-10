@@ -147,13 +147,12 @@
               由于 SSE 格式无法识别或解析失败，下方"响应 JSON"可能显示原始文本或为空。
               完整 SSE 原始数据已保存在 <strong>response_body_raw</strong> 字段，可点击下面的按钮查看。
             </p>
-            <div style="margin-top:8px">
+            <div v-if="req.response_body_raw" style="margin-top:8px">
               <button class="btn btn-warning btn-sm"
                       @click.stop="toggleRawSse(req)">
                 {{ rawSseExpanded[req.id] ? '🔽 隐藏原始SSE' : '📄 查看完整SSE原始文本' }}
               </button>
-              <span v-if="rawSseLoading[req.id]" style="margin-left:8px;color:#f0ad4e">⏳ 加载中...</span>
-              <pre v-if="rawSseExpanded[req.id]" class="raw-sse-text">{{ rawSseData[req.id] }}</pre>
+              <pre v-if="rawSseExpanded[req.id]" class="raw-sse-text">{{ req.response_body_raw }}</pre>
             </div>
           </div>
 
@@ -237,8 +236,6 @@ const requests = ref([])
 const expanded = ref({})
 const headersExpanded = ref({})
 const rawSseExpanded = ref({})
-const rawSseData = ref({})     // lazily fetched raw SSE text
-const rawSseLoading = ref({})  // loading spinner per request
 const copyMenuOpen = ref(false)
 const newCount = ref(0)
 const polling = ref(false)
@@ -397,25 +394,8 @@ function toggleExpand(reqId) {
   expanded.value[reqId] = !expanded.value[reqId]
 }
 
-async function toggleRawSse(req) {
-  const wasOpen = rawSseExpanded.value[req.id]
-  if (wasOpen) {
-    rawSseExpanded.value[req.id] = false
-    return
-  }
-  // Lazy-load raw SSE from backend on first click
-  if (!rawSseData.value[req.id]) {
-    rawSseLoading.value[req.id] = true
-    try {
-      const result = await api.getRawSse(portId, req.id)
-      rawSseData.value[req.id] = result.raw_sse || ''
-    } catch (e) {
-      rawSseData.value[req.id] = '(加载失败)'
-    } finally {
-      rawSseLoading.value[req.id] = false
-    }
-  }
-  rawSseExpanded.value[req.id] = true
+function toggleRawSse(req) {
+  rawSseExpanded.value[req.id] = !rawSseExpanded.value[req.id]
 }
 
 function collapseAll() {
