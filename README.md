@@ -278,7 +278,7 @@ users                        ports                       requests
 | 事件循环阻塞 | 所有 DB 查询在线程池执行 | `run_in_executor(_db_executor)` |
 | 管理接口 vs 日志争抢 | 双 DB 连接池完全隔离 | 管理池 20+40 / 日志池 10+20 |
 | 线程池争抢 | 代理日志使用专用线程池 | `DB_SAVE_WORKERS=8` |
-| 上游连接数 | httpx HTTP/1.1 共享连接池（热启动） | 200 总连接 / 50 keep-alive |
+| 上游连接数 | httpx HTTP/1.1 共享连接池（热启动） | 500 总连接 / 100 keep-alive |
 | 端口查找 | 内存缓存 + TTL | 5 秒过期，缓存命中率 99.9%+ |
 | 请求体 OOM | SpooledTemporaryFile | ≤10MB 内存，>10MB 溢写磁盘 |
 | 流式内存累积 | SpooledTemporaryFile | ≤10MB 内存, >10MB 自动溢写临时文件 |
@@ -724,7 +724,7 @@ server {
 
 | 参数 | 单机（默认） | 3 台 × 多机 |
 |------|:--:|:--:|
-| `HTTPX_MAX_CONNECTIONS` | 200 | 200（每台） |
+| `HTTPX_MAX_CONNECTIONS` | 500 | 500（每台） |
 | `DB_POOL_SIZE` | 20 | 10（每台，总 30） |
 | `DB_LOG_POOL_SIZE` | 10 | 8（每台，总 24） |
 | `DB_SAVE_WORKERS` | 8 | 8（每台） |
@@ -872,8 +872,8 @@ llm-proxy/
 | `DB_LOG_MAX_OVERFLOW` | 20 | 日志专用连接池溢出 |
 | `DB_SAVE_WORKERS` | 8 | 代理日志写入线程数 |
 | `PORT_CACHE_TTL` | 5 | 端口缓存刷新间隔（秒） |
-| `HTTPX_MAX_CONNECTIONS` | 200 | httpx 总连接数 |
-| `HTTPX_MAX_KEEPALIVE_CONNECTIONS` | 50 | httpx keep-alive |
+| `HTTPX_MAX_CONNECTIONS` | 500 | httpx 总连接数 |
+| `HTTPX_MAX_KEEPALIVE_CONNECTIONS` | 100 | httpx keep-alive |
 | `PROXY_BODY_MEMORY_LIMIT` | 10485760 | 请求/响应体内存缓冲上限（字节） |
 
 ## 生产环境安全建议

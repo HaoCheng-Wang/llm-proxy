@@ -89,8 +89,8 @@ DB_LOG_MAX_OVERFLOW = int(os.getenv("DB_LOG_MAX_OVERFLOW", "20"))
 PORT_CACHE_TTL = int(os.getenv("PORT_CACHE_TTL", "5"))
 
 # httpx 连接池上限（代理转发时使用）
-HTTPX_MAX_CONNECTIONS = int(os.getenv("HTTPX_MAX_CONNECTIONS", "200"))
-HTTPX_MAX_KEEPALIVE_CONNECTIONS = int(os.getenv("HTTPX_MAX_KEEPALIVE_CONNECTIONS", "50"))
+HTTPX_MAX_CONNECTIONS = int(os.getenv("HTTPX_MAX_CONNECTIONS", "500"))
+HTTPX_MAX_KEEPALIVE_CONNECTIONS = int(os.getenv("HTTPX_MAX_KEEPALIVE_CONNECTIONS", "100"))
 
 # 代理 请求体 / 响应体 的内存缓冲上限（字节）。
 # 小于此值在内存中处理，超过则溢出到磁盘临时文件（SpooledTemporaryFile）。
