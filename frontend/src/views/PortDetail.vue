@@ -285,17 +285,28 @@ const vClickOutside = {
 async function loadData() {
   try {
     _offset = 0
-    data.value = await api.getPortHistory(portId, 0, PAGE_SIZE, 0)
-    requests.value = data.value.requests || []
-    _maxId = requests.value.length > 0 ? Math.max(...requests.value.map(r => r.id)) : 0
-    _offset = requests.value.length
-    hasMore.value = _offset < (data.value.port?.request_count || 0)
-    // Don't auto-expand any cards for faster initial render
-    expanded.value = {}
+    requests.value = []
     newCount.value = 0
+    // Stream records one by one — first record triggers loading→done transition
+    let firstRecord = true
+    const { port, requests: all } = await api.getPortHistoryStream(
+      portId, 0, PAGE_SIZE, 0,
+      (rec) => {
+        requests.value.push(rec)
+        if (firstRecord) {
+          firstRecord = false
+          initialLoading.value = false
+        }
+      }
+    )
+    data.value = { port, requests: all }
+    _maxId = all.length > 0 ? Math.max(...all.map(r => r.id)) : 0
+    _offset = all.length
+    hasMore.value = _offset < (port?.request_count || 0)
+    expanded.value = {}
+    if (firstRecord) initialLoading.value = false  // no records
   } catch (e) {
     showToast('加载数据失败', 'error')
-  } finally {
     initialLoading.value = false
   }
 }
@@ -304,13 +315,17 @@ async function loadMore() {
   if (loadingMore.value || !hasMore.value) return
   loadingMore.value = true
   try {
-    const result = await api.getPortHistory(portId, 0, PAGE_SIZE, _offset)
-    const newReqs = result.requests || []
+    const { port, requests: newReqs } = await api.getPortHistoryStream(
+      portId, 0, PAGE_SIZE, _offset,
+      (rec) => requests.value.push(rec)  // append live
+    )
     if (newReqs.length > 0) {
-      requests.value = [...requests.value, ...newReqs]
       _offset += newReqs.length
     }
-    hasMore.value = _offset < (data.value.port?.request_count || 0)
+    if (port) {
+      data.value.port = port
+      hasMore.value = _offset < (port.request_count || 0)
+    }
   } catch (e) {
     showToast('加载更多失败', 'error')
   } finally {
@@ -322,14 +337,17 @@ async function loadAll() {
   if (loadingMore.value || !hasMore.value) return
   loadingMore.value = true
   try {
-    // Load in batches of 100 (backend max) until all records are fetched
     while (hasMore.value) {
-      const result = await api.getPortHistory(portId, 0, 100, _offset)
-      const newReqs = result.requests || []
+      const { port, requests: newReqs } = await api.getPortHistoryStream(
+        portId, 0, 100, _offset,
+        (rec) => requests.value.push(rec)
+      )
       if (newReqs.length === 0) break
-      requests.value = [...requests.value, ...newReqs]
       _offset += newReqs.length
-      hasMore.value = _offset < (data.value.port?.request_count || 0)
+      if (port) {
+        data.value.port = port
+        hasMore.value = _offset < (port.request_count || 0)
+      }
     }
   } catch (e) {
     showToast('加载全部失败', 'error')
@@ -342,26 +360,26 @@ async function pollNewRecords() {
   if (!data.value.port?.is_active) return
   polling.value = true
   try {
-    const result = await api.getPortHistory(portId, _maxId)
-    const newReqs = result.requests || []
+    // Collect streamed records so we can prepend them in batch
+    const polled = []
+    const { port, requests: newReqs } = await api.getPortHistoryStream(
+      portId, _maxId, 100, 0,
+      (rec) => polled.push(rec)
+    )
     if (newReqs.length > 0) {
-      // Get the highest new id
       _maxId = Math.max(_maxId, ...newReqs.map(r => r.id))
 
-      // If user is reading (scroll locked), preserve scroll position
       const savedScrollY = scrollLocked.value ? window.scrollY : null
 
-      // Prepend new records
+      // Prepend new records (newest first)
       requests.value = [...newReqs, ...requests.value]
       _offset += newReqs.length
       newCount.value += newReqs.length
-      // Update request_count and hasMore
-      if (result.port?.request_count !== undefined) {
-        data.value.port.request_count = result.port.request_count
+      if (port?.request_count !== undefined) {
+        data.value.port.request_count = port.request_count
       }
       hasMore.value = _offset < (data.value.port?.request_count || 0)
 
-      // Restore scroll position after Vue re-renders
       if (savedScrollY !== null) {
         await nextTick()
         window.scrollTo(0, savedScrollY)
