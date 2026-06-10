@@ -251,7 +251,12 @@ def get_port_history(
         query = query.filter(RequestModel.id > since_id)
     # Cap limit to prevent huge responses
     limit = min(max(limit, 1), 100)
-    requests = query.order_by(RequestModel.created_at.desc()).offset(offset).limit(limit).all()
+    requests = (
+        query
+        .options(defer(RequestModel.response_body_raw))
+        .order_by(RequestModel.created_at.desc())
+        .offset(offset).limit(limit).all()
+    )
 
     # Get creator username
     creator = db.query(User).filter(User.id == port.user_id).first()
@@ -544,6 +549,37 @@ def get_single_request(
         duration_ms=req_record.duration_ms,
         created_at=req_record.created_at,
     )
+
+
+@router.get("/{port_id}/history/{request_id}/raw-sse")
+def get_raw_sse(
+    port_id: int,
+    request_id: int,
+    current_user: User = Depends(require_approved),
+    db: Session = Depends(get_db),
+):
+    """Fetch only the response_body_raw (original SSE text) for one request.
+
+    This is a lightweight endpoint called on-demand when the user clicks
+    "查看原始SSE" in the frontend.  The main list query defers this
+    column to keep the list view fast.
+    """
+    port = db.query(Port).filter(Port.id == port_id).first()
+    if not port:
+        raise HTTPException(status_code=404, detail="Port not found")
+
+    if current_user.role != "admin" and port.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    row = (
+        db.query(RequestModel.response_body_raw)
+        .filter(RequestModel.id == request_id, RequestModel.port_id == port_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Request record not found")
+
+    return {"raw_sse": row[0] or ""}
 
 
 @router.get("/{port_id}/export")
