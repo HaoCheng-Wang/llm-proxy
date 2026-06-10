@@ -8,7 +8,8 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, defer
 from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
-from database import get_db, SessionLocal
+import database
+from database import get_db
 from models import User, Port, Request as RequestModel
 from schemas import PortCreate, PortUpdate, PortInfo, PortHistory, RequestInfo
 from auth import require_approved
@@ -604,7 +605,7 @@ def export_port_history(
 
     def stream_jsonl():
         # OWN session — lives as long as the generator is iterated.
-        own_db = SessionLocal()
+        own_db = database.SessionLocal()
         try:
             query = (
                 own_db.query(RequestModel)
