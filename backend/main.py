@@ -25,62 +25,63 @@ from proxy_manager import ProxyManager
 from proxy_app import close_shared_client, close_http2_client, init_shared_client, init_http2_client
 
 
-# Configure structured logging for the proxy module.
-# Uses uvicorn's log format when running under uvicorn, or plain stream handler
-# otherwise.  The llm_proxy.proxy logger is set to DEBUG so retry decisions
-# and connection lifecycle events always appear in the log.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+# Configure project logger — only touches the llm_proxy namespace,
+# leaving uvicorn's native log format (with PID) intact.
+_project_handler = logging.StreamHandler(sys.stderr)
+_project_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    stream=sys.stderr,
-)
-logging.getLogger("llm_proxy.proxy").setLevel(logging.DEBUG)
+))
+logging.getLogger("llm_proxy").addHandler(_project_handler)
+logging.getLogger("llm_proxy").setLevel(logging.DEBUG)
+logging.getLogger("llm_proxy").propagate = False
+
+logger = logging.getLogger("llm_proxy.main")
 
 
 # ---- Lifecycle ----
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    print("[Main] Initializing database...")
+    logger.info("Initializing database...")
     init_database()
 
-    print("[Main] Seeding default admin account...")
+    logger.info("Seeding default admin account...")
     seed_admin()
 
-    print("[Main] Initializing proxy manager...")
+    logger.info("Initializing proxy manager...")
     proxy_manager = ProxyManager()
     app.state.proxy_manager = proxy_manager
 
-    print("[Main] Loading proxy configurations from database...")
+    logger.info("Loading proxy configurations from database...")
     await proxy_manager.restore_from_database()
 
     # Pre-create httpx clients (HTTP/1.1 default, HTTP/2 opt-in per port).
-    print("[Main] Initializing HTTP/1.1 client...")
+    logger.info("Initializing HTTP/1.1 client...")
     init_shared_client()
-    print("[Main] Initializing HTTP/2 client...")
+    logger.info("Initializing HTTP/2 client...")
     init_http2_client()
 
-    print(f"[Main] Management API + Shared Proxy ready on port {API_PORT}")
-    print(f"[Main] Proxy URL format: http://<server>:{API_PORT}/<port_number>/v1/...")
+    logger.info("Management API + Shared Proxy ready on port %d", API_PORT)
+    logger.info("Proxy URL format: http://<server>:%d/<port_number>/v1/...", API_PORT)
     yield
 
     # Shutdown
-    print("[Main] Closing HTTP/1.1 client...")
+    logger.info("Closing HTTP/1.1 client...")
     await close_shared_client()
-    print("[Main] Closing HTTP/2 client...")
+    logger.info("Closing HTTP/2 client...")
     await close_http2_client()
 
-    print("[Main] Disposing database connection pools...")
+    logger.info("Disposing database connection pools...")
     if database.engine:
         database.engine.dispose()
     if database._log_engine:
         database._log_engine.dispose()
 
-    print("[Main] Shutting down DB executor thread pool...")
+    logger.info("Shutting down DB executor thread pool...")
     database.shutdown_db_executor()
 
-    print("[Main] Shutdown complete.")
+    logger.info("Shutdown complete.")
 
 
 def seed_admin():
@@ -97,16 +98,16 @@ def seed_admin():
             )
             db.add(admin)
             db.commit()
-            print(f"  Created admin user: {DEFAULT_ADMIN_USERNAME}")
+            logger.info("Created admin user: %s", DEFAULT_ADMIN_USERNAME)
 
         # Warn if using default password
         if DEFAULT_ADMIN_PASSWORD == "admin123":
-            print()
-            print("=" * 60)
-            print("  [WARNING] Admin password is still the default 'admin123'")
-            print("  [WARNING] Change DEFAULT_ADMIN_PASSWORD in .env immediately!")
-            print("=" * 60)
-            print()
+            logger.warning(
+                "\n============================================================\n"
+                "  Admin password is still the default 'admin123'\n"
+                "  Change DEFAULT_ADMIN_PASSWORD in .env immediately!\n"
+                "============================================================"
+            )
     finally:
         db.close()
 
@@ -156,7 +157,7 @@ if __name__ == "__main__":
     import uvicorn
 
     # Run DDL once before starting server
-    print("[Main] Running schema setup...")
+    logger.info("Running schema setup...")
     setup_schema()
 
     uvicorn.run(

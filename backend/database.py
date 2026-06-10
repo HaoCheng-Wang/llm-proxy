@@ -9,6 +9,7 @@ from config import (
     _DB_USER_FOR_AUTO, _DB_PASS_FOR_AUTO,
     _DB_HOST_FOR_AUTO, _DB_PORT_FOR_AUTO, _DB_NAME_FOR_AUTO,
 )
+import logging
 
 Base = declarative_base()
 
@@ -23,6 +24,8 @@ LogSessionLocal = None
 
 # Thread pool for non-blocking DB saves from proxy threads
 _db_executor = ThreadPoolExecutor(max_workers=DB_SAVE_WORKERS, thread_name_prefix="db-save")
+
+logger = logging.getLogger("llm_proxy.database")
 
 
 def _ensure_database():
@@ -41,7 +44,7 @@ def _ensure_database():
                 f"CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
             )
         conn.commit()
-        print(f"[DB] Database '{_DB_NAME_FOR_AUTO}' is ready")
+        logger.info("Database '%s' is ready", _DB_NAME_FOR_AUTO)
     finally:
         conn.close()
 
@@ -87,7 +90,7 @@ def _init_log_engine():
         },
     )
     LogSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_log_engine)
-    print(f"[DB] Log engine ready (pool_size={DB_LOG_POOL_SIZE}, max_overflow={DB_LOG_MAX_OVERFLOW})")
+    logger.info("Log engine ready (pool_size=%d, max_overflow=%d)", DB_LOG_POOL_SIZE, DB_LOG_MAX_OVERFLOW)
 
 
 def setup_schema():
@@ -107,13 +110,13 @@ def setup_schema():
     try:
         import models  # noqa: F401
         Base.metadata.create_all(bind=_ddl_engine)
-        print("[DB] All tables verified")
+        logger.info("All tables verified")
 
         # Run column migration with the temp engine
         _migrate_columns_on_engine(_ddl_engine)
     finally:
         _ddl_engine.dispose()
-        print("[DB] Schema setup complete (DDL engine disposed)")
+        logger.info("Schema setup complete (DDL engine disposed)")
 
 
 def _migrate_columns_on_engine(eng):
@@ -124,7 +127,7 @@ def _migrate_columns_on_engine(eng):
                 "ALTER TABLE requests ADD COLUMN response_body_raw LONGTEXT NULL"
             ))
             conn.commit()
-            print("[DB] Added column: response_body_raw")
+            logger.info("Added column: response_body_raw")
         except Exception:
             conn.rollback()
 
@@ -135,7 +138,7 @@ def _migrate_columns_on_engine(eng):
                 "ALTER TABLE requests MODIFY COLUMN port_id INT NULL"
             ))
             conn.commit()
-            print("[DB] Altered port_id to nullable")
+            logger.info("Altered port_id to nullable")
         except Exception:
             conn.rollback()
 
@@ -146,7 +149,7 @@ def _migrate_columns_on_engine(eng):
                 "NOT NULL DEFAULT 0"
             ))
             conn.commit()
-            print("[DB] Added column: requests.reconstruction_error")
+            logger.info("Added column: requests.reconstruction_error")
         except Exception:
             conn.rollback()
 
@@ -156,7 +159,7 @@ def _migrate_columns_on_engine(eng):
                 "ALTER TABLE ports ADD COLUMN deleted_at DATETIME NULL"
             ))
             conn.commit()
-            print("[DB] Added column: ports.deleted_at")
+            logger.info("Added column: ports.deleted_at")
         except Exception:
             conn.rollback()
 
@@ -166,7 +169,7 @@ def _migrate_columns_on_engine(eng):
                 "ALTER TABLE ports ADD COLUMN prefer_http2 TINYINT(1) NULL"
             ))
             conn.commit()
-            print("[DB] Added column: ports.prefer_http2 (nullable)")
+            logger.info("Added column: ports.prefer_http2 (nullable)")
         except Exception:
             conn.rollback()
 
@@ -189,18 +192,18 @@ def _migrate_columns_on_engine(eng):
             try:
                 conn.execute(text(idx_sql))
                 conn.commit()
-                print(f"[DB] Added index: {idx_name}")
+                logger.info("Added index: %s", idx_name)
             except Exception:
                 conn.rollback()
 
-        print("[DB] Column migration complete")
+        logger.info("Column migration complete")
 
 
 def init_database():
     """Startup: create connection pools."""
     _init_engine()
     _init_log_engine()
-    print(f"[DB] Engine ready (pool_size={DB_POOL_SIZE}, max_overflow={DB_MAX_OVERFLOW})")
+    logger.info("Engine ready (pool_size=%d, max_overflow=%d)", DB_POOL_SIZE, DB_MAX_OVERFLOW)
 
 
 def get_db():
@@ -215,4 +218,4 @@ def shutdown_db_executor():
     """Gracefully shut down the dedicated DB thread pool."""
     if _db_executor:
         _db_executor.shutdown(wait=True)
-        print("[DB] DB executor thread pool shut down")
+        logger.info("DB executor thread pool shut down")
