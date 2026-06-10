@@ -35,7 +35,7 @@ flowchart LR
 | 服务器 | 单进程 FastAPI + asyncio，一个端口处理千级并发 |
 | 配置存储 | MySQL，所有状态持久化，内存缓存 + TTL 加速 |
 | 安全 | JWT 认证 + bcrypt + SSRF 防护 + CORS |
-| 转发协议 | HTTP/2 多路复用（自动协商，回退 HTTP/1.1） |
+| 转发协议 | HTTP/1.1 长连接（keep-alive 连接池，杜绝 GOAWAY 中断） |
 | 流式处理 | SpooledTemporaryFile 流内缓冲，流结束一次性写入 MySQL |
 
 ### 路由优先级
@@ -150,7 +150,7 @@ sequenceDiagram
 
     P->>P: SpooledTemporaryFile 读取请求体
     P->>P: 请求头处理 (移除 host/content-length 等)
-    P->>U: httpx HTTP/2 转发 (启动时预热连接池)
+    P->>U: httpx HTTP/1.1 转发 (启动时预热连接池, keepalive 复用)
     U-->>P: 响应 (非 streaming)
     P->>P: SpooledTemporaryFile 累积响应体
     P->>C: 返回完整响应
@@ -278,12 +278,12 @@ users                        ports                       requests
 | 事件循环阻塞 | 所有 DB 查询在线程池执行 | `run_in_executor(_db_executor)` |
 | 管理接口 vs 日志争抢 | 双 DB 连接池完全隔离 | 管理池 20+40 / 日志池 10+20 |
 | 线程池争抢 | 代理日志使用专用线程池 | `DB_SAVE_WORKERS=8` |
-| 上游连接数 | httpx HTTP/2 共享连接池（热启动） | 200 总连接 / 50 keep-alive |
+| 上游连接数 | httpx HTTP/1.1 共享连接池（热启动） | 200 总连接 / 50 keep-alive |
 | 端口查找 | 内存缓存 + TTL | 5 秒过期，缓存命中率 99.9%+ |
 | 请求体 OOM | SpooledTemporaryFile | ≤10MB 内存，>10MB 溢写磁盘 |
 | 流式内存累积 | SpooledTemporaryFile | ≤10MB 内存, >10MB 自动溢写临时文件 |
 | 流式重建 | 流结束后立即同步重组 | 无需后台 Worker, 即写即见 |
-| HTTP/2 连接回收 | 自动探测 + 首字节前静默重试 | GOAWAY 帧触发，用户无感 |
+| HTTP/1.1 keepalive | 连接池预热 + 自动重试 | 无 GOAWAY，流式稳定不中断 |
 
 ### 为什么不需要多进程
 
@@ -389,19 +389,23 @@ flowchart LR
 
 `Authorization` 头（API Key）**原样透传**，代理不存储也不修改。
 
-### HTTP 协议协商
+### HTTP 协议与连接稳定性
 
-代理在启动时预创建共享 httpx 客户端，避免首个请求的冷启动延迟。连接上游 API 时通过 TLS ALPN **自动协商 HTTP/2**：如果上游支持 HTTP/2（OpenAI / Anthropic / Google 均支持），使用多路复用——同一条 TCP 连接上并发处理多个请求，零额外握手开销；不支持则自动回退到 HTTP/1.1。
+代理使用 **HTTP/1.1** 与上游 LLM API 通信，启动时预创建共享 httpx 客户端（连接池预热），首个请求零冷启动开销。
 
-HTTP/2 支持需安装 `h2` 包（`pip install h2>=4.0`）。未安装时自动降级为 HTTP/1.1，不影响功能。
+**为什么选择 HTTP/1.1？**
 
-### HTTP/2 连接回收与自动重试
+LLM API 的请求几乎全部是流式 SSE（`"stream":true`），每个响应持续数秒到数分钟。HTTP/2 的多路复用虽然能在一个 TCP 连接上并发多个请求，但存在致命的 **GOAWAY 竞态问题**：
 
-上游 LLM API（OpenAI、Anthropic 等）会定期关闭空闲或达到年龄上限的 HTTP/2 连接——向代理发送 **GOAWAY** 帧（`error_code:0`，无实际错误）。这在连接复用场景下导致经典的竞态问题：
+- 上游 API 定期回收空闲连接，发送 GOAWAY 帧
+- GOAWAY 会断开该连接上的**所有流**，包括正在传输中的 SSE
+- 数据已发送给客户端，无法重试 → 用户看到回复中断
 
-```
-代理复用连接 → 上游发送 GOAWAY → 代理发出新请求 → ConnectionTerminated
-```
+HTTP/1.1 是请求-连接一对一模型：每条 TCP 连接只服务一个请求，上游只能在**响应完成后**关闭连接，绝不会在流中途断开。
+
+**连接复用（keepalive）**：HTTP/1.1 同样支持连接池。一条 TCP 连接在上一个请求完成后回到池中（温热），下一个请求直接复用，省去 TLS 握手。配置：`max_connections=200`，`max_keepalive_connections=50`，足以应对高并发。
+
+**重试策略**（三层防护，覆盖整个请求生命周期）：
 
 ```mermaid
 sequenceDiagram
@@ -410,71 +414,53 @@ sequenceDiagram
     participant P as LLM Proxy
     participant U as 上游 LLM API
 
-    Note over P: httpx 共享连接池<br/>HTTP/2 多路复用
+    Note over P: httpx 共享连接池<br/>HTTP/1.1 keepalive 复用
 
     rect rgb(240, 248, 240)
-        Note over A,U: ✅ 正常请求 — 连接池有空闲连接
+        Note over A,U: ✅ 正常请求 — 连接池预热，复用温和连接
         A->>P: POST /12345/v1/chat/completions
-        P->>P: 从连接池取连接
-        P->>U: HTTP/2 stream (复用已有 TCP)
+        P->>P: 从连接池取温和连接 (0ms)
+        P->>U: HTTP/1.1 请求 (复用已有 TCP)
         U-->>P: 响应 (200) + SSE 流
-        P->>P: 连接归还池
+        P->>P: 连接归还池 (keepalive)
         P-->>A: SSE 流式透传
     end
 
-    rect rgb(255, 245, 230)
-        Note over A,U: ⚠️ 空闲期间 — 上游关闭连接
-        U-->>P: GOAWAY (error_code:0)<br/>"我要关闭这个连接了"
-        Note over P: TCP 连接即将断开<br/>但连接池尚未感知
-    end
-
-    rect rgb(253, 238, 238)
-        Note over A,U: ❌ 竞态触发（第1层重试）— stream() 即失败
-        A->>P: POST /12345/v1/chat/completions
-        P->>P: 从连接池取出同一个连接 → 已死亡
-        P--xU: client.stream() → RemoteProtocolError
-        Note over P: 第1层重试<br/>新建 TCP 连接
-        P->>U: HTTP/2 stream (全新连接)
+    rect rgb(240, 248, 240)
+        Note over A,U: ✅ 高并发 — 连接池满了新建连接
+        A->>P: 多用户同时请求
+        P->>P: 池内 50 个连接全在用 → 新建 TCP+TLS (~50ms)
+        P->>U: HTTP/1.1 请求 (全新 TCP)
         U-->>P: 响应 (200) + SSE 流
         P-->>A: SSE 流式透传
+        Note over P: HTTP/1.1 无 GOAWAY<br/>上游只能在响应完成后关闭连接
     end
 
     rect rgb(253, 238, 238)
-        Note over A,U: ❌ 竞态触发（第2层重试）— 流中途断开
+        Note over A,U: ❌ 罕见网络故障 — 自动重试
         A->>P: POST /12345/v1/chat/completions
-        P->>U: HTTP/2 stream
-        U-->>P: SSE chunk 1, chunk 2, ...
-        P-->>A: chunk 1, chunk 2, ...
-        U--xP: GOAWAY mid-stream → RemoteProtocolError
-        Note over P: 第2层重试（首字节前）<br/>或优雅终止（已发送数据）
+        P->>U: TCP 连接意外断开
+        U--xP: RemoteProtocolError / ConnectError
+        Note over P: 第1层: 重试 stream()<br/>第2层: 重试首个 chunk<br/>流中途: 优雅终止 + warning 日志
     end
 
     rect rgb(240, 248, 240)
-        Note over A,U: ✅ 外三层异常处理 — 兜底
-        Note over P: 两次都失败 → 返回 502<br/>日志: RemoteProtocolError
+        Note over A,U: ✅ 兜底 — 返回明确错误
+        Note over P: 两次都失败 → 返回 502<br/>日志: RemoteProtocolError / ConnectError
     end
 ```
 
-**重试策略**（三层防护，覆盖整个请求生命周期）：
+| 层次 | 错误位置 | 行为 |
+|------|----------|------|
+| 第1层 | `stream()` / `__aenter__()` | 静默重试一次 |
+| 第2层 | `aiter_bytes()` 首字节前 | 关闭死连接，新建连接，静默重试 |
+| 第2层 | `aiter_bytes()` 数据已发 | 优雅终止流，日志 warning（HTTP/1.1 几乎不会走到这里） |
+| 兜底 | 两次都失败 | 返回 502 + 结构化错误信息 |
+
+关键日志（`INFO` 级别）记录在 `llm_proxy.proxy` logger 下：
 
 ```
-请求到达 → [第1层] client.stream() / __aenter__()
-                ↓ 成功
-           [第2层] async for chunk in aiter_bytes()   ← 流式/非流式
-```
-
-| 层次 | 错误位置 | 流式（SSE） | 非流式 |
-|------|----------|-------------|--------|
-| 第1层 | `stream()` / `__aenter__()` | 静默重试一次 | 静默重试一次 |
-| 第2层 | `aiter_bytes()` 首字节前 | 关闭死连接，新建流，静默重试 | 关闭死连接，新建请求，静默重试 |
-| 第2层 | `aiter_bytes()` 数据已发 | 优雅终止流，日志 warning | — |
-| 第3层 | 两次都失败 | 返回 502 + 错误信息 | 返回 502 + 错误信息 |
-
-每一层重试仅进行一次（最多 2 次尝试），使用全新 TCP 连接。关键日志（`INFO` 级别）记录在 `llm_proxy.proxy` logger 下：
-
-```
-2026-06-08 14:30:16 [INFO] llm_proxy.proxy: Retrying stream setup (attempt 2/2) — connection may be dead: RemoteProtocolError: ...
-2026-06-08 14:30:16 [INFO] llm_proxy.proxy: Retrying stream (attempt 2/2) — upstream closed connection: RemoteProtocolError: ...
+2026-06-08 14:30:16 [INFO] llm_proxy.proxy: Retrying stream setup (attempt 2/2) — connection may be dead: ConnectError: ...
 ```
 
 ### 编码清洗（Surrogate 字符处理）
@@ -767,7 +753,7 @@ llm-proxy/
 │   ├── models.py            # ORM 模型（User / Port / Request）
 │   ├── schemas.py           # Pydantic 请求/响应模型
 │   ├── auth.py              # JWT 认证 + bcrypt 密码哈希
-│   ├── proxy_app.py         # 代理核心：HTTP/2 共享客户端、SSE 格式解析、DB 记录
+│   ├── proxy_app.py         # 代理核心：HTTP/1.1 共享客户端、SSE 格式解析、DB 记录
 │   ├── shared_proxy.py      # 共享代理端点 /{port_number}/{path}
 │   ├── proxy_manager.py     # 端口配置查询 + 缓存刷新
 │   ├── requirements.txt     # pip 依赖
