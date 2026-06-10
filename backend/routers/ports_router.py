@@ -4,10 +4,11 @@ import socket
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, defer
 from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
-from database import get_db
+from database import get_db, SessionLocal
 from models import User, Port, Request as RequestModel
 from schemas import PortCreate, PortUpdate, PortInfo, PortHistory, RequestInfo
 from auth import require_approved
@@ -544,19 +545,18 @@ def get_single_request(
     )
 
 
-@router.get("/{port_id}/export", response_model=dict)
+@router.get("/{port_id}/export")
 def export_port_history(
     port_id: int,
     method_filter: str = "all",
     current_user: User = Depends(require_approved),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db),  # for port lookup + count only
 ):
-    """Export all request history for a port as a JSON-serializable structure.
+    """Export all request history for a port as a streaming JSON response.
 
-    Excludes response_body_raw (raw SSE text, the largest column) from the
-    query to keep memory usage manageable even with tens of thousands of
-    records.  method_filter="api" pushes the filter into SQL to avoid
-    transferring then discarding non-API rows.
+    Uses a dedicated session (via `yield_per`) for the streaming phase so
+    the session outlives the route handler return.  Memory stays constant
+    at ~100 rows regardless of total record count.
 
     Args:
         method_filter: 'all' (default) or 'api' (POST/PUT/PATCH/DELETE only).
@@ -568,31 +568,22 @@ def export_port_history(
     if current_user.role != "admin" and port.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    # ── Build query (defer the largest column, push filter to SQL) ──
-    query = (
-        db.query(RequestModel)
-        .options(defer(RequestModel.response_body_raw))
-        .filter(RequestModel.port_id == port.id)
+    # ── Count total on the request-scoped session (cheap) ──
+    total_q = db.query(func.count(RequestModel.id)).filter(
+        RequestModel.port_id == port.id
     )
-
     if method_filter == "api":
-        query = query.filter(RequestModel.method.in_(["POST", "PUT", "PATCH", "DELETE"]))
+        total_q = total_q.filter(RequestModel.method.in_(["POST", "PUT", "PATCH", "DELETE"]))
+    total_count = total_q.scalar() or 0
 
-    requests = query.order_by(RequestModel.created_at.asc()).all()
+    # Capture immutable values for use inside the generator
+    _port_number = port.port_number
+    _port_target = port.target_url
+    _port_desc = port.description
+    _port_created = port.created_at.isoformat() if port.created_at else None
 
-    export_data = {
-        "port": {
-            "port_number": port.port_number,
-            "target_url": port.target_url,
-            "description": port.description,
-            "created_at": port.created_at.isoformat() if port.created_at else None,
-        },
-        "total_requests": len(requests),
-        "requests": []
-    }
-
-    for r in requests:
-        req_entry = {
+    def _row_to_dict(r):
+        entry = {
             "id": r.id,
             "method": r.method,
             "path": r.path,
@@ -600,16 +591,57 @@ def export_port_history(
             "duration_ms": r.duration_ms,
             "timestamp": r.created_at.isoformat() if r.created_at else None,
         }
-        # Parse JSON strings back to objects for cleaner export
         for field in ["request_headers", "request_body", "response_headers", "response_body"]:
             raw = getattr(r, field, None)
             if raw:
                 try:
-                    req_entry[field] = json.loads(raw)
+                    entry[field] = json.loads(raw)
                 except (json.JSONDecodeError, TypeError):
-                    req_entry[field] = raw
+                    entry[field] = raw
             else:
-                req_entry[field] = None
-        export_data["requests"].append(req_entry)
+                entry[field] = None
+        return entry
 
-    return export_data
+    def stream_jsonl():
+        # OWN session — lives as long as the generator is iterated.
+        own_db = SessionLocal()
+        try:
+            query = (
+                own_db.query(RequestModel)
+                .options(defer(RequestModel.response_body_raw))
+                .filter(RequestModel.port_id == port_id)
+            )
+            if method_filter == "api":
+                query = query.filter(RequestModel.method.in_(["POST", "PUT", "PATCH", "DELETE"]))
+            query = query.order_by(RequestModel.created_at.asc())
+
+            yield b'{"port":'
+            yield json.dumps({
+                "port_number": _port_number,
+                "target_url": _port_target,
+                "description": _port_desc,
+                "created_at": _port_created,
+            }, ensure_ascii=False).encode("utf-8")
+            yield f',"total_requests":{total_count},"requests":['.encode("utf-8")
+
+            first = True
+            for r in query.yield_per(100):
+                entry = _row_to_dict(r)
+                if not first:
+                    yield b","
+                first = False
+                yield json.dumps(entry, ensure_ascii=False).encode("utf-8")
+            yield b"]}"
+        finally:
+            own_db.close()
+
+    return StreamingResponse(
+        stream_jsonl(),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="llm-proxy-port{_port_number}-'
+                f'export-{method_filter}.json"'
+            ),
+        },
+    )
