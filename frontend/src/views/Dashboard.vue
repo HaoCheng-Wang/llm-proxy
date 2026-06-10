@@ -141,19 +141,20 @@
           </div>
           <div class="form-group">
             <label>🔗 转发协议 <span style="color:#e74c3c">*</span></label>
+            <p class="protocol-hint">目标是中转站（如 dmxapi.cn）必须选 HTTP/1.1；直连模型厂商 API 可选 HTTP/2</p>
             <div class="protocol-selector">
               <label class="protocol-option" :class="{ active: !createForm.prefer_http2 }">
                 <input type="radio" v-model="createForm.prefer_http2" :value="false" />
                 <div class="protocol-info">
-                  <strong>HTTP/1.1</strong> — <span class="protocol-tag-stable">稳定推荐</span>
-                  <p class="protocol-desc">每个请求独占一条 TCP 连接，无 GOAWAY 中断风险。适合中转站（如 dmxapi.cn）和高并发场景，延迟略高（首次 TLS 握手 ~50ms）。</p>
+                  <strong>HTTP/1.1</strong> — <span class="protocol-tag-stable">稳定推荐 · 无需担心中断</span>
+                  <p class="protocol-desc"><strong>原理</strong>：每个请求独占一条 TCP 连接，上游无法在中途切断。适合中转站（会定期回收连接）、高并发场景。延迟：首次 TLS 握手 ~50ms（有连接池复用后0ms）。</p>
                 </div>
               </label>
               <label class="protocol-option" :class="{ active: createForm.prefer_http2 }">
                 <input type="radio" v-model="createForm.prefer_http2" :value="true" />
                 <div class="protocol-info">
-                  <strong>HTTP/2</strong> — <span class="protocol-tag-risk">低延迟但可能中断</span>
-                  <p class="protocol-desc">多路复用：一条 TCP 连接并发多个请求，省 TLS 握手。但上游定期回收连接 (GOAWAY) 时可能中断正在传输的 SSE 流。仅适合直连 OpenAI/Anthropic 等模型 API。</p>
+                  <strong>HTTP/2</strong> — <span class="protocol-tag-risk">低延迟 · 中转站有中断风险</span>
+                  <p class="protocol-desc"><strong>原理</strong>：多条请求复用一条 TCP 连接，省 TLS 握手。但上游回收连接时，该连接上<strong>所有正在传输的 SSE 流会同时中断</strong>——数据已发给用户、无法重试。<strong>仅适合直连 OpenAI/Anthropic/Google 等不会激进回收连接的 API。</strong></p>
                 </div>
               </label>
             </div>
@@ -187,19 +188,20 @@
           </div>
           <div class="form-group">
             <label>🔗 转发协议 <span style="color:#e74c3c">*</span></label>
+            <p class="protocol-hint">目标是中转站（如 dmxapi.cn）必须选 HTTP/1.1；直连模型厂商 API 可选 HTTP/2</p>
             <div class="protocol-selector">
               <label class="protocol-option" :class="{ active: editForm.prefer_http2 === false }">
                 <input type="radio" v-model="editForm.prefer_http2" :value="false" />
                 <div class="protocol-info">
-                  <strong>HTTP/1.1</strong> — <span class="protocol-tag-stable">稳定推荐</span>
-                  <p class="protocol-desc">每个请求独占一条 TCP 连接，无中断风险。适合中转站和高并发场景。</p>
+                  <strong>HTTP/1.1</strong> — <span class="protocol-tag-stable">中转站首选</span>
+                  <p class="protocol-desc">每个请求独占一条 TCP 连接，上游无法在中途切断。中转站定期回收连接时不影响正在传输的流。</p>
                 </div>
               </label>
               <label class="protocol-option" :class="{ active: editForm.prefer_http2 === true }">
                 <input type="radio" v-model="editForm.prefer_http2" :value="true" />
                 <div class="protocol-info">
-                  <strong>HTTP/2</strong> — <span class="protocol-tag-risk">低延迟但可能中断</span>
-                  <p class="protocol-desc">多路复用省 TLS 握手，但上游回收连接时可能中断流。仅适合直连模型 API。</p>
+                  <strong>HTTP/2</strong> — <span class="protocol-tag-risk">⚠️ 中转站会中断流</span>
+                  <p class="protocol-desc">多路复用省 TLS 握手，但中转站回收连接时该连接上<strong>所有正在传输的 SSE 流会同时中断</strong>。仅适合直连模型厂商。</p>
                 </div>
               </label>
             </div>
