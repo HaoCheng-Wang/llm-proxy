@@ -191,6 +191,7 @@ sequenceDiagram
 | 字段 | 非流式 | 流式 |
 |------|:--:|:--:|
 | `port_id` | port.id 或 NULL | port.id 或 NULL（端口删除后仍保存） |
+| `prefer_http2` | port 配置 | 决定使用 HTTP/1.1 还是 HTTP/2 客户端转发 |
 | `method` / `path` | ✅ | ✅ |
 | `request_headers` / `request_body` | ✅ | ✅ |
 | `response_headers` | ✅ | ✅ |
@@ -238,22 +239,22 @@ stateDiagram-v2
 ## 数据模型
 
 ```
-users                        ports                       requests
-┌──────────────┐            ┌──────────────────┐        ┌──────────────────────┐
-│ id (PK)      │──┐         │ id (PK)          │──┐     │ id (PK)              │
-│ username     │  │         │ port_number (UQ) │  │     │ port_id (FK→ports)   │
-│ password_hash│  │ 1:N     │ user_id (FK)     │←─┘     │ method               │
-│ role         │──┘         │ target_url       │ 1:N    │ path                 │
-│ is_approved  │            │ description      │────────│ request_headers      │
-│ created_at   │            │ is_active        │        │ request_body         │
-└──────────────┘            │ deleted_at       │        │ response_headers     │
-                            │ created_at       │        │ response_body        │
-                            └──────────────────┘        │ response_body_raw    │
-                                                        │ status_code          │
-                                                        │ duration_ms          │
-                                                        │ reconstruction_error │
-                                                        │ created_at           │
-                                                        └──────────────────────┘
+users                        ports                              requests
+┌──────────────┐            ┌─────────────────────────┐        ┌──────────────────────┐
+│ id (PK)      │──┐         │ id (PK)                 │──┐     │ id (PK)              │
+│ username     │  │         │ port_number (UQ)        │  │     │ port_id (FK→ports)   │
+│ password_hash│  │ 1:N     │ user_id (FK)            │←─┘     │ method               │
+│ role         │──┘         │ target_url              │ 1:N    │ path                 │
+│ is_approved  │            │ description             │────────│ request_headers      │
+│ created_at   │            │ is_active               │        │ request_body         │
+└──────────────┘            │ prefer_http2            │        │ response_headers     │
+                            │ deleted_at              │        │ response_body        │
+                            │ created_at              │        │ response_body_raw    │
+                            └─────────────────────────┘        │ status_code          │
+                                                               │ duration_ms          │
+                                                               │ reconstruction_error │
+                                                               │ created_at           │
+                                                               └──────────────────────┘
 ```
 
 ## 安全设计
@@ -632,7 +633,7 @@ npm run dev
 #### 7. 使用流程
 
 1. 用户注册账号并登录（`REQUIRE_APPROVAL=false` 时注册后直接登录；设为 `true` 则由管理员审批后登录）
-2. 用户登录 → 点击「创建代理」→ 输入目标 API 地址（如 `https://api.openai.com`）
+2. 用户登录 → 点击「创建代理」→ 输入目标 API 地址并**选择转发协议**（默认 HTTP/1.1，中转站场景推荐；直连模型 API 可选 HTTP/2）
 3. 在智能体中，把 API Base URL 改为 `http://<你的IP>:3998/<分配的端口号>`，路径部分保持不变：
    - 原来：`https://api.openai.com/v1/chat/completions`
    - 改为：`http://<IP>:3998/12345/v1/chat/completions`（`12345` 为系统分配的 5 位编号）
@@ -799,7 +800,7 @@ llm-proxy/
 │   ├── models.py            # ORM 模型（User / Port / Request）
 │   ├── schemas.py           # Pydantic 请求/响应模型
 │   ├── auth.py              # JWT 认证 + bcrypt 密码哈希
-│   ├── proxy_app.py         # 代理核心：HTTP/1.1 共享客户端、SSE 格式解析、DB 记录
+│   ├── proxy_app.py         # 代理核心：HTTP/1.1 + HTTP/2 双客户端、SSE 解析、DB 记录
 │   ├── shared_proxy.py      # 共享代理端点 /{port_number}/{path}
 │   ├── proxy_manager.py     # 端口配置查询 + 缓存刷新
 │   ├── requirements.txt     # pip 依赖
@@ -868,13 +869,16 @@ llm-proxy/
 |------|------|------|
 | POST | `/api/ports` | 创建代理（自动分配编号） |
 | GET | `/api/ports` | 列出我的代理（管理员看全部） |
-| GET | `/api/ports/{id}` | 代理详情 + 交互历史（分页） |
-| PUT | `/api/ports/{id}` | 编辑代理 |
+| GET | `/api/ports/{id}` | 代理详情 + 交互历史（流式 NDJSON，分页） |
+| PUT | `/api/ports/{id}` | 编辑代理（含转发协议） |
 | DELETE | `/api/ports/{id}` | 软删除（可恢复） |
 | POST | `/api/ports/{id}/stop` | 停用 |
 | POST | `/api/ports/{id}/start` | 启用 |
 | DELETE | `/api/ports/{id}/history` | 清空历史 |
-| GET | `/api/ports/{id}/export` | 导出全部交互 JSON |
+| DELETE | `/api/ports/{id}/history/{req_id}` | 删除单条记录 |
+| GET | `/api/ports/{id}/history/{req_id}` | 获取单条记录详情 |
+| GET | `/api/ports/{id}/history/{req_id}/raw-sse` | 按需获取原始 SSE 文本 |
+| GET | `/api/ports/{id}/export` | 流式导出全部交互 JSON |
 
 ### 管理员
 
