@@ -6,7 +6,9 @@ from models import User, Port, Request as RequestModel
 from schemas import UserApproval, UserInfo, AdminUserList, PortInfo, DeletedPortList
 from auth import require_admin
 from proxy_app import refresh_port_cache
-import sys
+import logging
+
+logger = logging.getLogger("llm_proxy.admin")
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -157,10 +159,9 @@ def permanent_delete_port(
     # We skip them — they are already unreachable through the UI and
     # will be cleaned up by the DB admin periodically.
 
-    print(
-        f"[Admin] Permanently deleting port {port_number}: "
-        f"removing {req_deleted} linked request(s)",
-        file=sys.stderr,
+    logger.info(
+        "Permanently deleting port %s: removing %s linked request(s)",
+        port_number, req_deleted,
     )
 
     db.delete(port)
