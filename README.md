@@ -392,7 +392,34 @@ flowchart LR
 
 ### HTTP 协议选择：HTTP/1.1 vs HTTP/2
 
-每个代理端口可以独立选择转发协议，创建和编辑时在弹窗中配置。
+每个代理端口可以独立选择转发协议，创建和编辑时在弹窗中配置。系统维护两个独立的 httpx 客户端池（HTTP/1.1 和 HTTP/2），请求到达时根据端口配置自动路由。
+
+```mermaid
+flowchart TD
+    A[请求到达 :3998/{port}/{path}] --> B[aget_target_url(port)]
+    B --> C{port.prefer_http2?}
+
+    C -->|NULL 或 False| D[get_shared_client()]
+    D --> E[HTTP/1.1 客户端]
+    E --> F["独立 TCP 连接<br/>connect=15s read=120s<br/>max_connections=无上限<br/>keepalive=100"]
+
+    C -->|True| G[get_http2_client()]
+    G --> H{h2 包是否安装?}
+    H -->|是| I[HTTP/2 客户端]
+    I --> J["多路复用 TCP 连接<br/>connect=15s read=300s<br/>max_connections=无上限<br/>keepalive=100"]
+    H -->|否| K[退回 HTTP/1.1 客户端]
+    K --> L["⚠️ WARNING 日志:<br/>h2 not installed, fallback to HTTP/1.1"]
+
+    F --> M[转发请求到上游]
+    J --> M
+    L --> M
+
+    style D fill:#1a3a1a,stroke:#2ecc71,color:#2ecc71
+    style E fill:#1a3a1a,stroke:#2ecc71,color:#2ecc71
+    style G fill:#1a2a3a,stroke:#5dade2,color:#5dade2
+    style I fill:#1a2a3a,stroke:#5dade2,color:#5dade2
+    style K fill:#3a2a1a,stroke:#f39c12,color:#f1c40f
+```
 
 #### 对比
 
@@ -452,7 +479,7 @@ HTTP/1.1 无此问题：
 
 两种协议都支持连接池。一条 TCP 连接在上一个请求完成后回到池中保持温热，后续请求直接复用，省去 TLS 握手。配置：并发连接数不设上限（由操作系统 ulimit 决定），keepalive=100。
 
-#### 重试策略（三层防护）
+#### 重试策略与稳定性设计
 
 ```mermaid
 sequenceDiagram
@@ -464,36 +491,63 @@ sequenceDiagram
     Note over P: httpx 双客户端<br/>HTTP/1.1 (默认) / HTTP/2 (按端口可选)
 
     rect rgb(240, 248, 240)
-        Note over A,U: ✅ 正常请求 — 连接池预热，复用温热连接
+        Note over A,U: ✅ HTTP/1.1 — 正常请求，连接池复用
         A->>P: POST /12345/v1/chat/completions
-        P->>P: 从连接池取温和连接 (0ms)
+        P->>P: port.prefer_http2=False → get_shared_client()
+        P->>P: 从 keepalive 池取温热连接 (0ms)
         P->>U: HTTP/1.1 请求 (复用已有 TCP)
-        U-->>P: 响应 (200) + SSE 流
-        P->>P: 连接归还池 (keepalive)
-        P-->>A: SSE 流式透传
+        U-->>P: 响应 (200) + SSE 流 (30s)
+        P->>P: 连接归还池
+        P-->>A: SSE 流式透传 ✅
     end
 
     rect rgb(240, 248, 240)
-        Note over A,U: ✅ 高并发 — 连接池满了新建连接
-        A->>P: 多用户同时请求
-        P->>P: 池内 50 个连接全在用 → 新建 TCP+TLS (~50ms)
-        P->>U: HTTP/1.1 请求 (全新 TCP)
+        Note over A,U: ✅ HTTP/2 — 直连模型厂商 API
+        A->>P: POST /12345/v1/chat/completions
+        P->>P: port.prefer_http2=True → get_http2_client()
+        P->>U: HTTP/2 stream (多路复用, 省 TLS)
         U-->>P: 响应 (200) + SSE 流
-        P-->>A: SSE 流式透传
-        Note over P: HTTP/1.1 无 GOAWAY<br/>上游只能在响应完成后关闭连接
+        P-->>A: SSE 流式透传 ✅
     end
 
     rect rgb(253, 238, 238)
-        Note over A,U: ❌ 罕见网络故障 — 自动重试
+        Note over A,U: ❌ HTTP/2 中转站场景 — GOAWAY 流中断
         A->>P: POST /12345/v1/chat/completions
-        P->>U: TCP 连接意外断开
+        P->>P: prefer_http2=True → HTTP/2 客户端
+        P->>U: HTTP/2 stream (连接上已有 50 个流)
+        U-->>P: SSE chunk 1, chunk 2, ... (传输中)
+        P-->>A: chunk 1, chunk 2, ...
+
+        Note over U: 中转站："连接空闲太久，回收"
+        U--xP: GOAWAY (error_code:0) + TCP RST
+        Note over P: 流中途断开 — 数据已发给客户端<br/>无法重试 — 用户看到回复中断 ❌
+    end
+
+    rect rgb(255, 245, 230)
+        Note over A,U: ⚠️ 连接建立阶段故障 — 自动重试
+        A->>P: POST /12345/v1/chat/completions
+        P->>U: client.stream() → 连接已死
         U--xP: RemoteProtocolError / ConnectError
-        Note over P: 第1层: 重试 stream()<br/>第2层: 重试首个 chunk<br/>流中途: 优雅终止 + warning 日志
+        Note over P: 第1层重试：关闭死连接 → 新建连接 → stream()
+        P->>U: 全新 TCP 连接 + 请求
+        U-->>P: 响应 (200) + SSE 流
+        P-->>A: 正常透传 ✅
+    end
+
+    rect rgb(255, 245, 230)
+        Note over A,U: ⚠️ 首字节前故障 — 自动重试
+        A->>P: POST /12345/v1/chat/completions
+        P->>U: 请求已发出，等待首个 chunk
+        U--xP: RemoteProtocolError (尚无数据发给客户端)
+        Note over P: 第2层重试：关闭 → 新建 → 重新请求
+        P->>U: 全新 TCP 连接 + 请求
+        U-->>P: 响应 (200) + SSE 流
+        P-->>A: 正常透传 ✅
     end
 
     rect rgb(240, 248, 240)
-        Note over A,U: ✅ 兜底 — 返回明确错误
-        Note over P: 两次都失败 → 返回 502<br/>日志: RemoteProtocolError / ConnectError
+        Note over A,U: ✅ 兜底 — 两次都失败
+        Note over P: 返回 502 + 结构化错误信息
     end
 ```
 
@@ -501,7 +555,7 @@ sequenceDiagram
 |------|----------|------|
 | 第1层 | `stream()` / `__aenter__()` | 静默重试一次 |
 | 第2层 | `aiter_bytes()` 首字节前 | 关闭死连接，新建连接，静默重试 |
-| 第2层 | `aiter_bytes()` 数据已发 | 优雅终止流，日志 warning（HTTP/1.1 几乎不会走到这里） |
+| 第2层 | `aiter_bytes()` 数据已发 | 优雅终止流，日志 warning |
 | 兜底 | 两次都失败 | 返回 502 + 结构化错误信息 |
 
 关键日志（`INFO` 级别）记录在 `llm_proxy.proxy` logger 下：
