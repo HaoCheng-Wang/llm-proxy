@@ -40,21 +40,16 @@ logger.setLevel(logging.DEBUG)
 def _wants_streaming(body_bytes: bytes) -> bool:
     """Heuristic: does the request body ask for SSE streaming?
 
-    LLM APIs (OpenAI, Anthropic, DeepSeek, etc.) use ``"stream": true``
-    in the JSON body to request a server-sent-events response.  This
-    check is a fast substring scan — no full JSON parse — and is only
-    used to decide which HTTP client to pick.
+    Scans raw bytes directly — no decode, no allocation.  LLM API bodies
+    are typically a few KB.  The regex is equivalent to matching
+    ``"stream": true`` with case-insensitive ``true`` and any whitespace.
     """
     if not body_bytes:
         return False
-    try:
-        text = body_bytes.decode("utf-8", errors="replace")
-        if '"stream"' not in text:
-            return False
-        # Match "stream":true, "stream": true, "stream":True (any whitespace)
-        return bool(re.search(r'"stream"\s*:\s*true', text, re.IGNORECASE))
-    except Exception:
+    # Fast path: skip regex if the word "stream" isn't even present
+    if b'"stream"' not in body_bytes:
         return False
+    return bool(re.search(br'"stream"\s*:\s*true', body_bytes, re.IGNORECASE))
 
 
 router = APIRouter()
