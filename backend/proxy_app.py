@@ -86,10 +86,25 @@ async def close_shared_client():
         _shared_client = None
 
 
-def init_http2_client() -> httpx.AsyncClient:
-    """Create (or return existing) HTTP/2 client.  Call at startup."""
+def init_http2_client() -> httpx.AsyncClient | None:
+    """Create (or return existing) HTTP/2 client.  Call at startup.
+
+    Returns None if h2 is not installed — the caller (get_http2_client,
+    shared_proxy) falls back to HTTP/1.1 automatically.
+    """
     global _http2_client
     if _http2_client is None:
+        try:
+            import h2  # noqa: F401
+        except ImportError:
+            print(
+                "[Proxy] WARNING: h2 not installed — HTTP/2 unavailable. "
+                "Ports with prefer_http2=True will fall back to HTTP/1.1. "
+                "Install with: pip install httpx[http2]",
+                file=sys.stderr,
+            )
+            _http2_client = None  # sentinel: tried but failed
+            return None
         _http2_client = httpx.AsyncClient(
             timeout=httpx.Timeout(300.0, connect=15.0, read=300.0),
             limits=httpx.Limits(
@@ -108,11 +123,11 @@ def init_http2_client() -> httpx.AsyncClient:
     return _http2_client
 
 
-def get_http2_client() -> httpx.AsyncClient:
-    """Get the HTTP/2 shared client."""
+def get_http2_client() -> httpx.AsyncClient | None:
+    """Get the HTTP/2 shared client.  Returns None if unavailable (no h2)."""
     global _http2_client
     if _http2_client is None:
-        init_http2_client()
+        return init_http2_client()
     return _http2_client
 
 

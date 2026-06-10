@@ -113,11 +113,21 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
     try:
         # --- Choose HTTP client (per-port preference) ──────────
         if prefer_http2:
-            client = get_http2_client()
-            logger.debug(
-                "Using HTTP/2 client for %s #%d → %s",
-                request.method, port_number, target_url,
-            )
+            _h2 = get_http2_client()
+            if _h2 is not None:
+                client = _h2
+                logger.debug(
+                    "Using HTTP/2 client for %s #%d → %s",
+                    request.method, port_number, target_url,
+                )
+            else:
+                # h2 not installed — fall back to HTTP/1.1
+                client = get_shared_client()
+                logger.warning(
+                    "Port #%d prefers HTTP/2 but h2 is not installed — "
+                    "falling back to HTTP/1.1",
+                    port_number,
+                )
         else:
             client = get_shared_client()
             logger.debug(
