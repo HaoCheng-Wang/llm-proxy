@@ -638,10 +638,4 @@ def export_port_history(
     return StreamingResponse(
         stream_jsonl(),
         media_type="application/json",
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="llm-proxy-port{_port_number}-'
-                f'export-{method_filter}.json"'
-            ),
-        },
     )
