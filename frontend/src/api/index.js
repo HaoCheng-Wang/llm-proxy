@@ -39,12 +39,63 @@ export default {
   // Ports
   listPorts: () => http.get('/ports').then(r => r.data),
   createPort: (data) => http.post('/ports', data).then(r => r.data),
-  getPortHistory: (portId, sinceId = 0, limit = 20, offset = 0) => {
-    const params = {}
-    if (sinceId > 0) params.since_id = sinceId
-    if (limit !== 20) params.limit = limit
-    if (offset > 0) params.offset = offset
-    return http.get(`/ports/${portId}`, { params }).then(r => r.data)
+  // Streaming NDJSON — yields {port} then records one by one.
+  // onRecord(record) is called for each record as it arrives.
+  // Returns Promise<{port, requests}> when the stream is complete.
+  getPortHistoryStream: async (portId, sinceId = 0, limit = 20, offset = 0, onRecord = null) => {
+    const params = new URLSearchParams()
+    if (sinceId > 0) params.set('since_id', sinceId)
+    if (limit !== 20) params.set('limit', limit)
+    if (offset > 0) params.set('offset', offset)
+    const qs = params.toString()
+    const url = `/api/ports/${portId}${qs ? '?' + qs : ''}`
+    const token = localStorage.getItem('token')
+    const headers = token ? { Authorization: `Bearer ${token}` } : {}
+
+    const response = await fetch(url, { headers })
+    if (response.status === 401) {
+      localStorage.removeItem('token'); localStorage.removeItem('username')
+      localStorage.removeItem('role'); localStorage.removeItem('userId')
+      window.location.href = '/login'
+      throw new Error('Unauthorized')
+    }
+    if (!response.ok) {
+      const text = await response.text()
+      throw new Error(text || `HTTP ${response.status}`)
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let port = null
+    const requests = []
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop()  // keep incomplete last chunk
+      for (const line of lines) {
+        if (!line.trim()) continue
+        try {
+          const obj = JSON.parse(line)
+          if (port === null) {
+            port = obj  // first line = port metadata
+          } else {
+            requests.push(obj)
+            if (onRecord) onRecord(obj)  // incremental render
+          }
+        } catch (e) { /* skip */ }
+      }
+    }
+    if (buffer.trim()) {
+      try {
+        const obj = JSON.parse(buffer)
+        if (port !== null) { requests.push(obj); if (onRecord) onRecord(obj) }
+      } catch (e) { /* skip */ }
+    }
+    return { port, requests }
   },
   deletePort: (portId) => http.delete(`/ports/${portId}`).then(r => r.data),
   stopPort: (portId) => http.post(`/ports/${portId}/stop`).then(r => r.data),

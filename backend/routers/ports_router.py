@@ -220,77 +220,105 @@ def get_active_port_numbers(
     return [p[0] for p in ports]
 
 
-@router.get("/{port_id}", response_model=PortHistory)
+@router.get("/{port_id}")
 def get_port_history(
     port_id: int,
     since_id: int = 0,
     limit: int = 20,
     offset: int = 0,
     current_user: User = Depends(require_approved),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db),  # for auth + port lookup + count only
 ):
-    """Get detailed history for a specific port.
-    If since_id > 0, only return records with id > since_id (for incremental polling).
-    Supports pagination via limit (default 20, max 100) and offset."""
+    """Stream port history as NDJSON (one JSON object per line).
+
+    Line 1: port metadata + total_requests
+    Lines 2+: one request record each (response_body_raw excluded;
+             use GET .../raw-sse to fetch on demand)
+
+    The generator owns its own session so it outlives the route handler.
+    yield_per(50) keeps memory constant regardless of total record count.
+    """
     port = db.query(Port).filter(Port.id == port_id).first()
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
 
-    # Check ownership (admin can view all)
     if current_user.role != "admin" and port.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
 
+    # ── Count + creator on request-scoped session (cheap, happens once) ──
     request_count = db.query(func.count(RequestModel.id)).filter(
         RequestModel.port_id == port.id
     ).scalar() or 0
 
-    query = db.query(RequestModel).filter(
-        RequestModel.port_id == port.id
-    )
-    if since_id > 0:
-        query = query.filter(RequestModel.id > since_id)
-    # Cap limit to prevent huge responses
-    limit = min(max(limit, 1), 100)
-    requests = (
-        query
-        .options(defer(RequestModel.response_body_raw))
-        .order_by(RequestModel.created_at.desc())
-        .offset(offset).limit(limit).all()
-    )
-
-    # Get creator username
     creator = db.query(User).filter(User.id == port.user_id).first()
     creator_name = creator.username if creator else ""
 
-    return PortHistory(
-        port=PortInfo(
-            id=port.id,
-            port_number=port.port_number,
-            target_url=port.target_url,
-            description=port.description or "",
-            is_active=port.is_active,
-            deleted_at=port.deleted_at,
-            created_at=port.created_at,
-            request_count=request_count,
-            username=creator_name,
-        ),
-        requests=[
-            RequestInfo(
-                id=r.id,
-                port_id=r.port_id,
-                method=r.method,
-                path=r.path,
-                request_headers=r.request_headers,
-                request_body=r.request_body,
-                response_headers=r.response_headers,
-                response_body=r.response_body,
-                response_body_raw=r.response_body_raw,
-                status_code=r.status_code,
-                duration_ms=r.duration_ms,
-                reconstruction_error=r.reconstruction_error,
-                created_at=r.created_at,
-            ) for r in requests
-        ]
+    # Capture immutable values for the generator closure
+    _port_dict = {
+        "id": port.id,
+        "port_number": port.port_number,
+        "target_url": port.target_url,
+        "description": port.description or "",
+        "is_active": port.is_active,
+        "deleted_at": port.deleted_at,
+        "created_at": port.created_at,
+        "request_count": request_count,
+        "username": creator_name,
+    }
+    _port_id = port.id
+    _limit = min(max(limit, 1), 100)
+    _offset = offset
+    _since_id = since_id
+
+    def _record_to_dict(r):
+        return {
+            "id": r.id,
+            "port_id": r.port_id,
+            "method": r.method,
+            "path": r.path,
+            "request_headers": r.request_headers,
+            "request_body": r.request_body,
+            "response_headers": r.response_headers,
+            "response_body": r.response_body,
+            "status_code": r.status_code,
+            "duration_ms": r.duration_ms,
+            "reconstruction_error": r.reconstruction_error,
+            "created_at": r.created_at,
+        }
+
+    def stream_ndjson():
+        own_db = database.SessionLocal()
+        try:
+            query = (
+                own_db.query(RequestModel)
+                .options(defer(RequestModel.response_body_raw))
+                .filter(RequestModel.port_id == _port_id)
+            )
+            if _since_id > 0:
+                query = query.filter(RequestModel.id > _since_id)
+            query = query.order_by(RequestModel.created_at.desc())
+            if not (_since_id > 0):
+                # Offset only makes sense without since_id filtering
+                query = query.offset(_offset)
+            query = query.limit(_limit)
+
+            # Line 1 – port metadata
+            yield (
+                json.dumps(_port_dict, default=str, ensure_ascii=False) + "\n"
+            ).encode("utf-8")
+
+            # Subsequent lines – one record each
+            for r in query.yield_per(50):
+                rec = _record_to_dict(r)
+                yield (
+                    json.dumps(rec, default=str, ensure_ascii=False) + "\n"
+                ).encode("utf-8")
+        finally:
+            own_db.close()
+
+    return StreamingResponse(
+        stream_ndjson(),
+        media_type="application/x-ndjson",
     )
 
 
