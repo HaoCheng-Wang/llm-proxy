@@ -41,7 +41,7 @@ class UserInfo(BaseModel):
 class PortCreate(BaseModel):
     target_url: str = Field(..., min_length=5, max_length=500)
     description: str = Field(default="", max_length=200)
-    prefer_http2: bool = False  # False=HTTP/1.1 (stable, default), True=HTTP/2
+    prefer_http2: Optional[bool] = None  # None=HTTP/1.1, set later on edit
 
 
 class PortUpdate(BaseModel):
@@ -62,7 +62,7 @@ class PortInfo(BaseModel):
     target_url: str
     description: str
     is_active: bool
-    prefer_http2: bool = False
+    prefer_http2: Optional[bool] = None  # None/False=HTTP/1.1, True=HTTP/2
     deleted_at: Optional[datetime] = None
     created_at: datetime
     request_count: int = 0

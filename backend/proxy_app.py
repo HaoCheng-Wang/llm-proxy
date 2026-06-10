@@ -140,7 +140,7 @@ async def close_http2_client():
 
 # In-memory cache of port_number → (target_url, prefer_http2) mappings.
 # Refreshed from DB on startup and after PORT_CACHE_TTL seconds.
-_port_target_cache: dict[int, tuple[str, bool]] = {}
+_port_target_cache: dict[int, tuple[str, bool | None]] = {}
 _cache_updated_at: float = 0.0
 
 
@@ -177,7 +177,7 @@ def _maybe_refresh_cache():
         refresh_port_cache()
 
 
-def get_target_url(port_number: int) -> tuple[str, bool] | None:
+def get_target_url(port_number: int) -> tuple[str, bool | None] | None:
     """Get (target_url, prefer_http2) for a port. Falls back to DB.
 
     WARNING: This is a SYNC function — use ``aget_target_url()`` from async
@@ -214,7 +214,7 @@ async def _arefresh_port_cache():
     await loop.run_in_executor(None, refresh_port_cache)
 
 
-async def aget_target_url(port_number: int) -> tuple[str, bool] | None:
+async def aget_target_url(port_number: int) -> tuple[str, bool | None] | None:
     """Async: get (target_url, prefer_http2) for a port. Runs DB in thread pool."""
     if time.time() - _cache_updated_at <= PORT_CACHE_TTL:
         cache = _port_target_cache
