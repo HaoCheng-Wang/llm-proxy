@@ -18,6 +18,7 @@
               <th v-if="auth.isAdmin">创建者</th>
               <th>请求数</th>
               <th>状态</th>
+              <th>协议</th>
               <th>创建时间</th>
               <th>操作</th>
             </tr>
@@ -43,6 +44,12 @@
               <td>
                 <span :class="['badge', port.is_active ? 'badge-active' : 'badge-inactive']">
                   {{ port.is_active ? '运行中' : '已停止' }}
+                </span>
+              </td>
+              <td>
+                <span :class="['badge', port.prefer_http2 ? 'badge-http2' : 'badge-http11']"
+                      :title="port.prefer_http2 ? 'HTTP/2 多路复用 — 低延迟但有流中断风险，适合直连模型 API' : 'HTTP/1.1 独立连接 — 最稳定，适合中转站 / 高并发场景'">
+                  {{ port.prefer_http2 ? 'HTTP/2' : 'HTTP/1.1' }}
                 </span>
               </td>
               <td class="text-sm text-muted">{{ formatTime(port.created_at) }}</td>
@@ -132,6 +139,25 @@
             <input v-model="createForm.description" class="form-input"
                    placeholder="用于区分不同用途的代理" />
           </div>
+          <div class="form-group">
+            <label>🔗 转发协议 <span style="color:#e74c3c">*</span></label>
+            <div class="protocol-selector">
+              <label class="protocol-option" :class="{ active: !createForm.prefer_http2 }">
+                <input type="radio" v-model="createForm.prefer_http2" :value="false" />
+                <div class="protocol-info">
+                  <strong>HTTP/1.1</strong> — <span class="protocol-tag-stable">稳定推荐</span>
+                  <p class="protocol-desc">每个请求独占一条 TCP 连接，无 GOAWAY 中断风险。适合中转站（如 dmxapi.cn）和高并发场景，延迟略高（首次 TLS 握手 ~50ms）。</p>
+                </div>
+              </label>
+              <label class="protocol-option" :class="{ active: createForm.prefer_http2 }">
+                <input type="radio" v-model="createForm.prefer_http2" :value="true" />
+                <div class="protocol-info">
+                  <strong>HTTP/2</strong> — <span class="protocol-tag-risk">低延迟但可能中断</span>
+                  <p class="protocol-desc">多路复用：一条 TCP 连接并发多个请求，省 TLS 握手。但上游定期回收连接 (GOAWAY) 时可能中断正在传输的 SSE 流。仅适合直连 OpenAI/Anthropic 等模型 API。</p>
+                </div>
+              </label>
+            </div>
+          </div>
           <div v-if="createError" class="form-error">{{ createError }}</div>
           <div class="flex gap-8" style="justify-content:flex-end;margin-top:16px">
             <button type="button" class="btn btn-outline" @click="showCreateModal = false">取消</button>
@@ -159,6 +185,25 @@
             <input v-model="editForm.description" class="form-input"
                    placeholder="用于区分不同用途的代理" />
           </div>
+          <div class="form-group">
+            <label>🔗 转发协议 <span style="color:#e74c3c">*</span></label>
+            <div class="protocol-selector">
+              <label class="protocol-option" :class="{ active: editForm.prefer_http2 === false }">
+                <input type="radio" v-model="editForm.prefer_http2" :value="false" />
+                <div class="protocol-info">
+                  <strong>HTTP/1.1</strong> — <span class="protocol-tag-stable">稳定推荐</span>
+                  <p class="protocol-desc">每个请求独占一条 TCP 连接，无中断风险。适合中转站和高并发场景。</p>
+                </div>
+              </label>
+              <label class="protocol-option" :class="{ active: editForm.prefer_http2 === true }">
+                <input type="radio" v-model="editForm.prefer_http2" :value="true" />
+                <div class="protocol-info">
+                  <strong>HTTP/2</strong> — <span class="protocol-tag-risk">低延迟但可能中断</span>
+                  <p class="protocol-desc">多路复用省 TLS 握手，但上游回收连接时可能中断流。仅适合直连模型 API。</p>
+                </div>
+              </label>
+            </div>
+          </div>
           <div v-if="editError" class="form-error">{{ editError }}</div>
           <div class="flex gap-8" style="justify-content:flex-end;margin-top:16px">
             <button type="button" class="btn btn-outline" @click="showEditModal = false">取消</button>
@@ -183,12 +228,12 @@ const displayIp = ref('your-server-ip')
 const apiPort = ref(3998)
 const ports = ref([])
 const showCreateModal = ref(false)
-const createForm = ref({ target_url: '', description: '' })
+const createForm = ref({ target_url: '', description: '', prefer_http2: false })
 const createError = ref('')
 const creating = ref(false)
 
 const showEditModal = ref(false)
-const editForm = ref({ id: null, target_url: '', description: '' })
+const editForm = ref({ id: null, target_url: '', description: '', prefer_http2: false })
 const editError = ref('')
 const editing = ref(false)
 
@@ -206,7 +251,7 @@ async function handleCreate() {
   try {
     await api.createPort(createForm.value)
     showCreateModal.value = false
-    createForm.value = { target_url: '', description: '' }
+    createForm.value = { target_url: '', description: '', prefer_http2: false }
     showToast('代理创建成功！', 'success')
     await loadPorts()
   } catch (e) {
@@ -254,17 +299,23 @@ function openEdit(port) {
     id: port.id,
     target_url: port.target_url,
     description: port.description || '',
+    prefer_http2: port.prefer_http2 ?? false,
   }
   showEditModal.value = true
 }
 
 async function handleEdit() {
   editError.value = ''
+  if (editForm.value.prefer_http2 == null) {
+    editError.value = '请选择转发协议'
+    return
+  }
   editing.value = true
   try {
     await api.updatePort(editForm.value.id, {
       target_url: editForm.value.target_url,
       description: editForm.value.description,
+      prefer_http2: editForm.value.prefer_http2,
     })
     showEditModal.value = false
     showToast('代理配置已更新', 'success')

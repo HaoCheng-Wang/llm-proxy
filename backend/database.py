@@ -160,6 +160,16 @@ def _migrate_columns_on_engine(eng):
         except Exception:
             conn.rollback()
 
+        # Add prefer_http2 column to ports — user chooses HTTP/2 vs HTTP/1.1 per-port
+        try:
+            conn.execute(text(
+                "ALTER TABLE ports ADD COLUMN prefer_http2 TINYINT(1) NOT NULL DEFAULT 0"
+            ))
+            conn.commit()
+            print("[DB] Added column: ports.prefer_http2")
+        except Exception:
+            conn.rollback()
+
         for col in ["request_headers", "request_body", "response_headers",
                      "response_body", "response_body_raw"]:
             try:

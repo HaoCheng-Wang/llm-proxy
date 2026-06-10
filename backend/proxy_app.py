@@ -40,44 +40,41 @@ def _sanitize_text(value: str | None) -> str | None:
         return cleaned
 
 
-# Shared httpx client — HTTP/1.1, request-per-connection.
-# HTTP/2 multiplexing causes GOAWAY races: upstream LLM APIs periodically
-# recycle idle connections, and a mid-stream GOAWAY kills the response with
-# no way to retry.  HTTP/1.1 has no multiplexing → no GOAWAY → no mid-stream
-# disconnects.  The TLS handshake overhead (~50ms) is negligible compared to
-# typical LLM streaming latencies (seconds to minutes).
-_shared_client: httpx.AsyncClient | None = None
+# Shared httpx clients — HTTP/1.1 (default, stable) and HTTP/2 (opt-in per port).
+# HTTP/2 multiplexing causes GOAWAY races: upstream APIs (especially relays like
+# dmxapi.cn) periodically recycle idle connections, and a mid-stream GOAWAY
+# kills the response.  HTTP/1.1 is request-per-connection — no GOAWAY.
+# Users can opt into HTTP/2 per-port in the frontend when they trust the target.
+_shared_client: httpx.AsyncClient | None = None  # HTTP/1.1
+_http2_client: httpx.AsyncClient | None = None   # HTTP/2
 
 
 def init_shared_client() -> httpx.AsyncClient:
-    """Create (or return existing) shared httpx client.  Call at startup."""
+    """Create (or return existing) HTTP/1.1 client.  Call at startup."""
     global _shared_client
     if _shared_client is None:
         _shared_client = httpx.AsyncClient(
             timeout=httpx.Timeout(300.0, connect=15.0, read=120.0),
             limits=httpx.Limits(
-                max_connections=None,  # no artificial cap — OS ulimit is the limit
+                max_connections=None,
                 max_keepalive_connections=HTTPX_MAX_KEEPALIVE_CONNECTIONS,
             ),
             follow_redirects=False,
             verify=certifi.where(),
-            http2=False,  # HTTP/1.1 only — no GOAWAY, stable long streams
+            http2=False,
         )
         print(
-            "[Proxy] Shared HTTP client ready (HTTP/1.1, "
-            "max_connections=unlimited, "
-            f"keepalive={HTTPX_MAX_KEEPALIVE_CONNECTIONS}, "
-            "read_timeout=120s)",
+            "[Proxy] HTTP/1.1 client ready (max_connections=unlimited, "
+            f"keepalive={HTTPX_MAX_KEEPALIVE_CONNECTIONS}, read_timeout=120s)",
             file=sys.stderr,
         )
     return _shared_client
 
 
 def get_shared_client() -> httpx.AsyncClient:
-    """Get the shared httpx client (must be initialized at startup)."""
+    """Get the HTTP/1.1 shared client."""
     global _shared_client
     if _shared_client is None:
-        # Defensive fallback — should not happen in normal operation
         init_shared_client()
     return _shared_client
 
@@ -89,14 +86,51 @@ async def close_shared_client():
         _shared_client = None
 
 
-# In-memory cache of port_number → target_url mappings.
+def init_http2_client() -> httpx.AsyncClient:
+    """Create (or return existing) HTTP/2 client.  Call at startup."""
+    global _http2_client
+    if _http2_client is None:
+        _http2_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=15.0, read=300.0),
+            limits=httpx.Limits(
+                max_connections=None,
+                max_keepalive_connections=HTTPX_MAX_KEEPALIVE_CONNECTIONS,
+            ),
+            follow_redirects=False,
+            verify=certifi.where(),
+            http2=True,
+        )
+        print(
+            "[Proxy] HTTP/2 client ready (max_connections=unlimited, "
+            f"keepalive={HTTPX_MAX_KEEPALIVE_CONNECTIONS})",
+            file=sys.stderr,
+        )
+    return _http2_client
+
+
+def get_http2_client() -> httpx.AsyncClient:
+    """Get the HTTP/2 shared client."""
+    global _http2_client
+    if _http2_client is None:
+        init_http2_client()
+    return _http2_client
+
+
+async def close_http2_client():
+    global _http2_client
+    if _http2_client:
+        await _http2_client.aclose()
+        _http2_client = None
+
+
+# In-memory cache of port_number → (target_url, prefer_http2) mappings.
 # Refreshed from DB on startup and after PORT_CACHE_TTL seconds.
-_port_target_cache: dict[int, str] = {}
+_port_target_cache: dict[int, tuple[str, bool]] = {}
 _cache_updated_at: float = 0.0
 
 
 def refresh_port_cache(db=None):
-    """Refresh the port -> target_url cache from database."""
+    """Refresh the port_number → (target_url, prefer_http2) cache from DB."""
     global _port_target_cache, _cache_updated_at
     if db is None:
         db = database.SessionLocal()
@@ -104,14 +138,18 @@ def refresh_port_cache(db=None):
             ports = db.query(Port).filter(
                 Port.is_active.is_(True), Port.deleted_at.is_(None)
             ).all()
-            _port_target_cache = {p.port_number: p.target_url for p in ports}
+            _port_target_cache = {
+                p.port_number: (p.target_url, p.prefer_http2) for p in ports
+            }
         finally:
             db.close()
     else:
         ports = db.query(Port).filter(
             Port.is_active.is_(True), Port.deleted_at.is_(None)
         ).all()
-        _port_target_cache = {p.port_number: p.target_url for p in ports}
+        _port_target_cache = {
+            p.port_number: (p.target_url, p.prefer_http2) for p in ports
+        }
     _cache_updated_at = time.time()
 
 
@@ -124,16 +162,12 @@ def _maybe_refresh_cache():
         refresh_port_cache()
 
 
-def get_target_url(port_number: int) -> str | None:
-    """Get target URL for a port. Auto-refreshes stale cache, falls back to DB.
+def get_target_url(port_number: int) -> tuple[str, bool] | None:
+    """Get (target_url, prefer_http2) for a port. Falls back to DB.
 
-    WARNING: This is a SYNC function — it may perform blocking DB queries.
-    Use ``aget_target_url()`` from async contexts to avoid blocking the event loop.
+    WARNING: This is a SYNC function — use ``aget_target_url()`` from async
+    contexts to avoid blocking the event loop.
     """
-    # Check cache first (with TTL auto-refresh).
-    # Capture the dict reference ONCE to avoid a TOCTOU race where
-    # refresh_port_cache (running in a thread) replaces the dict between
-    # the membership check and the subscript lookup.
     _maybe_refresh_cache()
     cache = _port_target_cache
     if port_number in cache:
@@ -148,8 +182,9 @@ def get_target_url(port_number: int) -> str | None:
             Port.deleted_at.is_(None),
         ).first()
         if port:
-            _port_target_cache[port.port_number] = port.target_url
-            return port.target_url
+            entry = (port.target_url, port.prefer_http2)
+            _port_target_cache[port.port_number] = entry
+            return entry
         return None
     finally:
         db.close()
@@ -164,28 +199,18 @@ async def _arefresh_port_cache():
     await loop.run_in_executor(None, refresh_port_cache)
 
 
-async def aget_target_url(port_number: int) -> str | None:
-    """Async version of ``get_target_url`` — runs DB queries in a thread pool.
-
-    This is the function to use from async contexts (e.g. FastAPI route handlers)
-    to avoid blocking the asyncio event loop on synchronous DB operations.
-    """
-    # ── Fast path: cache hit ──
-    # Capture the dict reference ONCE to avoid a TOCTOU race where
-    # refresh_port_cache (running in a thread via _arefresh_port_cache)
-    # replaces the dict between the membership check and the subscript lookup.
+async def aget_target_url(port_number: int) -> tuple[str, bool] | None:
+    """Async: get (target_url, prefer_http2) for a port. Runs DB in thread pool."""
     if time.time() - _cache_updated_at <= PORT_CACHE_TTL:
         cache = _port_target_cache
         if port_number in cache:
             return cache[port_number]
     else:
-        # Cache TTL expired — refresh async (DB query in thread)
         await _arefresh_port_cache()
         cache = _port_target_cache
         if port_number in cache:
             return cache[port_number]
 
-    # ── Slow path: cache miss — async DB lookup ──
     loop = asyncio.get_running_loop()
 
     def _db_lookup():
@@ -197,9 +222,9 @@ async def aget_target_url(port_number: int) -> str | None:
                 Port.deleted_at.is_(None),
             ).first()
             if port:
-                # Update cache so subsequent lookups are fast
-                _port_target_cache[port.port_number] = port.target_url
-                return port.target_url
+                entry = (port.target_url, port.prefer_http2)
+                _port_target_cache[port.port_number] = entry
+                return entry
             return None
         finally:
             db.close()
@@ -302,6 +327,9 @@ __all__ = [
     "init_shared_client",
     "get_shared_client",
     "close_shared_client",
+    "init_http2_client",
+    "get_http2_client",
+    "close_http2_client",
     "refresh_port_cache",
     "get_target_url",
     "aget_target_url",
