@@ -14,7 +14,7 @@ import httpx
 import certifi
 import database
 from models import Port, Request as RequestModel
-from config import PORT_CACHE_TTL, HTTPX_MAX_CONNECTIONS, HTTPX_MAX_KEEPALIVE_CONNECTIONS
+from config import PORT_CACHE_TTL, HTTPX_MAX_KEEPALIVE_CONNECTIONS
 
 
 def _sanitize_text(value: str | None) -> str | None:
@@ -56,7 +56,7 @@ def init_shared_client() -> httpx.AsyncClient:
         _shared_client = httpx.AsyncClient(
             timeout=httpx.Timeout(300.0, connect=15.0, read=120.0),
             limits=httpx.Limits(
-                max_connections=HTTPX_MAX_CONNECTIONS,
+                max_connections=None,  # no artificial cap — OS ulimit is the limit
                 max_keepalive_connections=HTTPX_MAX_KEEPALIVE_CONNECTIONS,
             ),
             follow_redirects=False,
@@ -65,7 +65,7 @@ def init_shared_client() -> httpx.AsyncClient:
         )
         print(
             "[Proxy] Shared HTTP client ready (HTTP/1.1, "
-            f"max_connections={HTTPX_MAX_CONNECTIONS}, "
+            "max_connections=unlimited, "
             f"keepalive={HTTPX_MAX_KEEPALIVE_CONNECTIONS}, "
             "read_timeout=120s)",
             file=sys.stderr,
