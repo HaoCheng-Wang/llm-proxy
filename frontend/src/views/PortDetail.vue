@@ -23,16 +23,20 @@
         </span>
         <!-- Copy dropdown -->
         <div class="copy-dropdown" v-click-outside="closeCopyMenu">
-          <button class="btn btn-success btn-sm" @click="toggleCopyMenu" title="点击展开导出菜单 — 可导出 JSON 数据或完整交互记录">
-            📥 一键导出 ▾
+          <button class="btn btn-success btn-sm" @click="toggleCopyMenu"
+                  :disabled="exporting"
+                  title="点击展开导出菜单 — 可导出 JSON 数据或完整交互记录">
+            {{ exporting ? '⏳ 正在导出...' : '📥 一键导出 ▾' }}
           </button>
           <div v-if="copyMenuOpen" class="copy-menu">
             <div class="copy-menu-hint">导出当前分类下已加载的记录</div>
-            <div class="copy-menu-item" @click="exportJsonOnly">📄 仅导出JSON数据</div>
-            <div class="copy-menu-item" @click="exportAllData">📦 导出全部交互数据</div>
+            <div class="copy-menu-item" @click="exportJsonOnly" :class="{ disabled: exporting }">📄 仅导出JSON数据</div>
+            <div class="copy-menu-item" @click="exportAllData" :class="{ disabled: exporting }">📦 导出全部交互数据</div>
             <div class="copy-menu-divider"></div>
             <div class="copy-menu-hint">直接从后端导出（无需前端加载）</div>
-            <div class="copy-menu-item" @click="exportApiFromServer">🔄 从后端导出全部API请求JSON</div>
+            <div class="copy-menu-item" @click="exportApiFromServer" :class="{ disabled: exporting }">
+              {{ exporting ? '⏳ 正在从后端导出...' : '🔄 从后端导出全部API请求JSON' }}
+            </div>
           </div>
         </div>
         <button class="btn btn-danger btn-sm" @click="clearHistory">
@@ -240,6 +244,7 @@ const hasMore = ref(false)
 const scrollLocked = ref(false)
 const methodFilter = ref('all')
 const initialLoading = ref(true)
+const exporting = ref(false)  // server-side export in progress
 
 // API requests = POST/PUT/PATCH/DELETE (intelligent agent calls)
 // Other = GET/OPTIONS/HEAD (browser scans, probes, etc.)
@@ -472,6 +477,8 @@ function exportJsonOnly() {
 
 async function exportAllData() {
   closeCopyMenu()
+  if (exporting.value) return
+  exporting.value = true
   try {
     const exportData = await api.exportPortHistory(portId)
     // If filtered, only include filtered requests in full export too
@@ -491,11 +498,15 @@ async function exportAllData() {
     } catch (e2) {
       showToast('导出失败', 'error')
     }
+  } finally {
+    exporting.value = false
   }
 }
 
 async function exportApiFromServer() {
   closeCopyMenu()
+  if (exporting.value) return
+  exporting.value = true
   try {
     const exportData = await api.exportPortHistory(portId, 'api')
     // Extract only JSON data (request/response bodies), same as exportJsonOnly format
@@ -509,6 +520,8 @@ async function exportApiFromServer() {
     showToast(`已从后端导出 ${output.length} 条API请求JSON数据`, 'success')
   } catch (e) {
     showToast('后端导出失败', 'error')
+  } finally {
+    exporting.value = false
   }
 }
 
