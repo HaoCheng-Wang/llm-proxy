@@ -101,6 +101,7 @@ def list_deleted_ports(
             target_url=port.target_url,
             description=port.description or "",
             is_active=port.is_active,
+            prefer_http2=port.prefer_http2,
             deleted_at=port.deleted_at,
             created_at=port.created_at,
             request_count=count_map.get(port.id, 0),
