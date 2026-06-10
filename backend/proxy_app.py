@@ -40,44 +40,35 @@ def _sanitize_text(value: str | None) -> str | None:
         return cleaned
 
 
-# Shared httpx client with connection pooling — reused across all proxy requests.
-# Created eagerly at startup (via init_shared_client()) so the first proxy
-# request doesn't pay lazy-init overhead (certifi loading, etc.).
+# Shared httpx client — HTTP/1.1, request-per-connection.
+# HTTP/2 multiplexing causes GOAWAY races: upstream LLM APIs periodically
+# recycle idle connections, and a mid-stream GOAWAY kills the response with
+# no way to retry.  HTTP/1.1 has no multiplexing → no GOAWAY → no mid-stream
+# disconnects.  The TLS handshake overhead (~50ms) is negligible compared to
+# typical LLM streaming latencies (seconds to minutes).
 _shared_client: httpx.AsyncClient | None = None
-
-# Separate HTTP/1.1-only client for streaming requests.
-# HTTP/2 connection pooling suffers from GOAWAY races: upstream LLM APIs
-# periodically recycle idle connections, and a mid-stream GOAWAY kills
-# the response with no way to retry (data already sent to client).
-# HTTP/1.1 is request-per-connection — no multiplexing, no GOAWAY.
-_streaming_client: httpx.AsyncClient | None = None
 
 
 def init_shared_client() -> httpx.AsyncClient:
     """Create (or return existing) shared httpx client.  Call at startup."""
     global _shared_client
     if _shared_client is None:
-        # Try HTTP/2 first; fall back to HTTP/1.1 if h2 is not installed.
-        http2 = True
-        try:
-            import h2  # noqa: F401
-        except ImportError:
-            http2 = False
-            print(
-                "[Proxy] h2 not installed — using HTTP/1.1. "
-                "Install with: pip install httpx[http2]",
-                file=sys.stderr,
-            )
-
         _shared_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(300.0, connect=15.0),
+            timeout=httpx.Timeout(300.0, connect=15.0, read=120.0),
             limits=httpx.Limits(
                 max_connections=HTTPX_MAX_CONNECTIONS,
                 max_keepalive_connections=HTTPX_MAX_KEEPALIVE_CONNECTIONS,
             ),
             follow_redirects=False,
             verify=certifi.where(),
-            http2=http2,
+            http2=False,  # HTTP/1.1 only — no GOAWAY, stable long streams
+        )
+        print(
+            "[Proxy] Shared HTTP client ready (HTTP/1.1, "
+            f"max_connections={HTTPX_MAX_CONNECTIONS}, "
+            f"keepalive={HTTPX_MAX_KEEPALIVE_CONNECTIONS}, "
+            "read_timeout=120s)",
+            file=sys.stderr,
         )
     return _shared_client
 
@@ -96,53 +87,6 @@ async def close_shared_client():
     if _shared_client:
         await _shared_client.aclose()
         _shared_client = None
-
-
-def init_streaming_client() -> httpx.AsyncClient:
-    """Create (or return) HTTP/1.1-only client for streaming requests.
-
-    Why HTTP/1.1: LLM streaming (SSE) is a long-lived response.  Under
-    HTTP/2, the upstream may send GOAWAY mid-stream when recycling idle
-    connections — killing the response with no way to retry because data
-    has already been forwarded to the client.
-
-    HTTP/1.1 is request-per-connection: each stream owns its TCP socket.
-    No multiplexing means no GOAWAY.  The upstream can close the
-    connection after the response completes, but never during.
-    """
-    global _streaming_client
-    if _streaming_client is None:
-        _streaming_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(300.0, connect=15.0, read=120.0),
-            limits=httpx.Limits(
-                max_connections=HTTPX_MAX_CONNECTIONS,
-                max_keepalive_connections=0,  # no pooling — one conn per stream
-            ),
-            follow_redirects=False,
-            verify=certifi.where(),
-            http2=False,  # force HTTP/1.1
-        )
-        print(
-            "[Proxy] Streaming client ready (HTTP/1.1, keepalive=0, "
-            "read_timeout=120s)",
-            file=sys.stderr,
-        )
-    return _streaming_client
-
-
-def get_streaming_client() -> httpx.AsyncClient:
-    """Get the HTTP/1.1 streaming client (must be initialized at startup)."""
-    global _streaming_client
-    if _streaming_client is None:
-        init_streaming_client()
-    return _streaming_client
-
-
-async def close_streaming_client():
-    global _streaming_client
-    if _streaming_client:
-        await _streaming_client.aclose()
-        _streaming_client = None
 
 
 # In-memory cache of port_number → target_url mappings.
@@ -358,9 +302,6 @@ __all__ = [
     "init_shared_client",
     "get_shared_client",
     "close_shared_client",
-    "init_streaming_client",
-    "get_streaming_client",
-    "close_streaming_client",
     "refresh_port_cache",
     "get_target_url",
     "aget_target_url",
