@@ -173,7 +173,7 @@ def _migrate_columns_on_engine(eng):
         for idx_name, idx_sql in [
             ("ix_requests_port_id", "CREATE INDEX ix_requests_port_id ON requests (port_id)"),
             ("ix_requests_created_at", "CREATE INDEX ix_requests_created_at ON requests (created_at)"),
-            ("ix_requests_port_created", "CREATE INDEX ix_requests_port_created ON requests (port_id, created_at)"),
+            ("ix_requests_port_created", "CREATE INDEX ix_requests_port_created ON requests (port_id, created_at DESC)"),
 
         ]:
             try:
