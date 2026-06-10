@@ -139,8 +139,25 @@
             <input v-model="createForm.description" class="form-input"
                    placeholder="用于区分不同用途的代理" />
           </div>
-          <div class="form-group" style="padding:10px;background:rgba(46,204,113,0.06);border-radius:6px;border:1px solid rgba(46,204,113,0.15)">
-            <span style="font-size:13px;color:#85929e">创建后默认使用 <strong style="color:#2ecc71">HTTP/1.1</strong> 转发，可在编辑代理时修改为 HTTP/2</span>
+          <div class="form-group">
+            <label>🔗 转发协议 <span style="color:#e74c3c">*</span></label>
+            <p class="protocol-hint">目标是中转站（如 dmxapi.cn）必须选 HTTP/1.1；直连模型厂商 API 可选 HTTP/2</p>
+            <div class="protocol-selector">
+              <label class="protocol-option" :class="{ active: createForm.prefer_http2 === false }">
+                <input type="radio" v-model="createForm.prefer_http2" :value="false" />
+                <div class="protocol-info">
+                  <strong>HTTP/1.1</strong> — <span class="protocol-tag-stable">稳定推荐 · 无需担心中断</span>
+                  <p class="protocol-desc"><strong>原理</strong>：每个请求独占一条 TCP 连接，上游无法在中途切断。适合中转站（会定期回收连接）、高并发场景。延迟：首次 TLS 握手 ~50ms（有连接池复用后0ms）。</p>
+                </div>
+              </label>
+              <label class="protocol-option" :class="{ active: createForm.prefer_http2 === true }">
+                <input type="radio" v-model="createForm.prefer_http2" :value="true" />
+                <div class="protocol-info">
+                  <strong>HTTP/2</strong> — <span class="protocol-tag-risk">低延迟 · 中转站有中断风险</span>
+                  <p class="protocol-desc"><strong>原理</strong>：多条请求复用一条 TCP 连接，省 TLS 握手。但上游回收连接时，该连接上<strong>所有正在传输的 SSE 流会同时中断</strong>——数据已发给用户、无法重试。<strong>仅适合直连 OpenAI/Anthropic/Google 等不会激进回收连接的 API。</strong></p>
+                </div>
+              </label>
+            </div>
           </div>
           <div v-if="createError" class="form-error">{{ createError }}</div>
           <div class="flex gap-8" style="justify-content:flex-end;margin-top:16px">
@@ -213,7 +230,7 @@ const displayIp = ref('your-server-ip')
 const apiPort = ref(3998)
 const ports = ref([])
 const showCreateModal = ref(false)
-const createForm = ref({ target_url: '', description: '' })
+const createForm = ref({ target_url: '', description: '', prefer_http2: false })
 const createError = ref('')
 const creating = ref(false)
 
@@ -236,7 +253,7 @@ async function handleCreate() {
   try {
     await api.createPort(createForm.value)
     showCreateModal.value = false
-    createForm.value = { target_url: '', description: '' }
+    createForm.value = { target_url: '', description: '', prefer_http2: false }
     showToast('代理创建成功！', 'success')
     await loadPorts()
   } catch (e) {
