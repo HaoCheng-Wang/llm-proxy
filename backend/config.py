@@ -88,8 +88,10 @@ DB_LOG_MAX_OVERFLOW = int(os.getenv("DB_LOG_MAX_OVERFLOW", "20"))
 # 端口→目标URL缓存TTL（秒），到期后下次查询从DB刷新
 PORT_CACHE_TTL = int(os.getenv("PORT_CACHE_TTL", "5"))
 
-# httpx 连接池上限（代理转发时使用）
-HTTPX_MAX_CONNECTIONS = int(os.getenv("HTTPX_MAX_CONNECTIONS", "500"))
+# httpx keep-alive 空闲连接数。HTTP/1.1 下，请求完成后连接回到
+# 池中保持温热，后续请求直接复用，省去 TLS 握手。
+# max_connections 不设上限（httpx max_connections=None），由操作系统
+# ulimit（文件描述符数量）自然限制。
 HTTPX_MAX_KEEPALIVE_CONNECTIONS = int(os.getenv("HTTPX_MAX_KEEPALIVE_CONNECTIONS", "100"))
 
 # 代理 请求体 / 响应体 的内存缓冲上限（字节）。
