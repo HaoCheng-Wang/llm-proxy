@@ -4,12 +4,15 @@ Proxy Manager — tracks proxy port configurations in the database.
 In the shared-proxy architecture, there are no per-port servers to manage.
 All proxy traffic flows through a single shared endpoint that routes by
 port_number in the URL path. This module now only handles:
-  1. Port cache refresh (port_number → target_url mapping)
+  1. Port cache refresh (port_number → (target_url, prefer_http2) mapping)
   2. Database state queries
 """
+import logging
 import database
 from models import Port
 from proxy_app import refresh_port_cache
+
+logger = logging.getLogger("llm_proxy.proxy_manager")
 
 
 class ProxyManager:
@@ -42,4 +45,4 @@ class ProxyManager:
         """Refresh the port cache on startup."""
         refresh_port_cache()
         active_count = len(self.get_active_ports())
-        print(f"[ProxyManager] Loaded {active_count} active proxy configurations")
+        logger.info("Loaded %d active proxy configurations", active_count)
