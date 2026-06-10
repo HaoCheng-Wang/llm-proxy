@@ -123,6 +123,7 @@ def create_port(
             user_id=current_user.id,
             target_url=target_url,
             description=data.description,
+            prefer_http2=data.prefer_http2,
             is_active=True,
         )
         db.add(port)
@@ -147,6 +148,7 @@ def create_port(
         target_url=port.target_url,
         description=port.description or "",
         is_active=port.is_active,
+        prefer_http2=port.prefer_http2,
         created_at=port.created_at,
         request_count=0,
         username=current_user.username,
@@ -194,6 +196,7 @@ def list_ports(
             target_url=port.target_url,
             description=port.description or "",
             is_active=port.is_active,
+            prefer_http2=port.prefer_http2,
             created_at=port.created_at,
             request_count=count_map.get(port.id, 0),
             username=username_map.get(port.user_id, ""),
@@ -260,6 +263,7 @@ def get_port_history(
         "target_url": port.target_url,
         "description": port.description or "",
         "is_active": port.is_active,
+        "prefer_http2": port.prefer_http2,
         "deleted_at": port.deleted_at,
         "created_at": port.created_at,
         "request_count": request_count,
@@ -457,6 +461,9 @@ def update_port(
         if data.description is not None:
             port.description = data.description
 
+        if data.prefer_http2 is not None:
+            port.prefer_http2 = data.prefer_http2
+
         if new_port_number is not None and new_port_number != port.port_number:
             port.port_number = new_port_number
 
@@ -486,6 +493,7 @@ def update_port(
         target_url=port.target_url,
         description=port.description or "",
         is_active=port.is_active,
+        prefer_http2=port.prefer_http2,
         created_at=port.created_at,
         request_count=request_count,
         username=current_user.username,

@@ -27,6 +27,7 @@ class Port(Base):
     target_url = Column(String(500), nullable=False)
     description = Column(String(200), default="")
     is_active = Column(Boolean, default=True)
+    prefer_http2 = Column(Boolean, default=False)  # False=HTTP/1.1 (stable), True=HTTP/2 (multiplex)
     deleted_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 

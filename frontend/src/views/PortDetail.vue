@@ -52,6 +52,13 @@
         <div><span class="text-muted">描述：</span>{{ data.port.description || '-' }}</div>
         <div><span class="text-muted">编号：</span><code>{{ data.port.port_number }}</code></div>
         <div><span class="text-muted">总请求数：</span>{{ data.port.request_count }}</div>
+        <div>
+          <span class="text-muted">转发协议：</span>
+          <span :class="['badge', data.port.prefer_http2 ? 'badge-http2' : 'badge-http11']"
+                :title="data.port.prefer_http2 ? 'HTTP/2 多路复用 — 低延迟但有流中断风险' : 'HTTP/1.1 独立连接 — 最稳定，无中断风险'">
+            {{ data.port.prefer_http2 ? 'HTTP/2' : 'HTTP/1.1' }}
+          </span>
+        </div>
         <div><span class="text-muted">创建时间：</span>{{ formatTime(data.port.created_at) }}</div>
         <div>
           <span class="text-muted">代理地址：</span>

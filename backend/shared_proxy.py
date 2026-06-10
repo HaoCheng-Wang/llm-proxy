@@ -23,6 +23,7 @@ from fastapi.responses import Response, JSONResponse, StreamingResponse
 
 from proxy_app import (
     get_shared_client,
+    get_http2_client,
     _reconstruct_sse_to_json,
     aget_target_url,
     _serialize_body,
@@ -51,13 +52,14 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
     """
     start_time = time.time()
 
-    # Look up target URL for this port_number (async — DB query in thread pool)
-    target_url = await aget_target_url(port_number)
-    if not target_url:
+    # Look up target URL + protocol preference for this port number
+    _port_config = await aget_target_url(port_number)
+    if not _port_config:
         return JSONResponse(
             {"error": f"No active proxy configured for port {port_number}"},
             status_code=404,
         )
+    target_url, prefer_http2 = _port_config
 
     # Build the actual forward path (strip the /{port_number} prefix)
     forward_path = "/" + path if path else "/"
@@ -109,11 +111,21 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
     stream_ctx = None
 
     try:
+        # --- Choose HTTP client (per-port preference) ──────────
+        if prefer_http2:
+            client = get_http2_client()
+            logger.debug(
+                "Using HTTP/2 client for %s #%d → %s",
+                request.method, port_number, target_url,
+            )
+        else:
+            client = get_shared_client()
+            logger.debug(
+                "Using HTTP/1.1 client for %s #%d → %s",
+                request.method, port_number, target_url,
+            )
+
         # --- Initial stream creation (retry once when connection is dead) ---
-        # httpx connection pool may hand out a stale connection.
-        # client.stream() or __aenter__() then fails before any data flows
-        # — before the inner aiter_bytes() retry loops can see it.
-        client = get_shared_client()
         _RETRYABLE_INIT = (httpx.RemoteProtocolError, httpx.ConnectError)
         for _init_attempt in range(2):
             try:
