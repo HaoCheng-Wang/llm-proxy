@@ -22,7 +22,7 @@ from config import (
     API_PORT, CORS_ORIGINS,
 )
 from proxy_manager import ProxyManager
-from proxy_app import close_shared_client, init_shared_client
+from proxy_app import close_shared_client, close_streaming_client, init_shared_client, init_streaming_client
 
 
 # Configure structured logging for the proxy module.
@@ -55,18 +55,23 @@ async def lifespan(app: FastAPI):
     print("[Main] Loading proxy configurations from database...")
     await proxy_manager.restore_from_database()
 
-    # Pre-create the shared httpx client (HTTP/2, connection pool, certifi).
-    # Avoids lazy-init overhead on the first proxy request.
-    print("[Main] Initializing shared HTTP client...")
+    # Pre-create shared httpx clients (avoid lazy-init on first request).
+    # - Shared client:  HTTP/2, connection pool — for non-streaming requests
+    # - Streaming client: HTTP/1.1, no keepalive — avoids mid-stream GOAWAY
+    print("[Main] Initializing shared HTTP client (HTTP/2)...")
     init_shared_client()
+    print("[Main] Initializing streaming HTTP client (HTTP/1.1)...")
+    init_streaming_client()
 
     print(f"[Main] Management API + Shared Proxy ready on port {API_PORT}")
     print(f"[Main] Proxy URL format: http://<server>:{API_PORT}/<port_number>/v1/...")
     yield
 
     # Shutdown
-    print("[Main] Closing shared HTTP client...")
+    print("[Main] Closing shared HTTP client (HTTP/2)...")
     await close_shared_client()
+    print("[Main] Closing streaming HTTP client (HTTP/1.1)...")
+    await close_streaming_client()
 
     print("[Main] Disposing database connection pools...")
     if database.engine:

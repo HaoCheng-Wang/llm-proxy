@@ -15,6 +15,7 @@ import time
 import json
 import asyncio
 import logging
+import re
 import tempfile
 import httpx
 from urllib.parse import urlparse
@@ -23,6 +24,7 @@ from fastapi.responses import Response, JSONResponse, StreamingResponse
 
 from proxy_app import (
     get_shared_client,
+    get_streaming_client,
     _reconstruct_sse_to_json,
     aget_target_url,
     _serialize_body,
@@ -33,6 +35,27 @@ from config import PROXY_BODY_MEMORY_LIMIT
 
 logger = logging.getLogger("llm_proxy.proxy")
 logger.setLevel(logging.DEBUG)
+
+
+def _wants_streaming(body_bytes: bytes) -> bool:
+    """Heuristic: does the request body ask for SSE streaming?
+
+    LLM APIs (OpenAI, Anthropic, DeepSeek, etc.) use ``"stream": true``
+    in the JSON body to request a server-sent-events response.  This
+    check is a fast substring scan — no full JSON parse — and is only
+    used to decide which HTTP client to pick.
+    """
+    if not body_bytes:
+        return False
+    try:
+        text = body_bytes.decode("utf-8", errors="replace")
+        if '"stream"' not in text:
+            return False
+        # Match "stream":true, "stream": true, "stream":True (any whitespace)
+        return bool(re.search(r'"stream"\s*:\s*true', text, re.IGNORECASE))
+    except Exception:
+        return False
+
 
 router = APIRouter()
 
@@ -108,15 +131,29 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
     stream_ctx = None
 
     try:
+        # --- Choose HTTP client ─────────────────────────────────
+        # Streaming requests (SSE, long-lived) use HTTP/1.1 to avoid
+        # mid-stream GOAWAY.  Non-streaming uses HTTP/2 for multiplexing.
+        _wants_stream = _wants_streaming(body)
+        if _wants_stream:
+            client = get_streaming_client()
+            logger.debug(
+                "Using HTTP/1.1 streaming client for %s #%d → %s",
+                request.method, port_number, target_full_url,
+            )
+        else:
+            client = get_shared_client()
+
         # --- Initial stream creation (retry once when connection is dead) ---
         # httpx connection pool may hand out a connection that the upstream
         # has already GOAWAY'd.  client.stream() or __aenter__() then fails
         # with RemoteProtocolError before any data flows — before the inner
         # aiter_bytes() retry loops can see it.  Retry once at this level.
+        # (HTTP/1.1 client is less prone to this but the retry still helps
+        # against general connectivity glitches.)
         _RETRYABLE_INIT = (httpx.RemoteProtocolError, httpx.ConnectError)
         for _init_attempt in range(2):
             try:
-                client = get_shared_client()
                 stream_ctx = client.stream(
                     method=request.method,
                     url=target_full_url,
