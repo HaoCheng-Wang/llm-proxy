@@ -490,6 +490,17 @@ function downloadJson(filename, data) {
   URL.revokeObjectURL(url)
 }
 
+function downloadBlob(filename, blob) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
 function getExportFilename(suffix) {
   const port = data.value.port?.port_number || 'unknown'
   const filterLabel = methodFilter.value === 'api' ? '-api' : methodFilter.value === 'other' ? '-other' : ''
@@ -525,21 +536,28 @@ async function exportAllData() {
   if (exporting.value) return
   exporting.value = true
   try {
-    const exportData = await api.exportPortHistory(portId)
-    // If filtered, only include filtered requests in full export too
-    if (methodFilter.value !== 'all') {
+    // 无客户端过滤时走 Blob 直通路径：后端流式发送 → fetch 流式接收 → 直接写入磁盘
+    // 跳过 JSON.parse / JSON.stringify，零拷贝，不受 axios 30s 超时限制
+    if (methodFilter.value === 'all' || methodFilter.value === 'api') {
+      const serverFilter = methodFilter.value === 'api' ? 'api' : 'all'
+      const blob = await api.exportPortHistoryBlob(portId, serverFilter)
+      downloadBlob(getExportFilename('full'), blob)
+      showToast('已导出全部数据', 'success')
+    } else {
+      // 'other' 过滤器需要前端筛选，必须解析 JSON
+      const exportData = await api.exportPortHistory(portId)
       const filteredIds = new Set(_getExportRequests().map(r => r.id))
       exportData.requests = (exportData.requests || []).filter(r => filteredIds.has(r.id))
       exportData.total_requests = exportData.requests.length
+      downloadJson(getExportFilename('full'), exportData)
+      showToast(`已导出 ${exportData.total_requests} 条完整交互记录`, 'success')
     }
-    downloadJson(getExportFilename('full'), exportData)
-    const label = methodFilter.value === 'all' ? '' : ` (${methodFilter.value === 'api' ? '仅API请求' : '仅其他请求'})`
-    showToast(`已导出 ${exportData.total_requests} 条完整交互记录${label}`, 'success')
   } catch (e) {
+    // 降级：从已加载的分页数据中导出
     try {
       const source = _getExportRequests()
       downloadJson(getExportFilename('full'), { port: data.value.port, requests: source, total_requests: source.length })
-      showToast('已导出全部数据', 'success')
+      showToast('已导出全部数据（当前页面数据）', 'success')
     } catch (e2) {
       showToast('导出失败', 'error')
     }
@@ -553,8 +571,8 @@ async function exportApiFromServer() {
   if (exporting.value) return
   exporting.value = true
   try {
+    // 需要转换数据格式，使用 fetch 流式接收 + 解析（无 axios 超时限制）
     const exportData = await api.exportPortHistory(portId, 'api')
-    // Extract only JSON data (request/response bodies), same as exportJsonOnly format
     const output = (exportData.requests || []).map((r, i) => {
       const entry = { index: i + 1, method: r.method, path: r.path, status_code: r.status_code }
       entry.request = typeof r.request_body === 'string' ? (tryParseJson(r.request_body) ?? r.request_body) : r.request_body
