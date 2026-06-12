@@ -10,6 +10,7 @@
 - [安全设计](#安全设计)
 - [高并发设计](#高并发设计)
 - [SSE 流式处理](#sse-流式处理)
+- [大数据量导出：端到端流式架构](#大数据量导出端到端流式架构)
 - [部署方式](#部署方式)
 - [API 接口](#api-接口)
 - [环境变量](#环境变量)
@@ -335,7 +336,7 @@ SpooledTemporaryFile 在小于 `PROXY_BODY_MEMORY_LIMIT`（默认 10 MB）时完
 
 ### 数据库连接池设计
 
-整个系统使用 **两套独立的 SQLAlchemy 连接池**：
+整个系统使用 **三套独立的 SQLAlchemy 连接池**：
 
 ```
 ┌─ engine (DB_POOL_SIZE=20, DB_MAX_OVERFLOW=40)
@@ -343,13 +344,19 @@ SpooledTemporaryFile 在小于 `PROXY_BODY_MEMORY_LIMIT`（默认 10 MB）时完
 │   用途：FastAPI 管理路由 → 用户登录、端口 CRUD、历史查询
 │   调用方：浏览器触发的 /api/* 请求
 │
-└─ _log_engine (DB_LOG_POOL_SIZE=10, DB_LOG_MAX_OVERFLOW=20)
+├─ _log_engine (DB_LOG_POOL_SIZE=10, DB_LOG_MAX_OVERFLOW=20)
+│   连接同一个 MySQL
+│   用途：代理日志写入 → 写 requests
+│   调用方：代理转发线程
+│
+└─ _stream_engine (pool_size=5, max_overflow=5)
     连接同一个 MySQL
-    用途：代理日志写入 → 写 requests
-    调用方：代理转发线程
+    用途：大数据量流式查询 → 端口历史导出
+    特性：pymysql SSCursor (server-side cursor)，逐批拉取行，不一次性加载到内存
+    调用方：导出接口 GET /api/ports/{id}/export
 ```
 
-**为什么要两套？**
+**为什么要三套？**
 
 ```mermaid
 flowchart LR
@@ -362,18 +369,78 @@ flowchart LR
         D[100个流同时结束]
         E[INSERT requests]
     end
+    subgraph 流式导出
+        F[大数据量导出]
+        G[SSCursor 逐批拉取]
+    end
     A --> engine[(engine 20)]
     B --> engine
     C --> engine
     D --> log[(log_engine 10)]
     E --> log
+    F --> stream[(stream_engine 5)]
+    G --> stream
 ```
 
-如果共用一套连接池，100 个 SSE 流同时结束的瞬间——每个流一次 `INSERT requests`——可能暂时耗尽池中连接。此时管理员尝试登录，发现**无连接可用**，只能排队等 30 秒超时。两套池完全隔离后，日志写入再繁忙，管理接口始终有 20 个空闲连接待命。
+如果共用一套连接池，100 个 SSE 流同时结束的瞬间——每个流一次 `INSERT requests`——可能暂时耗尽池中连接。此时管理员尝试登录，发现**无连接可用**，只能排队等 30 秒超时。三套池完全隔离后，日志写入再繁忙，管理接口始终有 20 个空闲连接待命。
+
+流式导出使用第三套池，原因是 **pymysql SSCursor 的约束**：SSCursor 在读取完所有行之前不能在同一连接上执行其他查询。如果导出使用了管理池的连接，可能导致其他请求无法读取数据。独立小池（5+5）确保导出不阻塞其他操作。
 
 **日志专用线程池**
 
 代理日志写入（`_save_to_db`）使用 `database._db_executor`（`DB_SAVE_WORKERS=8` 个线程），而非 asyncio 的默认线程池。这样日志写入任务之间互不争抢，且不会占满 asyncio 默认线程池影响其他操作。
+
+### 大数据量导出：端到端流式架构
+
+端口交互历史导出（`GET /api/ports/{id}/export`）面临的核心挑战是：一个端口可能积累数万条记录，每行包含 LONGTEXT 字段。传统做法（后端全量查询 → 内存组装 → 一次性返回 → 前端解析）在数据量大时必然超时或 OOM。
+
+本系统的导出采用**四层真流式**，每层都不缓存、不阻塞：
+
+```mermaid
+flowchart LR
+    subgraph MySQL
+        A[(requests 表)] -->|"SSCursor<br/>逐批拉取<br/>每批 ~100 行"| B
+    end
+    subgraph Python
+        B[yield_per 迭代器] -->|"json.dumps<br/>立即序列化"| C
+    end
+    subgraph FastAPI
+        C[StreamingResponse] -->|"逐 chunk yield<br/>零内存累积"| D
+    end
+    subgraph nginx
+        D -->|"proxy_read_timeout=0<br/>不限时转发"| E
+    end
+    subgraph 浏览器
+        E -->|"fetch + Blob<br/>零 JSON 解析<br/>直接写磁盘"| F[(用户硬盘)]
+    end
+```
+
+#### 各层关键设计
+
+| 层 | 技术选型 | 为什么 | 超时 |
+|---|---|---|---|
+| MySQL → Python | `pymysql.cursors.SSCursor` | 服务端游标，不在 MySQL 客户端缓冲全部行 | `read_timeout=300s`（每批是 100 行小查询） |
+| Python → FastAPI | `StreamingResponse` + `yield_per(100)` | 读取一批立即发送一批，内存同时只有 ~100 行 | 无 (uvicorn 不限时) |
+| nginx | 导出路由独立 `location` 块 | 专用路由不限时，不影响其他 API | `proxy_read_timeout=0`（不限时） |
+| 浏览器 | `fetch` + `r.blob()` | 绕过 axios 的 30s 超时和整响应缓冲，浏览器原生流式接收 | 无 (浏览器默认不限时) |
+
+#### 两条导出路径
+
+```
+导出方式          all / api 过滤器             other 过滤器
+─────────────────  ─────────────────────────  ───────────────────────
+数据路径           后端全量流式 → 前端直写磁盘    后端全量流式 → 前端解析 JSON
+处理               零拷贝（Blob 直通）           前端过滤 + 重组
+API 调用            exportPortHistoryBlob()     exportPortHistory()
+内存占用            浏览器 ~O(1)                 浏览器 O(n)（需解析过滤）
+降级策略            已加载分页数据导出             已加载分页数据导出
+```
+
+`all` 和 `api` 过滤器走 Blob 直通路径是因为后端可以根据 `method_filter` 参数完成过滤，前端无需二次处理。`other`（非 API 方法）过滤器后端不支持，需要前端解析 JSON 后筛选。
+
+#### 为什么不用 axios
+
+axios 的 `timeout` 是**整个请求-响应的总时限**，不是"每两次读取之间"的时限。导出 5 万条数据可能需要几分钟，无法预知上限。axios 还在内存中缓冲整响应（`r.data` = `JSON.parse(responseText)`），数据量大时二次序列化开销也不可忽略。改用 `fetch` + `r.blob()` 后，浏览器直接将 HTTP 响应流写入磁盘，不经过 JavaScript 解析。
 
 ### 请求头转发规则
 
@@ -850,7 +917,7 @@ llm-proxy/
 ├── backend/                 # Python FastAPI 后端
 │   ├── main.py              # 入口：启动 FastAPI + 注册路由 + lifespan
 │   ├── config.py            # 读取 .env 环境变量
-│   ├── database.py          # 自动建库建表 + 双连接池 + 迁移
+│   ├── database.py          # 自动建库建表 + 三连接池（管理/日志/流式导出）+ 迁移
 │   ├── models.py            # ORM 模型（User / Port / Request）
 │   ├── schemas.py           # Pydantic 请求/响应模型
 │   ├── auth.py              # JWT 认证 + bcrypt 密码哈希
@@ -861,7 +928,7 @@ llm-proxy/
 │   └── routers/
 │       ├── auth_router.py   # 注册/登录/用户信息/修改密码
 │       ├── admin_router.py  # 用户审批 + 已删除端口管理
-│       ├── ports_router.py  # 端口 CRUD + 软删除 + 停用/启用 + 历史查询
+│       ├── ports_router.py  # 端口 CRUD + 软删除 + 停用/启用 + 历史查询 + 流式导出
 │       └── config_router.py # 前端配置（display_ip）
 │
 └── frontend/                # Vue 3 前端
@@ -872,16 +939,16 @@ llm-proxy/
         ├── main.js          # Vue 入口
         ├── App.vue          # 根组件（导航栏 + toast）
         ├── style.css        # 全局样式
-        ├── api/index.js     # axios 封装 + 拦截器
+        ├── api/index.js     # axios 封装 + fetch 流式导出 + 拦截器
         ├── stores/auth.js   # Pinia 认证状态
         ├── router/index.js  # 路由配置 + 守卫
         ├── components/
         │   └── JsonTree.vue # JSON 树形查看组件
         └── views/
-            ├── Login.vue         # 登录页
-            ├── Register.vue      # 注册页
+            ├── Login.vue          # 登录页
+            ├── Register.vue       # 注册页
             ├── Dashboard.vue     # 代理列表 + 创建
-            ├── PortDetail.vue    # 代理详情 + 交互记录
+            ├── PortDetail.vue    # 代理详情 + 交互记录 + 流式导出
             ├── JsonTreeViewer.vue # JSON 树形查看器
             ├── Admin.vue         # 用户管理
             ├── DeletedPorts.vue  # 已删除代理管理
@@ -896,7 +963,7 @@ llm-proxy/
 | 交互筛选 | 按请求方法分类：`📤 API请求`（POST/PUT/PATCH/DELETE）vs `🌐 其他`（GET/OPTIONS/HEAD） |
 | JSON 树形查看 | 基于 `vue-json-pretty`，请求和响应 JSON 各有独立树形查看按钮，支持折叠/展开/搜索 |
 | 重建异常审查 | 当 `reconstruction_error=True` 时显示橙色警告横幅，提供"查看完整 SSE 原始文本"按钮 |
-| 一键导出 | 可选仅导出 JSON 数据或完整交互含 HTTP 头；支持从后端直接导出全部 API 请求 JSON |
+| 一键导出 | 三合一：JSON 数据导出 / **流式全量导出**（fetch + Blob 直通，零 JSON 解析，无超时限制）/ 后端全量 API 请求导出 |
 | 分页加载 | 首次加载 10 条，支持"加载更多"和"加载全部"，上限 100 条/次 |
 | 滚动保护 | 阅读交互记录时新数据到达不跳动滚动位置 |
 
@@ -932,7 +999,7 @@ llm-proxy/
 | DELETE | `/api/ports/{id}/history/{req_id}` | 删除单条记录 |
 | GET | `/api/ports/{id}/history/{req_id}` | 获取单条记录详情 |
 | GET | `/api/ports/{id}/history/{req_id}/raw-sse` | 按需获取原始 SSE 文本 |
-| GET | `/api/ports/{id}/export` | 流式导出全部交互 JSON |
+| GET | `/api/ports/{id}/export` | 流式导出全部交互 JSON（SSCursor 逐批拉取 + StreamingResponse，无内存瓶颈） |
 
 ### 管理员
 

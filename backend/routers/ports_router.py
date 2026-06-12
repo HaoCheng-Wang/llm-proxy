@@ -676,8 +676,9 @@ def export_port_history(
         return entry
 
     def stream_jsonl():
-        # OWN session — lives as long as the generator is iterated.
-        own_db = database.SessionLocal()
+        # OWN session with server-side cursor (SSCursor) — fetches rows from MySQL
+        # incrementally instead of loading the full result set into memory.
+        own_db = database.StreamSessionLocal()
         try:
             query = (
                 own_db.query(RequestModel)

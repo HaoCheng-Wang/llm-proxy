@@ -67,6 +67,27 @@ def _init_engine():
     )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+    # Dedicated session for streaming/large-result queries.
+    # Uses pymysql SSCursor (server-side cursor) so rows are fetched incrementally
+    # instead of loading the entire result set into memory.  A separate engine with
+    # its own small pool prevents SSCursor connections from leaking into the normal
+    # pool (SSCursor requires reading all rows before the next query).
+    global _stream_engine, StreamSessionLocal
+    _stream_engine = create_engine(
+        DATABASE_URL,
+        pool_size=5,
+        max_overflow=5,
+        pool_pre_ping=True,
+        pool_recycle=600,
+        connect_args={
+            "connect_timeout": 10,
+            "read_timeout": 300,   # generous — each SSCursor batch fetch is tiny
+            "write_timeout": 60,
+            "cursorclass": pymysql.cursors.SSCursor,
+        },
+    )
+    StreamSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_stream_engine)
+
 
 def _init_log_engine():
     """Create a dedicated engine + sessionmaker for proxy request logging.

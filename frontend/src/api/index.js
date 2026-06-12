@@ -29,6 +29,30 @@ http.interceptors.response.use(
   }
 )
 
+// 导出的通用 fetch 封装：无超时限制，利用浏览器原生 HTTP 流式接收
+// 后端 StreamingResponse 逐块发送，fetch 原生支持背压，不会像 axios 那样缓冲整响应
+async function _exportFetch(portId, methodFilter = 'all') {
+  const params = new URLSearchParams()
+  if (methodFilter !== 'all') params.set('method_filter', methodFilter)
+  const qs = params.toString()
+  const url = `/api/ports/${portId}/export${qs ? '?' + qs : ''}`
+  const token = localStorage.getItem('token')
+  const headers = token ? { Authorization: `Bearer ${token}` } : {}
+
+  const response = await fetch(url, { headers })
+  if (response.status === 401) {
+    localStorage.removeItem('token'); localStorage.removeItem('username')
+    localStorage.removeItem('role'); localStorage.removeItem('userId')
+    window.location.href = '/login'
+    throw new Error('Unauthorized')
+  }
+  if (!response.ok) {
+    const text = await response.text()
+    throw new Error(text || `HTTP ${response.status}`)
+  }
+  return response
+}
+
 export default {
   // Auth
   login: (data) => http.post('/auth/login', data).then(r => r.data),
@@ -105,9 +129,16 @@ export default {
   deleteRequest: (portId, requestId) => http.delete(`/ports/${portId}/history/${requestId}`).then(r => r.data),
   getSingleRequest: (portId, requestId) => http.get(`/ports/${portId}/history/${requestId}`).then(r => r.data),
   getRawSse: (portId, requestId) => http.get(`/ports/${portId}/history/${requestId}/raw-sse`).then(r => r.data),
+
+  // 导出：使用 fetch 替代 axios，消除超时限制，利用浏览器原生 HTTP 流
+  // 后端 StreamingResponse 逐块发送，fetch 原生支持流式接收，不经过 axios 缓冲
+  exportPortHistoryBlob: (portId, methodFilter = 'all') => {
+    return _exportFetch(portId, methodFilter).then(r => r.blob())
+  },
+
+  // 获取解析后的 JSON，用于需要过滤/转换的导出场景
   exportPortHistory: (portId, methodFilter = 'all') => {
-    const params = methodFilter !== 'all' ? { method_filter: methodFilter } : {}
-    return http.get(`/ports/${portId}/export`, { params }).then(r => r.data)
+    return _exportFetch(portId, methodFilter).then(r => r.json())
   },
   getActivePorts: () => http.get('/ports/active-ports').then(r => r.data),
 
