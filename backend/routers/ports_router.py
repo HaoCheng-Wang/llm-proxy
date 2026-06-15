@@ -889,6 +889,7 @@ def export_port_history(
             "Export stream: SSCursor session acquired in %.3fs",
             _t_session - _t_stream_enter,
         )
+        _row_count = 0  # mutable so the except block can report how far we got
         try:
             query = (
                 own_db.query(RequestModel)
@@ -921,35 +922,56 @@ def export_port_history(
                 yield b"["
                 first = True
                 idx = 0
-                for r in query.yield_per(100):
-                    idx += 1
-                    if _first_row:
-                        _t_first = time.time() - _start_ts
-                        _first_row = False
-                        logger.info(
-                            "Export first row: port=%d time_to_first_row=%.2fs "
-                            "(MySQL query execution + first fetch from SSCursor)",
-                            _port_number, _t_first,
-                        )
-                    if not first:
+                try:
+                    for r in query.yield_per(100):
+                        idx += 1
+                        _row_count = idx
+                        if _first_row:
+                            _t_first = time.time() - _start_ts
+                            _first_row = False
+                            logger.info(
+                                "Export first row: port=%d time_to_first_row=%.2fs "
+                                "(MySQL query execution + first fetch from SSCursor)",
+                                _port_number, _t_first,
+                            )
+                        if not first:
+                            yield b","
+                        first = False
+                        yield _build_simple_row(r, idx)
+                        if idx >= _next_report:
+                            now = time.time()
+                            pct = (idx / total_count * 100) if total_count > 0 else 0
+                            interval_s = now - _t_last_report
+                            interval_rows = _report_every
+                            logger.info(
+                                "Export progress: port=%d %d/%d (%.0f%%) "
+                                "elapsed=%.1fs interval=[%d rows in %.1fs, %.0f rows/s]",
+                                _port_number, idx, total_count, pct,
+                                now - _start_ts, interval_rows, interval_s,
+                                interval_rows / interval_s if interval_s > 0 else 0,
+                            )
+                            _next_report += _report_every
+                            _t_last_report = now
+                    yield b"]"
+                except Exception as _export_err:
+                    elapsed = time.time() - _start_ts
+                    logger.error(
+                        "Export interrupted: port=%d %d/%d rows in %.1fs — %s: %s",
+                        _port_number, _row_count, total_count, elapsed,
+                        type(_export_err).__name__, _export_err,
+                    )
+                    # Close the JSON array with an error sentinel so the
+                    # downloaded file is still valid JSON (partial data).
+                    if _row_count > 0:
                         yield b","
-                    first = False
-                    yield _build_simple_row(r, idx)
-                    if idx >= _next_report:
-                        now = time.time()
-                        pct = (idx / total_count * 100) if total_count > 0 else 0
-                        interval_s = now - _t_last_report
-                        interval_rows = _report_every
-                        logger.info(
-                            "Export progress: port=%d %d/%d (%.0f%%) "
-                            "elapsed=%.1fs interval=[%d rows in %.1fs, %.0f rows/s]",
-                            _port_number, idx, total_count, pct,
-                            now - _start_ts, interval_rows, interval_s,
-                            interval_rows / interval_s if interval_s > 0 else 0,
-                        )
-                        _next_report += _report_every
-                        _t_last_report = now
-                yield b"]"
+                    _err_obj = json.dumps({
+                        "_export_error": "incomplete",
+                        "rows_received": _row_count,
+                        "total_expected": total_count,
+                        "error": f"{type(_export_err).__name__}: {_export_err}",
+                    }, ensure_ascii=False).encode("utf-8")
+                    yield _err_obj
+                    yield b"]"
             else:
                 # Full: {"port":{...},"total_requests":N,"requests":[...]}
                 yield b'{"port":'
@@ -963,35 +985,56 @@ def export_port_history(
 
                 first = True
                 row = 0
-                for r in query.yield_per(100):
-                    row += 1
-                    if _first_row:
-                        _t_first = time.time() - _start_ts
-                        _first_row = False
-                        logger.info(
-                            "Export first row: port=%d time_to_first_row=%.2fs "
-                            "(MySQL query execution + first fetch from SSCursor)",
-                            _port_number, _t_first,
-                        )
-                    if not first:
+                try:
+                    for r in query.yield_per(100):
+                        row += 1
+                        _row_count = row
+                        if _first_row:
+                            _t_first = time.time() - _start_ts
+                            _first_row = False
+                            logger.info(
+                                "Export first row: port=%d time_to_first_row=%.2fs "
+                                "(MySQL query execution + first fetch from SSCursor)",
+                                _port_number, _t_first,
+                            )
+                        if not first:
+                            yield b","
+                        first = False
+                        yield _build_full_row(r)
+                        if row >= _next_report:
+                            now = time.time()
+                            pct = (row / total_count * 100) if total_count > 0 else 0
+                            interval_s = now - _t_last_report
+                            interval_rows = _report_every
+                            logger.info(
+                                "Export progress: port=%d %d/%d (%.0f%%) "
+                                "elapsed=%.1fs interval=[%d rows in %.1fs, %.0f rows/s]",
+                                _port_number, row, total_count, pct,
+                                now - _start_ts, interval_rows, interval_s,
+                                interval_rows / interval_s if interval_s > 0 else 0,
+                            )
+                            _next_report += _report_every
+                            _t_last_report = now
+                    yield b"]}"
+                except Exception as _export_err:
+                    elapsed = time.time() - _start_ts
+                    logger.error(
+                        "Export interrupted: port=%d %d/%d rows in %.1fs — %s: %s",
+                        _port_number, _row_count, total_count, elapsed,
+                        type(_export_err).__name__, _export_err,
+                    )
+                    # Build error sentinel and close JSON cleanly.
+                    # Result: {...,"requests":[...,{"_export_error":...}],"_export_error":"incomplete"}
+                    if _row_count > 0:
                         yield b","
-                    first = False
-                    yield _build_full_row(r)
-                    if row >= _next_report:
-                        now = time.time()
-                        pct = (row / total_count * 100) if total_count > 0 else 0
-                        interval_s = now - _t_last_report
-                        interval_rows = _report_every
-                        logger.info(
-                            "Export progress: port=%d %d/%d (%.0f%%) "
-                            "elapsed=%.1fs interval=[%d rows in %.1fs, %.0f rows/s]",
-                            _port_number, row, total_count, pct,
-                            now - _start_ts, interval_rows, interval_s,
-                            interval_rows / interval_s if interval_s > 0 else 0,
-                        )
-                        _next_report += _report_every
-                        _t_last_report = now
-                yield b"]}"
+                    _err_obj = json.dumps({
+                        "_export_error": "incomplete",
+                        "rows_received": _row_count,
+                        "total_expected": total_count,
+                        "error": f"{type(_export_err).__name__}: {_export_err}",
+                    }, ensure_ascii=False).encode("utf-8")
+                    yield _err_obj
+                    yield b'],"_export_error":"incomplete"}'
 
             elapsed = time.time() - _start_ts
             final = row if not _simple else idx
