@@ -21,6 +21,11 @@
   - [复合索引与 COUNT 加速](#复合索引与-count-加速)
   - [生成器异常恢复](#生成器异常恢复)
   - [导出进度日志](#导出进度日志)
+  - [simple 格式跳过 ORDER BY](#simple-格式跳过-order-by)
+  - [编译 SQL 日志](#编译-sql-日志)
+  - [实测效果](#实测效果)
+  - [各优化项贡献](#各优化项贡献)
+  - [瓶颈分析](#瓶颈分析)
 - [部署方式](#部署方式)
 - [API 接口](#api-接口)
 - [环境变量](#环境变量)
@@ -591,6 +596,63 @@ Export stream closed     →  SSCursor session 关闭
 ```
 
 每一步都有独立计时，可以直接看到时间花在 MySQL 查询执行、数据传输、还是 Python 处理上。
+
+#### simple 格式跳过 ORDER BY
+
+full 格式输出包含 `created_at` 时间戳，按时间排序对用户有意义。但 simple 格式的输出字段是 `{index, method, path, status_code, request, response}`——根本没有时间戳。
+
+更关键的是，`ORDER BY created_at` 会迫使 MySQL 按索引顺序逐行做**随机表查找**来读取 LONGTEXT 溢出页。去掉排序后，MySQL 可以选择更顺序的磁盘访问方式，减少磁头跳跃。
+
+代码通过 `if not _simple` 条件控制：simple 格式不附加 `.order_by()`，full 格式保留。
+
+#### 编译 SQL 日志
+
+导出启动时，日志会输出完整的编译后 SQL（含字面值绑定）：
+
+```
+Export stream: query compiled in 0.001s
+  -- run this on MySQL to see the execution plan:
+  -- EXPLAIN SELECT requests.method, requests.path, requests.status_code,
+           requests.request_body, requests.response_body
+    FROM requests
+    WHERE requests.port_id = 60
+      AND requests.method IN ('POST', 'PUT', 'PATCH', 'DELETE')
+```
+
+运维人员可以直接复制这条 SQL 到生产 MySQL 执行 `EXPLAIN`，验证查询计划是否用到了复合索引。`EXPLAIN` 的 `Extra` 列应包含 `Using index condition`，且不应出现 `Using filesort`（simple 格式无排序，full 格式走索引顺序）。
+
+#### 实测效果
+
+生产环境一个拥有 12087 条 API 交互记录的端口，经过全部优化后的实际日志：
+
+```
+Export count query: port=60 total_rows=12087 filter=api elapsed=0.023s
+Export setup done: setup_total=0.028s
+Export first row: time_to_first_row=7.23s
+Export progress: 1208/12087 (10%) elapsed=46.8s interval=[1208 rows in 46.8s, 26 rows/s]
+Export progress: 2416/12087 (20%) elapsed=85.9s interval=[1208 rows in 39.1s, 31 rows/s]
+Export progress: 3624/12087 (30%) elapsed=124.3s interval=[1208 rows in 38.4s, 31 rows/s]
+...
+（全部 12087 行约 6.5 分钟完成）
+```
+
+#### 各优化项贡献
+
+| 优化项 | 优化前 | 优化后 | 改善幅度 |
+|--------|--------|--------|----------|
+| COUNT 查询 | 5.3s | 0.023s | **230×** |
+| Handler 总耗时 | 5.3s+ | 0.028s | **190×** |
+| 导出是否成功 | 超时报错（300s 无数据） | 稳定完成 | 从不可用到可用 |
+| Python 行处理 | json.loads+dumps（~30-120s） | b"".join（~1-3s） | **30-40×** |
+| LONGTEXT 列数 | 5 个（含不需要的 headers） | 2 个 | **减少 60% I/O** |
+| 传输体积（gzip） | 原始 JSON | 压缩后 10-20% | **5-10×** |
+| MySQL 超时 | 300s 后断开 | 3600s，不断开 | 任意大数据量 |
+
+#### 瓶颈分析
+
+全部软件优化到位后，31 rows/s 的传输速度由**生产 MySQL 服务器的磁盘 I/O 能力**决定。12087 行 × 2 个 LONGTEXT（request_body + response_body）≈ 每行 10KB 需从 InnoDB 溢出页随机读取，合计约 120MB 的磁盘 I/O。
+
+在代码层面，SQL 使用复合索引、列按需选取、无意义排序已移除、字节拼接零 CPU 开销——所有能做的都做了。如果需要进一步加速，方向是 MySQL 服务器硬件（SSD、InnoDB buffer pool 扩容到物理内存 70-80%，使 LONGTEXT 溢出页命中缓存）或架构层面（写入时预计算导出 JSON 列）。
 
 ### 请求头转发规则
 
