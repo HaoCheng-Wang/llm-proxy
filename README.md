@@ -538,18 +538,16 @@ MySQL LONGTEXT  →  raw[0] 第一个字符检查  →  原样嵌入输出  → 
 ```mermaid
 flowchart TD
     A["请求到达 :3998/{port}/{path}"] --> B[aget_target_url(port)]
-    B --> C{port.prefer_http2?}
-
-    C -->|NULL 或 False| D[get_shared_client()]
+    B --> C{"port.prefer_http2 ?"}
+    C -->|"NULL 或 False"| D[get_shared_client()]
     D --> E[HTTP/1.1 客户端]
     E --> F["独立 TCP 连接<br/>connect=15s read=120s<br/>max_connections=无上限<br/>keepalive=100"]
-
-    C -->|True| G[get_http2_client()]
-    G --> H{h2 包是否安装?}
-    H -->|是| I[HTTP/2 客户端]
+    C -->|"True"| G[get_http2_client()]
+    G --> H{"h2 包是否安装 ?"}
+    H -->|"是"| I[HTTP/2 客户端]
     I --> J["多路复用 TCP 连接<br/>connect=15s read=300s<br/>max_connections=无上限<br/>keepalive=100"]
-    H -->|否| K[退回 HTTP/1.1 客户端]
-    K --> L["⚠️ WARNING 日志:<br/>h2 not installed, fallback to HTTP/1.1"]
+    H -->|"否"| K[退回 HTTP/1.1 客户端]
+    K --> L["WARNING 日志: h2 not installed, fallback to HTTP/1.1"]
 
     F --> M[转发请求到上游]
     J --> M
