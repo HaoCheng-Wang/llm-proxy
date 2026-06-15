@@ -105,6 +105,8 @@ export default {
   deleteRequest: (portId, requestId) => http.delete(`/ports/${portId}/history/${requestId}`).then(r => r.data),
   getSingleRequest: (portId, requestId) => http.get(`/ports/${portId}/history/${requestId}`).then(r => r.data),
   getRawSse: (portId, requestId) => http.get(`/ports/${portId}/history/${requestId}/raw-sse`).then(r => r.data),
+  // 获取一次性下载 ticket（用于浏览器原生下载，避免 JWT 出现在 URL 中）
+  createExportTicket: (portId) => http.post(`/ports/${portId}/export-ticket`).then(r => r.data),
   getActivePorts: () => http.get('/ports/active-ports').then(r => r.data),
 
   // Admin
