@@ -382,7 +382,11 @@ def _serialize_body(body_bytes: bytes, label: str = "body") -> str | None:
                 )
                 result = result.encode("utf-8", errors="replace").decode("utf-8")
             return result
-        except (json.JSONDecodeError, Exception):
+        except (json.JSONDecodeError, Exception) as e:
+            logger.debug(
+                "Body is not JSON, storing as-is (%s): %s",
+                label, str(e)[:120],
+            )
             return text
     except UnicodeDecodeError:
         logger.warning(
@@ -1209,7 +1213,11 @@ def _reconstruct_sse_to_json(raw_sse: str) -> str | None:
                     return result
             # Always try universal as ultimate fallback
             return _parse_generic_sse(raw_sse)
-        except (json.JSONDecodeError, Exception):
+        except (json.JSONDecodeError, Exception) as e:
+            logger.debug(
+                "SSE dispatch failed for line, trying next: %s",
+                str(e)[:120],
+            )
             continue
 
     return None
