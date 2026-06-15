@@ -903,12 +903,7 @@ def export_port_history(
             )
             if method_filter == "api":
                 query = query.filter(RequestModel.method.in_(["POST", "PUT", "PATCH", "DELETE"]))
-            # Full format includes created_at in output → ORDER BY is meaningful.
-            # Simple format defers created_at (not in output) → skip ORDER BY so
-            # MySQL can choose a scan plan with more sequential I/O for LONGTEXT
-            # overflow pages, instead of index-ordered random table lookups.
-            if not _simple:
-                query = query.order_by(RequestModel.created_at.asc())
+            query = query.order_by(RequestModel.created_at.asc())
             _t_query = time.time()
 
             # Emit the compiled SQL so the operator can EXPLAIN it manually
