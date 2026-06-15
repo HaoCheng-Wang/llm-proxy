@@ -891,9 +891,26 @@ def export_port_history(
         )
         _row_count = 0  # mutable so the except block can report how far we got
         try:
+            # Build query, deferring columns the output format does not need.
+            # LONGTEXT columns live in InnoDB overflow pages — each one costs a
+            # random disk read per row.  Deferring unused LONGTEXT columns cuts
+            # the I/O in half for simple format (2 LONGTEXTs instead of 4–5).
+            _deferred = [RequestModel.response_body_raw]  # never needed for export
+            if _simple:
+                # Simple format only needs: method, path, status_code, request_body, response_body.
+                # Defer the rest — especially LONGTEXT headers.
+                _deferred.extend([
+                    RequestModel.id,
+                    RequestModel.port_id,
+                    RequestModel.duration_ms,
+                    RequestModel.reconstruction_error,
+                    RequestModel.created_at,
+                    RequestModel.request_headers,
+                    RequestModel.response_headers,
+                ])
             query = (
                 own_db.query(RequestModel)
-                .options(defer(RequestModel.response_body_raw))
+                .options(defer(*_deferred))
                 .filter(RequestModel.port_id == port_id)
             )
             if method_filter == "api":
