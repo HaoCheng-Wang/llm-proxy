@@ -537,12 +537,26 @@ MySQL LONGTEXT  →  raw[0] 第一个字符检查  →  原样嵌入输出  → 
 
 ```mermaid
 flowchart TD
-    A[请求到达代理端口] --> B[查询端口配置]
-    B --> C{prefer_http2?}
-    C -->|false| D[HTTP 1.1 客户端]
-    C -->|true| E[HTTP 2 客户端]
-    D --> F[转发请求]
-    E --> F
+    A[请求到达 :3998/port/path] --> B[aget_target_url port]
+    B --> C[port.prefer_http2 判断]
+    C -->|NULL 或 False| D[get_shared_client]
+    D --> E[HTTP/1.1 客户端]
+    E --> F[独立 TCP 连接\nconnect=15s read=120s\nmax_connections=无上限\nkeepalive=100]
+    C -->|True| G[get_http2_client]
+    G --> H[h2 包是否安装]
+    H -->|是| I[HTTP/2 客户端]
+    I --> J[多路复用 TCP 连接\nconnect=15s read=300s\nmax_connections=无上限\nkeepalive=100]
+    H -->|否| K[退回 HTTP/1.1 客户端]
+    K --> L[WARNING 日志\nh2 not installed, fallback to HTTP/1.1]
+    F --> M[转发请求到上游]
+    J --> M
+    L --> M
+
+    style D fill:#1a3a1a,stroke:#2ecc71,color:#2ecc71
+    style E fill:#1a3a1a,stroke:#2ecc71,color:#2ecc71
+    style G fill:#1a2a3a,stroke:#5dade2,color:#5dade2
+    style I fill:#1a2a3a,stroke:#5dade2,color:#5dade2
+    style K fill:#3a2a1a,stroke:#f39c12,color:#f1c40f
 ```
 
 #### 对比
