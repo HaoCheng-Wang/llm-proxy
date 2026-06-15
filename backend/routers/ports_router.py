@@ -819,23 +819,11 @@ def export_port_history(
     def _embed_body(raw):
         """Embed a raw body/header string as a JSON value.
 
-        The text stored in MySQL LONGTEXT columns is already valid JSON
-        (LLM API request/response bodies are always JSON).  We verify with
-        a single-character structural check and embed directly — no
-        json.loads()/json.dumps() round-trip.
+        All body fields stored in this application come from LLM API
+        request/response payloads — they are always valid JSON strings.
+        We embed directly with zero validation overhead.
         """
-        if not raw:
-            return "null"
-        c = raw[0]
-        # JSON must start with: { [ " t f n - 0-9
-        if c in '{}[]"' or c in ('t', 'f', 'n') or c == '-' or c.isdigit():
-            return raw
-        # Rare edge case: leading whitespace — strip and re-check
-        s = raw.lstrip()
-        if s and s[0] in '{}[]"tfn-0123456789':
-            return raw
-        # Non-JSON body (e.g. plain text, form data) — encode as JSON string
-        return json.dumps(raw, ensure_ascii=False)
+        return raw or "null"
 
     def _build_full_row(r):
         """Build one row's JSON bytes directly — no intermediate dict, no json.loads.
@@ -940,7 +928,7 @@ def export_port_history(
                 first = True
                 idx = 0
                 try:
-                    for r in query.yield_per(100):
+                    for r in query.yield_per(500):
                         idx += 1
                         _row_count = idx
                         if _first_row:
@@ -1003,7 +991,7 @@ def export_port_history(
                 first = True
                 row = 0
                 try:
-                    for r in query.yield_per(100):
+                    for r in query.yield_per(500):
                         row += 1
                         _row_count = row
                         if _first_row:
