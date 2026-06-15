@@ -748,43 +748,82 @@ def export_port_history(
     fmt_label = "-simple" if _simple else ""
     filename = f"llm-proxy-port{_port_number}{filter_label}{fmt_label}-{ts}.json"
 
-    def _row_to_full(r):
-        entry = {
-            "id": r.id,
-            "method": r.method,
-            "path": r.path,
-            "status_code": r.status_code,
-            "duration_ms": r.duration_ms,
-            "timestamp": r.created_at.isoformat() if r.created_at else None,
-        }
-        for field in ["request_headers", "request_body", "response_headers", "response_body"]:
-            raw = getattr(r, field, None)
-            if raw:
-                try:
-                    entry[field] = json.loads(raw)
-                except (json.JSONDecodeError, TypeError):
-                    entry[field] = raw
-            else:
-                entry[field] = None
-        return entry
+    # ── JSON building helpers (module-level, outside the generator) ──
 
-    def _row_to_simple(r, index):
-        entry = {
-            "index": index,
-            "method": r.method,
-            "path": r.path,
-            "status_code": r.status_code,
-        }
-        for field in ["request_body", "response_body"]:
+    def _json_literal(v):
+        """Encode a Python scalar as a JSON literal (no quotes for numbers/null)."""
+        if v is None:
+            return "null"
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, int):
+            return str(v)
+        return json.dumps(v, ensure_ascii=False)
+
+    def _embed_body(raw):
+        """Embed a raw body/header string as a JSON value.
+
+        The text stored in MySQL LONGTEXT columns is already valid JSON
+        (LLM API request/response bodies are always JSON).  We verify with
+        a single-character structural check and embed directly — no
+        json.loads()/json.dumps() round-trip.
+        """
+        if not raw:
+            return "null"
+        c = raw[0]
+        # JSON must start with: { [ " t f n - 0-9
+        if c in '{}[]"' or c in ('t', 'f', 'n') or c == '-' or c.isdigit():
+            return raw
+        # Rare edge case: leading whitespace — strip and re-check
+        s = raw.lstrip()
+        if s and s[0] in '{}[]"tfn-0123456789':
+            return raw
+        # Non-JSON body (e.g. plain text, form data) — encode as JSON string
+        return json.dumps(raw, ensure_ascii=False)
+
+    def _build_full_row(r):
+        """Build one row's JSON bytes directly — no intermediate dict, no json.loads.
+
+        The body/header fields in MySQL are already valid JSON strings
+        (they come from LLM API request/response bodies).  We verify with a
+        single-character structural check and embed directly, eliminating the
+        dominant CPU cost of large exports: json.loads() + json.dumps() per row.
+        """
+        parts = [
+            b'{"id":', str(r.id).encode(),
+            b',"method":', json.dumps(r.method, ensure_ascii=False).encode(),
+            b',"path":', json.dumps(r.path, ensure_ascii=False).encode(),
+            b',"status_code":', _json_literal(r.status_code).encode(),
+            b',"duration_ms":', _json_literal(r.duration_ms).encode(),
+            b',"timestamp":',
+            json.dumps(r.created_at.isoformat() if r.created_at else None, ensure_ascii=False).encode(),
+        ]
+        for field in ("request_headers", "request_body", "response_headers", "response_body"):
             raw = getattr(r, field, None)
-            if raw:
-                try:
-                    entry["request" if field == "request_body" else "response"] = json.loads(raw)
-                except (json.JSONDecodeError, TypeError):
-                    entry["request" if field == "request_body" else "response"] = raw
-            else:
-                entry["request" if field == "request_body" else "response"] = None
-        return entry
+            parts.append(b',"')
+            parts.append(field.encode())
+            parts.append(b'":')
+            parts.append(_embed_body(raw).encode())
+        parts.append(b'}')
+        return b"".join(parts)
+
+    def _build_simple_row(r, index):
+        """Build one simple-format row's JSON bytes directly."""
+        parts = [
+            b'{"index":', str(index).encode(),
+            b',"method":', json.dumps(r.method, ensure_ascii=False).encode(),
+            b',"path":', json.dumps(r.path, ensure_ascii=False).encode(),
+            b',"status_code":', _json_literal(r.status_code).encode(),
+        ]
+        for field in ("request_body", "response_body"):
+            key = "request" if field == "request_body" else "response"
+            raw = getattr(r, field, None)
+            parts.append(b',"')
+            parts.append(key.encode())
+            parts.append(b'":')
+            parts.append(_embed_body(raw).encode())
+        parts.append(b'}')
+        return b"".join(parts)
 
     def stream_jsonl():
         own_db = database.StreamSessionLocal()
@@ -808,7 +847,7 @@ def export_port_history(
                     if not first:
                         yield b","
                     first = False
-                    yield json.dumps(_row_to_simple(r, idx), ensure_ascii=False).encode("utf-8")
+                    yield _build_simple_row(r, idx)
                 yield b"]"
             else:
                 # Full: {"port":{...},"total_requests":N,"requests":[...]}
@@ -826,7 +865,7 @@ def export_port_history(
                     if not first:
                         yield b","
                     first = False
-                    yield json.dumps(_row_to_full(r), ensure_ascii=False).encode("utf-8")
+                    yield _build_full_row(r)
                 yield b"]}"
         finally:
             own_db.close()
