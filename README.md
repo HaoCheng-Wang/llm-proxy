@@ -11,6 +11,16 @@
 - [高并发设计](#高并发设计)
 - [SSE 流式处理](#sse-流式处理)
 - [大数据量导出：端到端流式架构](#大数据量导出端到端流式架构)
+  - [各层关键设计](#各层关键设计)
+  - [一次性 Ticket 鉴权](#一次性-ticket-鉴权)
+  - [两条导出路径](#两条导出路径)
+  - [format=simple 模式](#formatsimple-模式)
+  - [每行处理性能](#每行处理性能零解析-vs-jsonloadsdumps)
+  - [Nginx 流式 gzip 压缩](#nginx-流式-gzip-压缩)
+  - [LONGTEXT 列按需选取](#longtext-列按需选取)
+  - [复合索引与 COUNT 加速](#复合索引与-count-加速)
+  - [生成器异常恢复](#生成器异常恢复)
+  - [导出进度日志](#导出进度日志)
 - [部署方式](#部署方式)
 - [API 接口](#api-接口)
 - [环境变量](#环境变量)
@@ -403,16 +413,16 @@ flowchart LR
         T[获得一次性 ticket] -->|"GET /api/ports/{id}/export?ticket=...<br/>（浏览器原生请求）"| N
     end
     subgraph nginx
-        N -->|"导出路由独立 location<br/>proxy_read_timeout=0"| S
+        N -->|"导出路由独立 location<br/>proxy_read_timeout=0<br/>proxy_buffering off + gzip"| S
     end
     subgraph FastAPI
         S -->|"_consume_ticket()<br/>验证并销毁 ticket"| V
         V -->|"StreamingResponse<br/>Content-Disposition: attachment"| G
-        G[stream_jsonl 生成器] -->|"b''.join<br/>直接字节拼接<br/>零解析零复制"| Q
+        G[stream_jsonl 生成器] -->|"defer 不需要的 LONGTEXT 列<br/>b''.join 直接字节拼接<br/>零解析零验证"| Q
     end
     subgraph MySQL
-        Q -->|"yield_per(100)"| C[SSCursor]
-        C -->|"逐批拉取 ~100 行"| D[(requests 表)]
+        Q -->|"yield_per(500)"| C[SSCursor]
+        C -->|"逐行拉取<br/>服务端游标<br/>复合索引加速"| D[(requests 表)]
     end
     subgraph 浏览器
         N -->|"下载对话框立即弹出<br/>原生进度条<br/>直接写磁盘"| F[(用户硬盘)]
@@ -423,11 +433,11 @@ flowchart LR
 
 | 层 | 技术选型 | 为什么 | 超时 |
 |---|---|---|---|
-| MySQL → Python | `pymysql.cursors.SSCursor` | 服务端游标，不在 MySQL 客户端缓冲全部行 | `read_timeout=300s`（每批是 100 行小查询） |
-| Python 行处理 | `b"".join(parts)` 直接构建 JSON 字节 | **不** json.loads() / json.dumps() — LONGTEXT 字段已是有效 JSON，首字符检查后原样嵌入，零解析零复制 | 每行 ~微秒级 |
-| Python → FastAPI | `StreamingResponse` + `yield_per(100)` | 读取一批立即发送一批，内存同时只有 ~100 行 | 无 (uvicorn 不限时) |
-| nginx | 导出路由独立 `location` 块 | 专用路由不限时，不影响其他 API | `proxy_read_timeout=0`（不限时） |
-| 浏览器 | `<a>` 标签导航 + `Content-Disposition: attachment` | 浏览器原生下载管理器，弹出对话框即开始写磁盘，JS 内存占用为 0 | 无 (浏览器默认不限时) |
+| MySQL → Python | `pymysql.cursors.SSCursor` + 复合索引 | 服务端游标，不在客户端缓冲全部行；`(port_id, method, created_at)` 索引让 COUNT/排序走覆盖索引 | `read_timeout=3600s` |
+| Python 行处理 | `b"".join(parts)` + defer 不需要的列 | simple 格式只查 2 个 LONGTEXT（不是 5 个）；LONGTEXT 零解析零验证原样嵌入 | 每行 ~微秒级 |
+| Python → FastAPI | `StreamingResponse` + `yield_per(500)` | 批次更大 = 更少 ORM identity map 过期开销；SSCursor 底层逐行拉取，内存恒定 | 无 |
+| nginx | 独立 `location` + gzip + unbuffered | 传输压缩 5–10×；`proxy_buffering off` 字节立刻推到浏览器 | `proxy_read_timeout=0` |
+| 浏览器 | `<a>` 标签 + `Content-Disposition: attachment` | 浏览器原生下载管理器，弹出对话框即开始写磁盘，JS 内存 0 | 无 |
 
 #### 一次性 Ticket 鉴权
 
@@ -492,19 +502,19 @@ MySQL LONGTEXT (已是有效 JSON 字符串)
 本系统的做法：
 
 ```
-MySQL LONGTEXT  →  raw[0] 第一个字符检查  →  原样嵌入输出  →  b"".join(parts)
-                    单字符操作 (纳秒)           零复制          一次内存分配
+MySQL LONGTEXT  →  原样嵌入输出  →  b"".join(parts)
+                   零复制              一次内存分配
 ```
 
-**为什么可以原样嵌入？** LLM API 的请求体和响应体**永远是 JSON**（OpenAI/Anthropic/Google 的 API 都只接受/返回 JSON）。MySQL 里存的 `request_body` / `response_body` 字段已经是合法的 JSON 字符串，不需要重新解析再序列化。首字符检查（`{` ` [` `"` `t` `f` `n` `-` 数字）是对 JSON 结构的廉价验证，在极端罕见情况下遇到非 JSON 内容（如表单数据）时回退到 `json.dumps`。
+**为什么可以原样嵌入？** LLM API 的请求体和响应体**永远是 JSON**（OpenAI/Anthropic/Google 的 API 都只接受/返回 JSON）。MySQL 里存的 `request_body` / `response_body` 字段已经是合法的 JSON 字符串。`_embed_body()` 做一次假值检查（`raw or "null"`）然后直接返回原始字符串——零解析、零验证、零复制。
 
 | 指标 | 旧方案 (json.loads+dumps) | 新方案 (字节拼接) |
 |------|--------------------------|-------------------|
-| 每行处理 | `json.loads(4×body)` + `json.dumps(全行)` | `raw[0]` 检查 + `b"".join` |
+| 每行处理 | `json.loads(4×body)` + `json.dumps(全行)` | `b"".join` |
 | body 文本复制 | 2 次（parse 分配对象 → serialize 生成字符串） | 0 次（原样嵌入） |
 | Python 对象分配 | 每行数千个 dict/list/str/int | 每行 1 个 bytes |
 | 1 万行 50KB body 耗时 | ~30-120 秒（Python CPU bound） | ~1-3 秒 |
-| 内存峰值 | Python 对象树递归分配 | ~100 行 × 各字段字节片段 |
+| 内存峰值 | Python 对象树递归分配 | ~500 行 × 各字段字节片段 |
 
 #### 为什么不用 axios / fetch
 
@@ -515,6 +525,72 @@ MySQL LONGTEXT  →  raw[0] 第一个字符检查  →  原样嵌入输出  → 
 | **`<a>` 标签 + 一次性 ticket** | ✅ 立即弹出 | ✅ 原生进度条 | 0（浏览器直接写磁盘） | 无 |
 
 核心洞察：**浏览器自带一个完善的下载管理器，为什么要绕过它？**
+
+#### Nginx 流式 gzip 压缩
+
+导出 JSON 内容（尤其是 LLM API 的请求/响应体）具有极高的压缩比——JSON 中的键名（如 `"request_body"`、`"response_headers"`）和嵌套结构高度重复，gzip 可将体积缩小 **5–10 倍**。
+
+nginx 配置了两项关键策略：
+
+- **`proxy_buffering off`**：字节从 FastAPI 产出后**立刻推到浏览器**，不在 nginx 内存中排队。浏览器收到的第一个字节就是 export 开始 yield 的第一个字节。
+- **`gzip on` + `gzip_proxied any`**：对代理响应启用**分块 gzip**（chunked gzip encoding）。nginx 对接收到的每一段 chunk 独立压缩然后转发——流不被阻塞，但传输量减少 80-90%。
+
+```
+FastAPI yield bytes  →  nginx 收取 chunk  →  gzip 压缩  →  浏览器解压  →  写磁盘
+     (原始大小)           (不缓冲)             (5-10×缩小)     (浏览器原生)
+```
+
+#### LONGTEXT 列按需选取
+
+InnoDB 将 LONGTEXT 列存储在行外的溢出页（overflow pages）。每条记录每个 LONGTEXT 列需要**一次额外的磁盘随机读**。导出时并非所有列都需要：
+
+```
+simple 格式实际需要  →  method, path, status_code, request_body, response_body
+simple 格式 defer 掉 →  id, duration_ms, reconstruction_error, created_at,
+                       request_headers, response_headers, response_body_raw
+```
+
+SQLAlchemy `defer()` 让 `SELECT` 语句不拉取这些列，MySQL 也就不会去读它们的溢出页。simple 格式从 5 个 LONGTEXT 降到 2 个，**减少 ~60% 的 LONGTEXT 磁盘 I/O**。
+
+#### 复合索引与 COUNT 加速
+
+导出前需要 `SELECT COUNT(*)` 确定总行数（用于进度百分比），同时在流式阶段需要 `ORDER BY created_at`。单列索引 `ix_requests_port_id` 只能快速定位行，但 MySQL 仍需额外 filesort。
+
+`ix_requests_port_method_created (port_id, method, created_at)` 是一个**覆盖索引**——三项查询条件全部命中索引：
+
+- `port_id` — 快速定位到特定端口
+- `method` — 精确过滤 API 请求（POST/PUT/PATCH/DELETE）
+- `created_at` — 直接按索引顺序遍历，无需 filesort
+
+实际效果：COUNT 从 **5.3 秒降到 <0.01 秒**（生产环境实测）。
+
+#### 生成器异常恢复
+
+SSCursor 流式传输中如果 MySQL 连接意外断开（超时、重启、网络故障），未捕获的异常会导致 uvicorn 输出 ASGI application error，浏览器收到损坏的 HTTP 响应。
+
+导出生成器的两个 `for r in query.yield_per(500)` 循环均包裹在 `try/except` 中。异常发生时：
+
+1. 记录 `ERROR` 日志，包含已处理行数和异常详情
+2. 生成合法的 JSON 错误标记并闭合 JSON 数组
+3. 浏览器正常完成下载——文件末尾包含 `{"_export_error": "incomplete", "rows_received": N, ...}`
+
+用户收到的是**部分但有效的 JSON 文件**，而非一个下载失败的错误提示。
+
+#### 导出进度日志
+
+每次导出在后端日志中输出完整的时间线追踪，方便定位瓶颈：
+
+```
+Export request received  →  auth 耗时  →  port 查找  →  COUNT 查询
+Export setup done        →  总耗时分解
+Export started           →  开始流式传输
+Export first row         →  MySQL 查询执行耗时（time_to_first_row）
+Export progress          →  每 10% 里程碑 + 区间 rows/s
+Export finished          →  总耗时 + first_row vs transfer+process 分解
+Export stream closed     →  SSCursor session 关闭
+```
+
+每一步都有独立计时，可以直接看到时间花在 MySQL 查询执行、数据传输、还是 Python 处理上。
 
 ### 请求头转发规则
 
