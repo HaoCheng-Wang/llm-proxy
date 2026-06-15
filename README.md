@@ -284,7 +284,7 @@ users                        ports                              requests
 | SSRF 防护 | URL 校验 | 阻止内网 IP / localhost / metadata 端点 |
 | CORS | FastAPI Middleware | 可配置来源白名单 |
 | 端口分配锁 | MySQL GET_LOCK | 序列化分配，防止编号冲突 |
-| API Key | 透传不存储 | 代理不记录 Authorization 头 |
+| API Key | 原样透传并记录 | Authorization 头原样转发到上游，同时完整记录到数据库 request_headers 字段 |
 
 ## 高并发设计
 
@@ -666,7 +666,7 @@ Export progress: 3624/12087 (30%) elapsed=124.3s interval=[1208 rows in 38.4s, 3
 
 ### 请求头转发规则
 
-代理转发到上游 LLM API 时，以下请求头会被**移除**：
+代理转发到上游 LLM API 时，以下请求头会从**转发请求**中移除（但仍完整记录到数据库 `request_headers` 字段）：
 
 | 移除的头 | 原因 |
 |----------|------|
@@ -677,7 +677,9 @@ Export progress: 3624/12087 (30%) elapsed=124.3s interval=[1208 rows in 38.4s, 3
 | `content-encoding` | httpx 自动解压响应，无需透传 |
 | `accept-encoding` | 显式移除，避免上游返回压缩内容 |
 
-`Authorization` 头（API Key）**原样透传**，代理不存储也不修改。
+`Authorization` 头（API Key）**原样透传**，代理不修改，但会完整记录到数据库 `request_headers` 字段。
+
+> **实际案例**：Claude CLI（`claude-cli/2.1.98`）等客户端会在请求中携带 `accept-encoding: gzip, deflate`，表示客户端能接受压缩响应。代理在转发前移除此头，确保上游返回未压缩的原始 SSE 流——否则压缩后的二进制数据会打碎 SSE 事件边界，导致逐 chunk 透传和 JSON 重组均无法工作。原始 `accept-encoding` 值仍完整保存在数据库 `request_headers` 中，可在前端查看详情时看到。
 
 ### HTTP 协议选择：HTTP/1.1 vs HTTP/2
 
@@ -1129,9 +1131,15 @@ llm-proxy/
 ├── docker-compose.yml       # 2 容器编排
 ├── nginx.conf               # 前端 nginx 配置
 ├── pyproject.toml           # uv 项目定义 + Python 依赖声明 + pytest 配置
-├── test_backend.py           # 77 个单元测试（配置 / Auth / SSE 解析器 / 模型等）
-├── test_integration.py       # 23 个集成+压力测试（端点逻辑 / 并发 / 大数据量）
 ├── README.md
+│
+├── tests/                    # 测试套件
+│   ├── conftest.py           # 共享 fixtures
+│   ├── test_auth.py          # 13 个认证测试
+│   ├── test_admin.py         # 7 个管理员测试
+│   ├── test_ports.py         # 13 个端口管理测试
+│   ├── test_proxy.py         # 17 个代理 / SSE 解析测试
+│   └── test_stress.py        # 9 个压力测试
 │
 ├── backend/                 # Python FastAPI 后端
 │   ├── main.py              # 入口：启动 FastAPI + 注册路由 + lifespan
@@ -1155,22 +1163,22 @@ llm-proxy/
     ├── package.json
     ├── vite.config.js
     └── src/
-        ├── main.js          # Vue 入口
-        ├── App.vue          # 根组件（导航栏 + toast）
+        ├── main.js          # Vue 入口（createApp + Pinia + Router）
+        ├── App.vue          # 根组件（导航栏 + 用户信息 + toast 通知）
         ├── style.css        # 全局样式
-        ├── api/index.js     # axios 封装 + fetch 流式导出 + 拦截器
-        ├── stores/auth.js   # Pinia 认证状态
-        ├── router/index.js  # 路由配置 + 守卫
+        ├── api/index.js     # API 客户端（axios 拦截器 + NDJSON 流式加载 + ticket 导出）
+        ├── stores/auth.js   # Pinia 认证状态（token/用户信息/登录/登出）
+        ├── router/index.js  # 路由配置 + 守卫（guest/auth/admin 三级权限）
         ├── components/
-        │   └── JsonTree.vue # JSON 树形查看组件
+        │   └── JsonTree.vue # JSON 树形查看组件（搜索/折叠/展开/导航）
         └── views/
             ├── Login.vue          # 登录页
             ├── Register.vue       # 注册页
-            ├── Dashboard.vue     # 代理列表 + 创建
+            ├── Dashboard.vue     # 代理列表 + 创建/编辑/停用
             ├── PortDetail.vue    # 代理详情 + 交互记录 + 流式导出
-            ├── JsonTreeViewer.vue # JSON 树形查看器
-            ├── Admin.vue         # 用户管理
-            ├── DeletedPorts.vue  # 已删除代理管理
+            ├── JsonTreeViewer.vue # JSON 树形查看器（独立页面，含原始 SSE 查看）
+            ├── Admin.vue         # 用户管理（审批/删除）
+            ├── DeletedPorts.vue  # 已删除代理管理（恢复/彻底删除）
             └── ChangePassword.vue # 修改密码
 ```
 
@@ -1193,6 +1201,7 @@ llm-proxy/
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/health` | 健康检查 |
+| GET | `/api/config` | 前端配置（display_ip, api_port） |
 
 ### 认证
 
@@ -1209,6 +1218,7 @@ llm-proxy/
 |------|------|------|
 | POST | `/api/ports` | 创建代理（自动分配编号） |
 | GET | `/api/ports` | 列出我的代理（管理员看全部） |
+| GET | `/api/ports/active-ports` | 获取所有活跃端口号 |
 | GET | `/api/ports/{id}` | 代理详情 + 交互历史（流式 NDJSON，分页） |
 | PUT | `/api/ports/{id}` | 编辑代理（含转发协议） |
 | DELETE | `/api/ports/{id}` | 软删除（可恢复） |

@@ -258,14 +258,20 @@ class TestPortCache:
 
     def test_cache_hit(self):
         """Cache returns cached value."""
-        from proxy_app import _port_target_cache, get_target_url
-        _port_target_cache[9999] = "https://cached.example.com"
-        result = get_target_url(9999)
-        assert result == "https://cached.example.com"
-        del _port_target_cache[9999]
+        import time
+        import proxy_app
+        # Prevent cache refresh (which needs DB) by setting TTL not yet expired
+        proxy_app._cache_updated_at = time.time()
+        proxy_app._port_target_cache[9999] = ("https://cached.example.com", None)
+        result = proxy_app.get_target_url(9999)
+        assert result == ("https://cached.example.com", None)
+        del proxy_app._port_target_cache[9999]
 
     def test_cache_miss_returns_none(self):
-        """Cache miss for non-existent port returns None."""
-        from proxy_app import get_target_url
-        result = get_target_url(49999)
+        """Cache miss for non-existent port falls back to DB, returns None."""
+        import time
+        import proxy_app
+        # Prevent cache refresh (which needs DB) by setting TTL not yet expired
+        proxy_app._cache_updated_at = time.time()
+        result = proxy_app.get_target_url(49999)
         assert result is None

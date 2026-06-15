@@ -58,9 +58,14 @@ async def test_get_port_history(client, admin_headers):
 
     resp = await client.get(f"/api/ports/{port_id}", headers=admin_headers)
     assert resp.status_code == 200
-    data = resp.json()
-    assert "port" in data
-    assert "requests" in data
+    # Endpoint returns NDJSON (line 1 = port metadata)
+    text = resp.text
+    lines = [l for l in text.strip().split("\n") if l.strip()]
+    assert len(lines) >= 1
+    import json
+    data = json.loads(lines[0])
+    assert "port_number" in data
+    assert "target_url" in data
 
 
 @pytest.mark.asyncio

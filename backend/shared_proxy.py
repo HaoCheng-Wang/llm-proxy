@@ -98,7 +98,6 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
     }
     parsed_target = urlparse(target_url)
     forward_headers["host"] = parsed_target.netloc
-    forward_headers.pop("accept-encoding", None)
 
     # Forward the request
     status_code = 502

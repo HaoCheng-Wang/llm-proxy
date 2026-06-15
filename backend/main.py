@@ -142,16 +142,17 @@ app.include_router(admin_router)
 app.include_router(ports_router)
 app.include_router(config_router)
 
-# Shared proxy endpoint — routes all /{port_number}/{path} traffic.
-# This MUST be registered after /api/ routes so that /api/* paths
-# are matched first (static routes take priority over parameterized).
-from shared_proxy import router as shared_proxy_router  # noqa: E402
-app.include_router(shared_proxy_router)
-
 
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "service": "llm-proxy"}
+
+
+# Shared proxy endpoint — routes all /{port_number}/{path} traffic.
+# This MUST be registered after /api/ routes and /api/health so that
+# /api/* paths are matched first (static routes take priority over parameterized).
+from shared_proxy import router as shared_proxy_router  # noqa: E402
+app.include_router(shared_proxy_router)
 
 
 # ---- Run ----

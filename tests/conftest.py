@@ -39,7 +39,9 @@ def event_loop():
 @pytest_asyncio.fixture(scope="session")
 async def setup_database():
     """Initialize test database, create tables, and set up app state."""
+    database._ensure_database()
     database.init_database()
+    Base.metadata.create_all(bind=database.engine)
 
     # Seed admin user
     db = database.SessionLocal()

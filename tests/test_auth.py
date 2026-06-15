@@ -19,7 +19,9 @@ async def test_register_success(client):
     assert resp.status_code == 200
     data = resp.json()
     assert "message" in data
-    assert "submitted" in data["message"].lower() or "approval" in data["message"].lower()
+    # Works with both REQUIRE_APPROVAL=true and false
+    msg = data["message"].lower()
+    assert any(kw in msg for kw in ("successful", "submitted", "approval")), f"Unexpected message: {data['message']}"
 
 
 @pytest.mark.asyncio

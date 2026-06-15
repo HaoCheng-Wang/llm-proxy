@@ -333,7 +333,8 @@ async def _save_record_async(port_number: int, method: str, path: str,
 # Headers to exclude when forwarding
 EXCLUDE_HEADERS = {
     "host", "content-length", "connection", "transfer-encoding",
-    "content-encoding",  # httpx decompresses for us
+    "content-encoding",   # httpx decompresses for us
+    "accept-encoding",    # avoid upstream returning compressed content
 }
 
 # Symbols exported for use by shared_proxy and main

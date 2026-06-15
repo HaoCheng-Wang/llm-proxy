@@ -120,11 +120,16 @@ def create_port(
     """
     import random
 
-    # Acquire a MySQL named lock to serialize port allocation.
-    lock_acquired = db.execute(
+    # In SQLAlchemy 2.0, session.commit() may release the connection back to
+    # the pool, so the finally-block RELEASE_LOCK could land on a different
+    # connection.  Get a dedicated raw connection for locking so GET_LOCK and
+    # RELEASE_LOCK are guaranteed to use the same MySQL connection.
+    raw_conn = db.bind.connect()
+    lock_acquired = raw_conn.execute(
         text("SELECT GET_LOCK('llm_proxy_port_alloc', 10)")
     ).scalar()
     if lock_acquired != 1:
+        raw_conn.close()
         raise HTTPException(
             status_code=503,
             detail="Server is busy processing port allocation, please try again"
@@ -177,7 +182,8 @@ def create_port(
             )
     finally:
         # Always release the MySQL named lock, even on error.
-        db.execute(text("SELECT RELEASE_LOCK('llm_proxy_port_alloc')"))
+        raw_conn.execute(text("SELECT RELEASE_LOCK('llm_proxy_port_alloc')"))
+        raw_conn.close()
 
     db.refresh(port)
     refresh_port_cache(db)
