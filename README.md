@@ -539,15 +539,15 @@ MySQL LONGTEXT  →  raw[0] 第一个字符检查  →  原样嵌入输出  → 
 flowchart TD
     A[请求到达 :3998/port/path] --> B[aget_target_url port]
     B --> C[port.prefer_http2 判断]
-    C -->|NULL 或 False| D[get_shared_client]
+    C -->|"NULL 或 False"| D[get_shared_client]
     D --> E[HTTP/1.1 客户端]
-    E --> F[独立 TCP 连接\nconnect=15s read=120s\nmax_connections=无上限\nkeepalive=100]
-    C -->|True| G[get_http2_client]
+    E --> F["独立 TCP 连接\nconnect=15s read=120s\nmax_connections=无上限\nkeepalive=100"]
+    C -->|"True"| G[get_http2_client]
     G --> H[h2 包是否安装]
-    H -->|是| I[HTTP/2 客户端]
-    I --> J[多路复用 TCP 连接\nconnect=15s read=300s\nmax_connections=无上限\nkeepalive=100]
-    H -->|否| K[退回 HTTP/1.1 客户端]
-    K --> L[WARNING 日志\nh2 not installed, fallback to HTTP/1.1]
+    H -->|"是"| I[HTTP/2 客户端]
+    I --> J["多路复用 TCP 连接\nconnect=15s read=300s\nmax_connections=无上限\nkeepalive=100"]
+    H -->|"否"| K[退回 HTTP/1.1 客户端]
+    K --> L["WARNING 日志\nh2 not installed, fallback to HTTP/1.1"]
     F --> M[转发请求到上游]
     J --> M
     L --> M
