@@ -705,38 +705,78 @@ def export_port_history(
         ticket: One-time download ticket (from POST /{port_id}/export-ticket).
     """
     # ── Auth: prefer Bearer header, fallback to ?ticket= one-time token ──
+    _req_start_ts = time.time()
+    logger.info(
+        "Export request received: port=%d method_filter=%s format=%s auth_mode=%s",
+        port_id, method_filter, format,
+        "bearer" if credentials else ("ticket" if ticket else "none"),
+    )
+
+    _t_auth = time.time()
     if credentials:
         current_user = _verify_token_str(credentials.credentials, db)
+        logger.info(
+            "Export auth: mode=bearer user=%d role=%s elapsed=%.3fs",
+            current_user.id, current_user.role, time.time() - _t_auth,
+        )
     elif ticket:
         entry = _consume_ticket(ticket)
         if entry is None:
+            logger.warning("Export auth: ticket invalid or expired")
             raise HTTPException(status_code=401, detail="Invalid or expired ticket")
         _ticket_port_id, _ticket_user_id = entry
         if _ticket_port_id != port_id:
+            logger.warning(
+                "Export auth: ticket port mismatch ticket_port=%d request_port=%d",
+                _ticket_port_id, port_id,
+            )
             raise HTTPException(status_code=403, detail="Ticket does not match port")
         current_user = db.query(User).filter(User.id == _ticket_user_id).first()
         if not current_user:
+            logger.warning("Export auth: ticket user not found user=%d", _ticket_user_id)
             raise HTTPException(status_code=401, detail="User not found")
+        logger.info(
+            "Export auth: mode=ticket user=%d role=%s elapsed=%.3fs",
+            current_user.id, current_user.role, time.time() - _t_auth,
+        )
     else:
+        logger.warning("Export auth: no credentials provided")
         raise HTTPException(status_code=401, detail="Authentication required")
 
     if not current_user.is_approved and current_user.role != "admin":
+        logger.warning("Export auth: user=%d not approved", current_user.id)
         raise HTTPException(status_code=403, detail="Account not yet approved by admin")
 
+    _t_port = time.time()
     port = db.query(Port).filter(Port.id == port_id).first()
     if not port:
+        logger.warning("Export: port=%d not found", port_id)
         raise HTTPException(status_code=404, detail="Port not found")
 
     if current_user.role != "admin" and port.user_id != current_user.id:
+        logger.warning(
+            "Export: access denied port=%d owner=%d user=%d",
+            port_id, port.user_id, current_user.id,
+        )
         raise HTTPException(status_code=403, detail="Access denied")
+    logger.info(
+        "Export port lookup: port_number=%d target=%s elapsed=%.3fs",
+        port.port_number, port.target_url, time.time() - _t_port,
+    )
 
     # ── Count total on the request-scoped session (cheap) ──
+    _t_count_query = time.time()
     total_q = db.query(func.count(RequestModel.id)).filter(
         RequestModel.port_id == port.id
     )
     if method_filter == "api":
         total_q = total_q.filter(RequestModel.method.in_(["POST", "PUT", "PATCH", "DELETE"]))
     total_count = total_q.scalar() or 0
+    _t_count_done = time.time()
+    logger.info(
+        "Export count query: port=%d total_rows=%d filter=%s elapsed=%.3fs",
+        port_id, total_count, method_filter, _t_count_done - _t_count_query,
+    )
 
     # Capture immutable values for use inside the generator
     _port_number = port.port_number
@@ -750,6 +790,19 @@ def export_port_history(
     filter_label = "-api" if method_filter == "api" else ""
     fmt_label = "-simple" if _simple else ""
     filename = f"llm-proxy-port{_port_number}{filter_label}{fmt_label}-{ts}.json"
+
+    _t_setup_done = time.time()
+    _t_auth_elapsed = _t_port - _t_auth
+    _t_port_elapsed = _t_count_query - _t_port
+    _t_count_elapsed = _t_count_done - _t_count_query
+    _t_other_elapsed = _t_setup_done - _t_count_done  # filename, helpers
+    logger.info(
+        "Export setup done: port=%d total=%d format=%s filename=%s "
+        "setup_total=%.3fs breakdown=[auth=%.3fs port_lookup=%.3fs count=%.3fs helpers=%.3fs]",
+        _port_number, total_count, "simple" if _simple else "full", filename,
+        _t_setup_done - _req_start_ts,
+        _t_auth_elapsed, _t_port_elapsed, _t_count_elapsed, _t_other_elapsed,
+    )
 
     # ── JSON building helpers (module-level, outside the generator) ──
 
@@ -829,7 +882,13 @@ def export_port_history(
         return b"".join(parts)
 
     def stream_jsonl():
+        _t_stream_enter = time.time()
         own_db = database.StreamSessionLocal()
+        _t_session = time.time()
+        logger.info(
+            "Export stream: SSCursor session acquired in %.3fs",
+            _t_session - _t_stream_enter,
+        )
         try:
             query = (
                 own_db.query(RequestModel)
@@ -839,6 +898,11 @@ def export_port_history(
             if method_filter == "api":
                 query = query.filter(RequestModel.method.in_(["POST", "PUT", "PATCH", "DELETE"]))
             query = query.order_by(RequestModel.created_at.asc())
+            _t_query = time.time()
+            logger.info(
+                "Export stream: query built in %.3fs, starting iteration",
+                _t_query - _t_session,
+            )
 
             # Progress tracking
             _start_ts = time.time()
@@ -941,7 +1005,14 @@ def export_port_history(
             )
         finally:
             own_db.close()
+            logger.info("Export stream: SSCursor session closed")
 
+    _t_handoff = time.time()
+    logger.info(
+        "Export handoff: returning StreamingResponse to ASGI server "
+        "(total_handler_elapsed=%.3fs, rows=%d, filename=%s)",
+        _t_handoff - _req_start_ts, total_count, filename,
+    )
     return StreamingResponse(
         stream_jsonl(),
         media_type="application/json",
