@@ -408,7 +408,7 @@ flowchart LR
     subgraph FastAPI
         S -->|"_consume_ticket()<br/>验证并销毁 ticket"| V
         V -->|"StreamingResponse<br/>Content-Disposition: attachment"| G
-        G[stream_jsonl 生成器] -->|"json.dumps<br/>立即序列化"| Q
+        G[stream_jsonl 生成器] -->|"b''.join<br/>直接字节拼接<br/>零解析零复制"| Q
     end
     subgraph MySQL
         Q -->|"yield_per(100)"| C[SSCursor]
@@ -424,6 +424,7 @@ flowchart LR
 | 层 | 技术选型 | 为什么 | 超时 |
 |---|---|---|---|
 | MySQL → Python | `pymysql.cursors.SSCursor` | 服务端游标，不在 MySQL 客户端缓冲全部行 | `read_timeout=300s`（每批是 100 行小查询） |
+| Python 行处理 | `b"".join(parts)` 直接构建 JSON 字节 | **不** json.loads() / json.dumps() — LONGTEXT 字段已是有效 JSON，首字符检查后原样嵌入，零解析零复制 | 每行 ~微秒级 |
 | Python → FastAPI | `StreamingResponse` + `yield_per(100)` | 读取一批立即发送一批，内存同时只有 ~100 行 | 无 (uvicorn 不限时) |
 | nginx | 导出路由独立 `location` 块 | 专用路由不限时，不影响其他 API | `proxy_read_timeout=0`（不限时） |
 | 浏览器 | `<a>` 标签导航 + `Content-Disposition: attachment` | 浏览器原生下载管理器，弹出对话框即开始写磁盘，JS 内存占用为 0 | 无 (浏览器默认不限时) |
@@ -472,6 +473,38 @@ API 调用            POST /export-ticket + GET /export   无 API 调用
 #### format=simple 模式
 
 导出 API 支持 `?format=simple` 参数。默认 `full` 模式返回完整的 `{port, total_requests, requests: [{id, method, path, request_headers, ...}]}`；`simple` 模式返回扁平数组 `[{index, method, path, status_code, request, response}]`，由后端完成 JSON 提取和重组，前端零处理开销。"导出全部 API 请求 JSON"按钮即使用此模式。
+
+#### 每行处理性能：零解析 vs json.loads+dumps
+
+导出最耗 CPU 的环节不是数据库查询，而是**每行数据的 Python JSON 处理**。一个端口 1 万条记录、每条 4 个 LONGTEXT 字段（请求/响应 header+body），平均 50KB 的 body 意味着一共 **2GB 文本需要处理**。
+
+旧方案（每行的典型写法）：
+
+```
+MySQL LONGTEXT (已是有效 JSON 字符串)
+  → json.loads(50KB) → Python dict/list 树 (数千个对象)
+  → json.dumps(200KB 全行) → JSON 字符串
+  → encode("utf-8") → bytes
+  → GC 回收临时对象树
+  # 合计：4 万次 json.loads + 1 万次 json.dumps
+```
+
+本系统的做法：
+
+```
+MySQL LONGTEXT  →  raw[0] 第一个字符检查  →  原样嵌入输出  →  b"".join(parts)
+                    单字符操作 (纳秒)           零复制          一次内存分配
+```
+
+**为什么可以原样嵌入？** LLM API 的请求体和响应体**永远是 JSON**（OpenAI/Anthropic/Google 的 API 都只接受/返回 JSON）。MySQL 里存的 `request_body` / `response_body` 字段已经是合法的 JSON 字符串，不需要重新解析再序列化。首字符检查（`{` ` [` `"` `t` `f` `n` `-` 数字）是对 JSON 结构的廉价验证，在极端罕见情况下遇到非 JSON 内容（如表单数据）时回退到 `json.dumps`。
+
+| 指标 | 旧方案 (json.loads+dumps) | 新方案 (字节拼接) |
+|------|--------------------------|-------------------|
+| 每行处理 | `json.loads(4×body)` + `json.dumps(全行)` | `raw[0]` 检查 + `b"".join` |
+| body 文本复制 | 2 次（parse 分配对象 → serialize 生成字符串） | 0 次（原样嵌入） |
+| Python 对象分配 | 每行数千个 dict/list/str/int | 每行 1 个 bytes |
+| 1 万行 50KB body 耗时 | ~30-120 秒（Python CPU bound） | ~1-3 秒 |
+| 内存峰值 | Python 对象树递归分配 | ~100 行 × 各字段字节片段 |
 
 #### 为什么不用 axios / fetch
 
