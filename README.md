@@ -21,7 +21,7 @@
   - [复合索引与 COUNT 加速](#复合索引与-count-加速)
   - [生成器异常恢复](#生成器异常恢复)
   - [导出进度日志](#导出进度日志)
-  - [simple 格式跳过 ORDER BY](#simple-格式跳过-order-by)
+  - [ORDER BY 为什么不会拖慢速度](#order-by-为什么不会拖慢速度)
   - [编译 SQL 日志](#编译-sql-日志)
   - [实测效果](#实测效果)
   - [各优化项贡献](#各优化项贡献)
@@ -597,13 +597,17 @@ Export stream closed     →  SSCursor session 关闭
 
 每一步都有独立计时，可以直接看到时间花在 MySQL 查询执行、数据传输、还是 Python 处理上。
 
-#### simple 格式跳过 ORDER BY
+#### ORDER BY 为什么不会拖慢速度
 
-full 格式输出包含 `created_at` 时间戳，按时间排序对用户有意义。但 simple 格式的输出字段是 `{index, method, path, status_code, request, response}`——根本没有时间戳。
+两种格式的输出都统一按 `created_at ASC` 排序。full 格式因为输出包含 `timestamp` 字段，排序对用户有意义；simple 格式虽然输出不含时间字段，但数据本身代表一个对话的时间线，按交互时间排序能保证逻辑顺序正确。
 
-更关键的是，`ORDER BY created_at` 会迫使 MySQL 按索引顺序逐行做**随机表查找**来读取 LONGTEXT 溢出页。去掉排序后，MySQL 可以选择更顺序的磁盘访问方式，减少磁头跳跃。
+加了排序为什么不会变慢？
 
-代码通过 `if not _simple` 条件控制：simple 格式不附加 `.order_by()`，full 格式保留。
+1. **复合索引已覆盖排序**。`ix_requests_port_method_created (port_id, method, created_at)` 的第三列就是 `created_at`。MySQL 扫描索引时自然就是有序的，`EXPLAIN` 中不会出现 `Using filesort`。
+
+2. **主键顺序 ≈ 时间顺序**。InnoDB 的主键 `id` 是 auto-increment，`created_at` 是插入时间，两者几乎线性对齐——后插入的行 id 更大、时间更晚。MySQL 回表读 LONGTEXT 溢出页时，即使在物理层面也接近顺序访问。
+
+3. **不管加不加 ORDER BY 都要回表**。索引只存了索引列，LONGTEXT 始终在溢出页里。先用哪个索引找主键、再回表，路径不同但本质相同：找到一批行 → 读 LONGTEXT。真正的瓶颈是 120MB LONGTEXT 的磁盘 I/O，不是磁盘寻道。
 
 #### 编译 SQL 日志
 
@@ -617,9 +621,10 @@ Export stream: query compiled in 0.001s
     FROM requests
     WHERE requests.port_id = 60
       AND requests.method IN ('POST', 'PUT', 'PATCH', 'DELETE')
+    ORDER BY requests.created_at ASC
 ```
 
-运维人员可以直接复制这条 SQL 到生产 MySQL 执行 `EXPLAIN`，验证查询计划是否用到了复合索引。`EXPLAIN` 的 `Extra` 列应包含 `Using index condition`，且不应出现 `Using filesort`（simple 格式无排序，full 格式走索引顺序）。
+运维人员可以直接复制这条 SQL 到生产 MySQL 执行 `EXPLAIN`，验证 `Extra` 列不含 `Using filesort`——排序走索引顺序，零额外开销。
 
 #### 实测效果
 
@@ -652,7 +657,7 @@ Export progress: 3624/12087 (30%) elapsed=124.3s interval=[1208 rows in 38.4s, 3
 
 全部软件优化到位后，31 rows/s 的传输速度由**生产 MySQL 服务器的磁盘 I/O 能力**决定。12087 行 × 2 个 LONGTEXT（request_body + response_body）≈ 每行 10KB 需从 InnoDB 溢出页随机读取，合计约 120MB 的磁盘 I/O。
 
-在代码层面，SQL 使用复合索引、列按需选取、无意义排序已移除、字节拼接零 CPU 开销——所有能做的都做了。如果需要进一步加速，方向是 MySQL 服务器硬件（SSD、InnoDB buffer pool 扩容到物理内存 70-80%，使 LONGTEXT 溢出页命中缓存）或架构层面（写入时预计算导出 JSON 列）。
+在代码层面，SQL 使用复合索引（排序走索引顺序，零 filesort）、列按需选取（simple 只查 2 个 LONGTEXT）、字节拼接零 CPU 开销——所有能做的都做了。如果需要进一步加速，方向是 MySQL 服务器硬件（SSD、InnoDB buffer pool 扩容到物理内存 70-80%，使 LONGTEXT 溢出页命中缓存）或架构层面（写入时预计算导出 JSON 列）。
 
 ### 请求头转发规则
 
