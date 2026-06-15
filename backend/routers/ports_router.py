@@ -903,12 +903,33 @@ def export_port_history(
             )
             if method_filter == "api":
                 query = query.filter(RequestModel.method.in_(["POST", "PUT", "PATCH", "DELETE"]))
-            query = query.order_by(RequestModel.created_at.asc())
+            # Full format includes created_at in output → ORDER BY is meaningful.
+            # Simple format defers created_at (not in output) → skip ORDER BY so
+            # MySQL can choose a scan plan with more sequential I/O for LONGTEXT
+            # overflow pages, instead of index-ordered random table lookups.
+            if not _simple:
+                query = query.order_by(RequestModel.created_at.asc())
             _t_query = time.time()
-            logger.info(
-                "Export stream: query built in %.3fs, starting iteration",
-                _t_query - _t_session,
-            )
+
+            # Emit the compiled SQL so the operator can EXPLAIN it manually
+            # when diagnosing slow exports.
+            try:
+                _compiled = query.statement.compile(
+                    compile_kwargs={"literal_binds": True}
+                )
+                logger.info(
+                    "Export stream: query compiled in %.3fs\n"
+                    "  -- run this on MySQL to see the execution plan:\n"
+                    "  -- EXPLAIN %s",
+                    _t_query - _t_session,
+                    str(_compiled)[:2000],
+                )
+            except Exception:
+                logger.info(
+                    "Export stream: query compiled in %.3fs (SQL suppressed — "
+                    "bind literal rendering failed, likely due to LONGTEXT params)",
+                    _t_query - _t_session,
+                )
 
             # Progress tracking
             _start_ts = time.time()
