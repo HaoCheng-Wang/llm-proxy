@@ -898,7 +898,7 @@ def export_port_history(
                 ])
             query = (
                 own_db.query(RequestModel)
-                .options(defer(*_deferred))
+                .options(*[defer(col) for col in _deferred])
                 .filter(RequestModel.port_id == port_id)
             )
             if method_filter == "api":
