@@ -27,14 +27,16 @@ from proxy_app import close_shared_client, close_http2_client, init_shared_clien
 
 # Configure project logger — only touches the llm_proxy namespace,
 # leaving uvicorn's native log format (with PID) intact.
-_project_handler = logging.StreamHandler(sys.stderr)
-_project_handler.setFormatter(logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-))
-logging.getLogger("llm_proxy").addHandler(_project_handler)
-logging.getLogger("llm_proxy").setLevel(logging.DEBUG)
-logging.getLogger("llm_proxy").propagate = False
+# Guard against duplicate handlers (uvicorn reload may import main.py twice).
+if not logging.getLogger("llm_proxy").handlers:
+    _project_handler = logging.StreamHandler(sys.stderr)
+    _project_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logging.getLogger("llm_proxy").addHandler(_project_handler)
+    logging.getLogger("llm_proxy").setLevel(logging.DEBUG)
+    logging.getLogger("llm_proxy").propagate = False
 
 logger = logging.getLogger("llm_proxy.main")
 
