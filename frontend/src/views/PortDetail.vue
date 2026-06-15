@@ -478,19 +478,29 @@ function goBack() {
 function toggleCopyMenu() { copyMenuOpen.value = !copyMenuOpen.value }
 function closeCopyMenu() { copyMenuOpen.value = false }
 
-function downloadJson(filename, data) {
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
-  const url = URL.createObjectURL(blob)
+// 构建导出 URL — 浏览器直接导航到此 URL 即可触发下载
+// 后端返回 Content-Disposition: attachment，浏览器弹出原生下载对话框
+function buildExportUrl(portId, { methodFilter = 'all', format = 'full' } = {}) {
+  const params = new URLSearchParams()
+  if (methodFilter !== 'all') params.set('method_filter', methodFilter)
+  if (format !== 'full') params.set('format', format)
+  params.set('token', localStorage.getItem('token'))
+  return `/api/ports/${portId}/export?${params.toString()}`
+}
+
+// 浏览器原生下载：直接导航到导出 URL
+// 后端有 Content-Disposition: attachment 头，浏览器会自动弹出下载对话框（含进度条）
+function downloadDirect(url) {
   const a = document.createElement('a')
   a.href = url
-  a.download = filename
+  a.style.display = 'none'
   document.body.appendChild(a)
   a.click()
   document.body.removeChild(a)
-  URL.revokeObjectURL(url)
 }
 
-function downloadBlob(filename, blob) {
+function downloadJson(filename, data) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
@@ -531,26 +541,23 @@ function exportJsonOnly() {
   }
 }
 
-async function exportAllData() {
+function exportAllData() {
   closeCopyMenu()
   if (exporting.value) return
   exporting.value = true
   try {
-    // 无客户端过滤时走 Blob 直通路径：后端流式发送 → fetch 流式接收 → 直接写入磁盘
-    // 跳过 JSON.parse / JSON.stringify，零拷贝，不受 axios 30s 超时限制
+    // all/api — 浏览器直接下载：服务器每发一批 MySQL 就 flush 一批
+    // → nginx 透传 → 浏览器原生下载管理器（弹出对话框 + 进度条）
+    // 不需要前端缓冲/解析，数据从数据库直接流到用户硬盘
     if (methodFilter.value === 'all' || methodFilter.value === 'api') {
       const serverFilter = methodFilter.value === 'api' ? 'api' : 'all'
-      const blob = await api.exportPortHistoryBlob(portId, serverFilter)
-      downloadBlob(getExportFilename('full'), blob)
-      showToast('已导出全部数据', 'success')
+      downloadDirect(buildExportUrl(portId, { methodFilter: serverFilter }))
+      showToast('下载已开始，请查看浏览器下载进度', 'success')
     } else {
-      // 'other' 过滤器需要前端筛选，必须解析 JSON
-      const exportData = await api.exportPortHistory(portId)
-      const filteredIds = new Set(_getExportRequests().map(r => r.id))
-      exportData.requests = (exportData.requests || []).filter(r => filteredIds.has(r.id))
-      exportData.total_requests = exportData.requests.length
-      downloadJson(getExportFilename('full'), exportData)
-      showToast(`已导出 ${exportData.total_requests} 条完整交互记录`, 'success')
+      // 'other' 过滤器后端不支持，只能从前端已加载的分页数据导出
+      const source = _getExportRequests()
+      downloadJson(getExportFilename('full'), { port: data.value.port, requests: source, total_requests: source.length })
+      showToast(`已导出 ${source.length} 条完整交互记录（当前页面数据）`, 'success')
     }
   } catch (e) {
     // 降级：从已加载的分页数据中导出
@@ -566,21 +573,15 @@ async function exportAllData() {
   }
 }
 
-async function exportApiFromServer() {
+function exportApiFromServer() {
   closeCopyMenu()
   if (exporting.value) return
   exporting.value = true
   try {
-    // 需要转换数据格式，使用 fetch 流式接收 + 解析（无 axios 超时限制）
-    const exportData = await api.exportPortHistory(portId, 'api')
-    const output = (exportData.requests || []).map((r, i) => {
-      const entry = { index: i + 1, method: r.method, path: r.path, status_code: r.status_code }
-      entry.request = typeof r.request_body === 'string' ? (tryParseJson(r.request_body) ?? r.request_body) : r.request_body
-      entry.response = typeof r.response_body === 'string' ? (tryParseJson(r.response_body) ?? r.response_body) : r.response_body
-      return entry
-    })
-    downloadJson(getExportFilename('api-json-only'), output)
-    showToast(`已从后端导出 ${output.length} 条API请求JSON数据`, 'success')
+    // format=simple 由后端完成 JSON 提取（省去前端解析/转换）
+    // 浏览器原生下载，对话框立即弹出
+    downloadDirect(buildExportUrl(portId, { methodFilter: 'api', format: 'simple' }))
+    showToast('下载已开始，请查看浏览器下载进度', 'success')
   } catch (e) {
     showToast('后端导出失败', 'error')
   } finally {

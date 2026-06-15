@@ -12,7 +12,8 @@ import database
 from database import get_db
 from models import User, Port, Request as RequestModel
 from schemas import PortCreate, PortUpdate, PortInfo, PortHistory, RequestInfo
-from auth import require_approved
+from auth import require_approved, _verify_token_str, security_optional
+from fastapi.security import HTTPAuthorizationCredentials
 from config import ALLOW_INTERNAL_TARGETS
 from proxy_app import refresh_port_cache
 
@@ -622,18 +623,35 @@ def get_raw_sse(
 def export_port_history(
     port_id: int,
     method_filter: str = "all",
-    current_user: User = Depends(require_approved),
-    db: Session = Depends(get_db),  # for port lookup + count only
+    format: str = "full",
+    token: str = None,
+    credentials: HTTPAuthorizationCredentials = Depends(security_optional),
+    db: Session = Depends(get_db),
 ):
-    """Export all request history for a port as a streaming JSON response.
+    """Export all request history for a port as a streaming JSON download.
 
-    Uses a dedicated session (via `yield_per`) for the streaming phase so
-    the session outlives the route handler return.  Memory stays constant
-    at ~100 rows regardless of total record count.
+    Supports two auth methods so the browser can trigger a direct download
+    (where custom headers are impossible — use ``?token=...``) while the
+    fetch-based path keeps using the Bearer header.
 
     Args:
-        method_filter: 'all' (default) or 'api' (POST/PUT/PATCH/DELETE only).
+        method_filter: ``all`` (default) or ``api`` (POST/PUT/PATCH/DELETE only).
+        format: ``full`` (default, all fields + port metadata) or
+                ``simple`` (flat array of {index, method, path, status_code,
+                request, response} — no headers, no port wrapper).
+        token: JWT for browser-direct download (no Authorization header support).
     """
+    # ── Auth: prefer Bearer header, fallback to ?token= query param ──
+    if credentials:
+        current_user = _verify_token_str(credentials.credentials, db)
+    elif token:
+        current_user = _verify_token_str(token, db)
+    else:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if not current_user.is_approved and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Account not yet approved by admin")
+
     port = db.query(Port).filter(Port.id == port_id).first()
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
@@ -654,8 +672,15 @@ def export_port_history(
     _port_target = port.target_url
     _port_desc = port.description
     _port_created = port.created_at.isoformat() if port.created_at else None
+    _simple = (format == "simple")
 
-    def _row_to_dict(r):
+    # Build filename for Content-Disposition
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    filter_label = "-api" if method_filter == "api" else ""
+    fmt_label = "-simple" if _simple else ""
+    filename = f"llm-proxy-port{_port_number}{filter_label}{fmt_label}-{ts}.json"
+
+    def _row_to_full(r):
         entry = {
             "id": r.id,
             "method": r.method,
@@ -675,9 +700,25 @@ def export_port_history(
                 entry[field] = None
         return entry
 
+    def _row_to_simple(r, index):
+        entry = {
+            "index": index,
+            "method": r.method,
+            "path": r.path,
+            "status_code": r.status_code,
+        }
+        for field in ["request_body", "response_body"]:
+            raw = getattr(r, field, None)
+            if raw:
+                try:
+                    entry["request" if field == "request_body" else "response"] = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    entry["request" if field == "request_body" else "response"] = raw
+            else:
+                entry["request" if field == "request_body" else "response"] = None
+        return entry
+
     def stream_jsonl():
-        # OWN session with server-side cursor (SSCursor) — fetches rows from MySQL
-        # incrementally instead of loading the full result set into memory.
         own_db = database.StreamSessionLocal()
         try:
             query = (
@@ -689,27 +730,41 @@ def export_port_history(
                 query = query.filter(RequestModel.method.in_(["POST", "PUT", "PATCH", "DELETE"]))
             query = query.order_by(RequestModel.created_at.asc())
 
-            yield b'{"port":'
-            yield json.dumps({
-                "port_number": _port_number,
-                "target_url": _port_target,
-                "description": _port_desc,
-                "created_at": _port_created,
-            }, ensure_ascii=False).encode("utf-8")
-            yield f',"total_requests":{total_count},"requests":['.encode("utf-8")
+            if _simple:
+                # Flat array: [{"index":1,...}, ...]
+                yield b"["
+                first = True
+                idx = 0
+                for r in query.yield_per(100):
+                    idx += 1
+                    if not first:
+                        yield b","
+                    first = False
+                    yield json.dumps(_row_to_simple(r, idx), ensure_ascii=False).encode("utf-8")
+                yield b"]"
+            else:
+                # Full: {"port":{...},"total_requests":N,"requests":[...]}
+                yield b'{"port":'
+                yield json.dumps({
+                    "port_number": _port_number,
+                    "target_url": _port_target,
+                    "description": _port_desc,
+                    "created_at": _port_created,
+                }, ensure_ascii=False).encode("utf-8")
+                yield f',"total_requests":{total_count},"requests":['.encode("utf-8")
 
-            first = True
-            for r in query.yield_per(100):
-                entry = _row_to_dict(r)
-                if not first:
-                    yield b","
-                first = False
-                yield json.dumps(entry, ensure_ascii=False).encode("utf-8")
-            yield b"]}"
+                first = True
+                for r in query.yield_per(100):
+                    if not first:
+                        yield b","
+                    first = False
+                    yield json.dumps(_row_to_full(r), ensure_ascii=False).encode("utf-8")
+                yield b"]}"
         finally:
             own_db.close()
 
     return StreamingResponse(
         stream_jsonl(),
         media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
