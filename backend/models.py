@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Index
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
@@ -39,8 +39,9 @@ class Port(Base):
 class Request(Base):
     __tablename__ = "requests"
     __table_args__ = (
-        # Composite index for fast filtering by port_id and ordering by created_at
-        # This speeds up the get_port_history query significantly
+        # Composite index for fast filtering by port_id, method, and ordering by created_at.
+        # Without this, COUNT/ORDER BY on a port's requests requires a filesort.
+        Index("ix_requests_port_method_created", "port_id", "method", "created_at"),
         {"mysql_charset": "utf8mb4"},
     )
 

@@ -208,7 +208,7 @@ def _migrate_columns_on_engine(eng):
             ("ix_requests_port_id", "CREATE INDEX ix_requests_port_id ON requests (port_id)"),
             ("ix_requests_created_at", "CREATE INDEX ix_requests_created_at ON requests (created_at)"),
             ("ix_requests_port_created", "CREATE INDEX ix_requests_port_created ON requests (port_id, created_at DESC)"),
-
+            ("ix_requests_port_method_created", "CREATE INDEX ix_requests_port_method_created ON requests (port_id, method, created_at)"),
         ]:
             try:
                 conn.execute(text(idx_sql))
