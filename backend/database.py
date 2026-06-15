@@ -140,69 +140,66 @@ def setup_schema():
         logger.info("Schema setup complete (DDL engine disposed)")
 
 
+def _run_migration_ddl(conn, sql: str, success_msg: str):
+    """Execute a migration DDL statement, logging success or the actual error."""
+    try:
+        conn.execute(text(sql))
+        conn.commit()
+        logger.info(success_msg)
+    except Exception as e:
+        conn.rollback()
+        # Expected for "already exists" (1060=duplicate column, 1061=duplicate index),
+        # but log anyway so the operator has full visibility.
+        err_msg = str(e).rstrip()
+        logger.warning("Migration skipped (%s): %s", sql[:60], err_msg[:200])
+
+
 def _migrate_columns_on_engine(eng):
     """Like ``_migrate_columns()`` but accepts an explicit engine argument."""
     with eng.connect() as conn:
-        try:
-            conn.execute(text(
-                "ALTER TABLE requests ADD COLUMN response_body_raw LONGTEXT NULL"
-            ))
-            conn.commit()
-            logger.info("Added column: response_body_raw")
-        except Exception:
-            conn.rollback()
+        # ── Column additions ──
+        _run_migration_ddl(
+            conn,
+            "ALTER TABLE requests ADD COLUMN response_body_raw LONGTEXT NULL",
+            "Added column: response_body_raw",
+        )
 
         # Make port_id nullable so orphaned requests (from deleted ports)
         # can still be saved with raw response data intact.
-        try:
-            conn.execute(text(
-                "ALTER TABLE requests MODIFY COLUMN port_id INT NULL"
-            ))
-            conn.commit()
-            logger.info("Altered port_id to nullable")
-        except Exception:
-            conn.rollback()
+        _run_migration_ddl(
+            conn,
+            "ALTER TABLE requests MODIFY COLUMN port_id INT NULL",
+            "Altered port_id to nullable",
+        )
 
         # Add reconstruction_error flag to requests for SSE failure tracking
-        try:
-            conn.execute(text(
-                "ALTER TABLE requests ADD COLUMN reconstruction_error TINYINT(1) "
-                "NOT NULL DEFAULT 0"
-            ))
-            conn.commit()
-            logger.info("Added column: requests.reconstruction_error")
-        except Exception:
-            conn.rollback()
+        _run_migration_ddl(
+            conn,
+            "ALTER TABLE requests ADD COLUMN reconstruction_error TINYINT(1) NOT NULL DEFAULT 0",
+            "Added column: requests.reconstruction_error",
+        )
 
         # Add deleted_at column to ports for soft-delete
-        try:
-            conn.execute(text(
-                "ALTER TABLE ports ADD COLUMN deleted_at DATETIME NULL"
-            ))
-            conn.commit()
-            logger.info("Added column: ports.deleted_at")
-        except Exception:
-            conn.rollback()
+        _run_migration_ddl(
+            conn,
+            "ALTER TABLE ports ADD COLUMN deleted_at DATETIME NULL",
+            "Added column: ports.deleted_at",
+        )
 
         # Add prefer_http2 column to ports — NULL=HTTP/1.1 (default)
-        try:
-            conn.execute(text(
-                "ALTER TABLE ports ADD COLUMN prefer_http2 TINYINT(1) NULL"
-            ))
-            conn.commit()
-            logger.info("Added column: ports.prefer_http2 (nullable)")
-        except Exception:
-            conn.rollback()
+        _run_migration_ddl(
+            conn,
+            "ALTER TABLE ports ADD COLUMN prefer_http2 TINYINT(1) NULL",
+            "Added column: ports.prefer_http2 (nullable)",
+        )
 
         for col in ["request_headers", "request_body", "response_headers",
                      "response_body", "response_body_raw"]:
-            try:
-                conn.execute(
-                    text(f"ALTER TABLE requests MODIFY COLUMN `{col}` LONGTEXT NULL")
-                )
-                conn.commit()
-            except Exception:
-                conn.rollback()
+            _run_migration_ddl(
+                conn,
+                f"ALTER TABLE requests MODIFY COLUMN `{col}` LONGTEXT NULL",
+                f"Altered column type: {col} → LONGTEXT",
+            )
 
         for idx_name, idx_sql in [
             ("ix_requests_port_id", "CREATE INDEX ix_requests_port_id ON requests (port_id)"),
@@ -210,12 +207,7 @@ def _migrate_columns_on_engine(eng):
             ("ix_requests_port_created", "CREATE INDEX ix_requests_port_created ON requests (port_id, created_at DESC)"),
             ("ix_requests_port_method_created", "CREATE INDEX ix_requests_port_method_created ON requests (port_id, method, created_at)"),
         ]:
-            try:
-                conn.execute(text(idx_sql))
-                conn.commit()
-                logger.info("Added index: %s", idx_name)
-            except Exception:
-                conn.rollback()
+            _run_migration_ddl(conn, idx_sql, f"Added index: {idx_name}")
 
         logger.info("Column migration complete")
 

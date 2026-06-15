@@ -159,8 +159,8 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                 if stream_ctx is not None:
                     try:
                         await stream_ctx.__aexit__(None, None, None)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to close dead stream context: %s", e)
                     stream_ctx = None
 
         status_code = response.status_code
@@ -232,8 +232,8 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                             # Close the dead/poisoned stream context
                             try:
                                 await current_ctx.__aexit__(None, None, None)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug("Failed to close poisoned stream context: %s", e)
 
                             # Re-create stream context — httpx will use a
                             # different connection from the pool (or create
@@ -285,8 +285,8 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                     resp_buf.close()
                     try:
                         await current_ctx.__aexit__(None, None, None)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to close stream context (http2 retry): %s", e)
 
             response_headers = {"X-Proxy-Port": str(port_number)}
             return StreamingResponse(
@@ -321,8 +321,8 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                         # Close dead context, re-create on fresh connection
                         try:
                             await stream_ctx.__aexit__(None, None, None)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug("Failed to close dead stream context (http1 retry): %s", e)
                         stream_ctx = client.stream(
                             method=request.method,
                             url=target_full_url,
@@ -348,7 +348,8 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
             resp_body_str = _serialize_body(full_body, label="response")
             try:
                 resp_body_raw_str = full_body.decode("utf-8", errors="replace")
-            except Exception:
+            except Exception as e:
+                logger.debug("Failed to decode full body as UTF-8, using response text: %s", e)
                 resp_body_raw_str = resp_body_str
 
     except httpx.TimeoutException as e:
