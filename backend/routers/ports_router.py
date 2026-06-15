@@ -1,5 +1,6 @@
 import ipaddress
 import json
+import logging
 import socket
 import time
 import uuid
@@ -19,6 +20,8 @@ from auth import require_approved, _verify_token_str, security_optional
 from fastapi.security import HTTPAuthorizationCredentials
 from config import ALLOW_INTERNAL_TARGETS
 from proxy_app import refresh_port_cache
+
+logger = logging.getLogger("llm_proxy.ports")
 
 router = APIRouter(prefix="/api/ports", tags=["ports"])
 
@@ -837,6 +840,15 @@ def export_port_history(
                 query = query.filter(RequestModel.method.in_(["POST", "PUT", "PATCH", "DELETE"]))
             query = query.order_by(RequestModel.created_at.asc())
 
+            # Progress tracking
+            _start_ts = time.time()
+            _report_every = max(500, total_count // 10) if total_count > 0 else 500
+            _next_report = _report_every
+            logger.info(
+                "Export started: port=%d count=%d filter=%s format=%s",
+                _port_number, total_count, method_filter, "simple" if _simple else "full",
+            )
+
             if _simple:
                 # Flat array: [{"index":1,...}, ...]
                 yield b"["
@@ -848,6 +860,13 @@ def export_port_history(
                         yield b","
                     first = False
                     yield _build_simple_row(r, idx)
+                    if idx >= _next_report:
+                        pct = (idx / total_count * 100) if total_count > 0 else 0
+                        logger.info(
+                            "Export progress: port=%d %d/%d (%.0f%%) elapsed=%.1fs",
+                            _port_number, idx, total_count, pct, time.time() - _start_ts,
+                        )
+                        _next_report += _report_every
                 yield b"]"
             else:
                 # Full: {"port":{...},"total_requests":N,"requests":[...]}
@@ -861,12 +880,28 @@ def export_port_history(
                 yield f',"total_requests":{total_count},"requests":['.encode("utf-8")
 
                 first = True
+                row = 0
                 for r in query.yield_per(100):
+                    row += 1
                     if not first:
                         yield b","
                     first = False
                     yield _build_full_row(r)
+                    if row >= _next_report:
+                        pct = (row / total_count * 100) if total_count > 0 else 0
+                        logger.info(
+                            "Export progress: port=%d %d/%d (%.0f%%) elapsed=%.1fs",
+                            _port_number, row, total_count, pct, time.time() - _start_ts,
+                        )
+                        _next_report += _report_every
                 yield b"]}"
+
+            elapsed = time.time() - _start_ts
+            final = row if not _simple else idx
+            logger.info(
+                "Export finished: port=%d %d rows in %.1fs (%.0f rows/s)",
+                _port_number, final, elapsed, final / elapsed if elapsed > 0 else 0,
+            )
         finally:
             own_db.close()
 
