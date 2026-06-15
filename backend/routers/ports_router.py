@@ -844,6 +844,9 @@ def export_port_history(
             _start_ts = time.time()
             _report_every = max(500, total_count // 10) if total_count > 0 else 500
             _next_report = _report_every
+            _t_last_report = _start_ts  # for per-interval rows/s
+            _first_row = True
+            _t_first = 0.0  # time to first row (set after first iteration)
             logger.info(
                 "Export started: port=%d count=%d filter=%s format=%s",
                 _port_number, total_count, method_filter, "simple" if _simple else "full",
@@ -856,17 +859,32 @@ def export_port_history(
                 idx = 0
                 for r in query.yield_per(100):
                     idx += 1
+                    if _first_row:
+                        _t_first = time.time() - _start_ts
+                        _first_row = False
+                        logger.info(
+                            "Export first row: port=%d time_to_first_row=%.2fs "
+                            "(MySQL query execution + first fetch from SSCursor)",
+                            _port_number, _t_first,
+                        )
                     if not first:
                         yield b","
                     first = False
                     yield _build_simple_row(r, idx)
                     if idx >= _next_report:
+                        now = time.time()
                         pct = (idx / total_count * 100) if total_count > 0 else 0
+                        interval_s = now - _t_last_report
+                        interval_rows = _report_every
                         logger.info(
-                            "Export progress: port=%d %d/%d (%.0f%%) elapsed=%.1fs",
-                            _port_number, idx, total_count, pct, time.time() - _start_ts,
+                            "Export progress: port=%d %d/%d (%.0f%%) "
+                            "elapsed=%.1fs interval=[%d rows in %.1fs, %.0f rows/s]",
+                            _port_number, idx, total_count, pct,
+                            now - _start_ts, interval_rows, interval_s,
+                            interval_rows / interval_s if interval_s > 0 else 0,
                         )
                         _next_report += _report_every
+                        _t_last_report = now
                 yield b"]"
             else:
                 # Full: {"port":{...},"total_requests":N,"requests":[...]}
@@ -883,24 +901,43 @@ def export_port_history(
                 row = 0
                 for r in query.yield_per(100):
                     row += 1
+                    if _first_row:
+                        _t_first = time.time() - _start_ts
+                        _first_row = False
+                        logger.info(
+                            "Export first row: port=%d time_to_first_row=%.2fs "
+                            "(MySQL query execution + first fetch from SSCursor)",
+                            _port_number, _t_first,
+                        )
                     if not first:
                         yield b","
                     first = False
                     yield _build_full_row(r)
                     if row >= _next_report:
+                        now = time.time()
                         pct = (row / total_count * 100) if total_count > 0 else 0
+                        interval_s = now - _t_last_report
+                        interval_rows = _report_every
                         logger.info(
-                            "Export progress: port=%d %d/%d (%.0f%%) elapsed=%.1fs",
-                            _port_number, row, total_count, pct, time.time() - _start_ts,
+                            "Export progress: port=%d %d/%d (%.0f%%) "
+                            "elapsed=%.1fs interval=[%d rows in %.1fs, %.0f rows/s]",
+                            _port_number, row, total_count, pct,
+                            now - _start_ts, interval_rows, interval_s,
+                            interval_rows / interval_s if interval_s > 0 else 0,
                         )
                         _next_report += _report_every
+                        _t_last_report = now
                 yield b"]}"
 
             elapsed = time.time() - _start_ts
             final = row if not _simple else idx
+            _t_first_val = _t_first if not _first_row else elapsed
             logger.info(
-                "Export finished: port=%d %d rows in %.1fs (%.0f rows/s)",
-                _port_number, final, elapsed, final / elapsed if elapsed > 0 else 0,
+                "Export finished: port=%d %d rows in %.1fs (%.0f rows/s) "
+                "breakdown=[first_row=%.2fs, transfer+process=%.2fs]",
+                _port_number, final, elapsed,
+                final / elapsed if elapsed > 0 else 0,
+                _t_first_val, elapsed - _t_first_val,
             )
         finally:
             own_db.close()
