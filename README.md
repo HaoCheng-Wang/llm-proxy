@@ -394,24 +394,28 @@ flowchart LR
 
 端口交互历史导出（`GET /api/ports/{id}/export`）面临的核心挑战是：一个端口可能积累数万条记录，每行包含 LONGTEXT 字段。传统做法（后端全量查询 → 内存组装 → 一次性返回 → 前端解析）在数据量大时必然超时或 OOM。
 
-本系统的导出采用**四层真流式**，每层都不缓存、不阻塞：
+本系统的导出采用**五层真流式 + 浏览器原生下载**——用户点击导出，浏览器**立即弹出下载对话框**，自带进度条。数据从 MySQL 直接流到用户硬盘，全程不经过 JavaScript 内存缓冲，也不受任何超时限制。
 
 ```mermaid
 flowchart LR
-    subgraph MySQL
-        A[(requests 表)] -->|"SSCursor<br/>逐批拉取<br/>每批 ~100 行"| B
-    end
-    subgraph Python
-        B[yield_per 迭代器] -->|"json.dumps<br/>立即序列化"| C
-    end
-    subgraph FastAPI
-        C[StreamingResponse] -->|"逐 chunk yield<br/>零内存累积"| D
+    subgraph 用户操作
+        U[点击导出] -->|"POST /api/ports/{id}/export-ticket<br/>（Bearer JWT 鉴权）"| T
+        T[获得一次性 ticket] -->|"GET /api/ports/{id}/export?ticket=...<br/>（浏览器原生请求）"| N
     end
     subgraph nginx
-        D -->|"proxy_read_timeout=0<br/>不限时转发"| E
+        N -->|"导出路由独立 location<br/>proxy_read_timeout=0"| S
+    end
+    subgraph FastAPI
+        S -->|"_consume_ticket()<br/>验证并销毁 ticket"| V
+        V -->|"StreamingResponse<br/>Content-Disposition: attachment"| G
+        G[stream_jsonl 生成器] -->|"json.dumps<br/>立即序列化"| Q
+    end
+    subgraph MySQL
+        Q -->|"yield_per(100)"| C[SSCursor]
+        C -->|"逐批拉取 ~100 行"| D[(requests 表)]
     end
     subgraph 浏览器
-        E -->|"fetch + Blob<br/>零 JSON 解析<br/>直接写磁盘"| F[(用户硬盘)]
+        N -->|"下载对话框立即弹出<br/>原生进度条<br/>直接写磁盘"| F[(用户硬盘)]
     end
 ```
 
@@ -422,25 +426,62 @@ flowchart LR
 | MySQL → Python | `pymysql.cursors.SSCursor` | 服务端游标，不在 MySQL 客户端缓冲全部行 | `read_timeout=300s`（每批是 100 行小查询） |
 | Python → FastAPI | `StreamingResponse` + `yield_per(100)` | 读取一批立即发送一批，内存同时只有 ~100 行 | 无 (uvicorn 不限时) |
 | nginx | 导出路由独立 `location` 块 | 专用路由不限时，不影响其他 API | `proxy_read_timeout=0`（不限时） |
-| 浏览器 | `fetch` + `r.blob()` | 绕过 axios 的 30s 超时和整响应缓冲，浏览器原生流式接收 | 无 (浏览器默认不限时) |
+| 浏览器 | `<a>` 标签导航 + `Content-Disposition: attachment` | 浏览器原生下载管理器，弹出对话框即开始写磁盘，JS 内存占用为 0 | 无 (浏览器默认不限时) |
+
+#### 一次性 Ticket 鉴权
+
+核心矛盾：浏览器 `<a>` 标签下载**无法携带自定义 HTTP 头**（如 `Authorization: Bearer ...`），但直接把 JWT 放在 URL 查询参数里会泄露到 nginx 日志、浏览器历史、Referer 头。
+
+解决：引入**一次性下载 ticket**——前端通过 Bearer 鉴权的 API 获取一个随机字符串，然后把它放在下载 URL 中。Ticket 是：
+
+- **单次使用**：验证后立即销毁（`dict.pop`），同一个 ticket 第二次请求直接 401
+- **60 秒过期**：指拿到 ticket 后必须在 60 秒内**开始下载**，与下载耗时无关——ticket 在 HTTP 请求到达的瞬间就被验证并销毁了，后续几小时的流式传输完全不受影响
+- **内存存储**：不落库，进程重启后全部作废
+- **端口绑定**：ticket 记录了 `port_id`，不能跨端口使用
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant F as 前端
+    participant B as 后端
+
+    U->>F: 点击"导出全部数据"
+    F->>B: POST /api/ports/{id}/export-ticket<br/>Authorization: Bearer <JWT>
+    B-->>F: {"ticket": "a1b2c3...", "expires_in": 60}
+    F->>F: 构建 <a href="/api/ports/{id}/export?ticket=a1b2c3...">
+    F->>F: a.click()
+    Note over B: _consume_ticket() → 验证 → 销毁 → 开始流式传输
+    B-->>U: Content-Disposition: attachment<br/>浏览器弹出下载对话框 + 进度条
+    Note over U: 下载可能持续数分钟<br/>ticket 早已销毁，不受影响
+```
 
 #### 两条导出路径
 
 ```
-导出方式          all / api 过滤器             other 过滤器
-─────────────────  ─────────────────────────  ───────────────────────
-数据路径           后端全量流式 → 前端直写磁盘    后端全量流式 → 前端解析 JSON
-处理               零拷贝（Blob 直通）           前端过滤 + 重组
-API 调用            exportPortHistoryBlob()     exportPortHistory()
-内存占用            浏览器 ~O(1)                 浏览器 O(n)（需解析过滤）
-降级策略            已加载分页数据导出             已加载分页数据导出
+导出方式          all / api 过滤器                    other 过滤器
+─────────────────  ─────────────────────────────────  ──────────────────────
+数据路径           浏览器原生下载（ticket → 流式）       前端已加载分页数据导出
+处理              后端 SSCursor 逐批 → 浏览器写磁盘     前端 Blob → 下载
+API 调用            POST /export-ticket + GET /export   无 API 调用
+内存占用            浏览器 JS ~O(1)                     浏览器 JS O(n)
+格式              后端 Content-Disposition 含时间戳文件名 前端生成文件名
 ```
 
-`all` 和 `api` 过滤器走 Blob 直通路径是因为后端可以根据 `method_filter` 参数完成过滤，前端无需二次处理。`other`（非 API 方法）过滤器后端不支持，需要前端解析 JSON 后筛选。
+`all` 和 `api` 过滤器走浏览器原生下载。`other`（非 API 方法）过滤器后端不支持，从前端已加载的分页数据导出。
 
-#### 为什么不用 axios
+#### format=simple 模式
 
-axios 的 `timeout` 是**整个请求-响应的总时限**，不是"每两次读取之间"的时限。导出 5 万条数据可能需要几分钟，无法预知上限。axios 还在内存中缓冲整响应（`r.data` = `JSON.parse(responseText)`），数据量大时二次序列化开销也不可忽略。改用 `fetch` + `r.blob()` 后，浏览器直接将 HTTP 响应流写入磁盘，不经过 JavaScript 解析。
+导出 API 支持 `?format=simple` 参数。默认 `full` 模式返回完整的 `{port, total_requests, requests: [{id, method, path, request_headers, ...}]}`；`simple` 模式返回扁平数组 `[{index, method, path, status_code, request, response}]`，由后端完成 JSON 提取和重组，前端零处理开销。"导出全部 API 请求 JSON"按钮即使用此模式。
+
+#### 为什么不用 axios / fetch
+
+| 方案 | 下载对话框 | 进度条 | 内存占用 | 超时风险 |
+|------|:--:|:--:|:--:|:--:|
+| axios `r.data` | ❌ 等全部传完才弹 | ❌ 无 | 全部数据在 JS 堆里 | 30s 硬超时 |
+| fetch `r.blob()` | ❌ 等全部传完才弹 | ❌ 无 | 全部数据在 JS 堆里 | 无（但不写磁盘） |
+| **`<a>` 标签 + 一次性 ticket** | ✅ 立即弹出 | ✅ 原生进度条 | 0（浏览器直接写磁盘） | 无 |
+
+核心洞察：**浏览器自带一个完善的下载管理器，为什么要绕过它？**
 
 ### 请求头转发规则
 
@@ -999,7 +1040,8 @@ llm-proxy/
 | DELETE | `/api/ports/{id}/history/{req_id}` | 删除单条记录 |
 | GET | `/api/ports/{id}/history/{req_id}` | 获取单条记录详情 |
 | GET | `/api/ports/{id}/history/{req_id}/raw-sse` | 按需获取原始 SSE 文本 |
-| GET | `/api/ports/{id}/export` | 流式导出全部交互 JSON（SSCursor 逐批拉取 + StreamingResponse，无内存瓶颈） |
+| GET | `/api/ports/{id}/export` | 流式导出全部交互 JSON（SSCursor + StreamingResponse + Content-Disposition） |
+| POST | `/api/ports/{id}/export-ticket` | 创建一次性下载 ticket（用于浏览器原生下载，JWT 不暴露在 URL 中） |
 
 ### 管理员
 
