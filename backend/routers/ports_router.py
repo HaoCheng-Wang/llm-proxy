@@ -1,7 +1,10 @@
 import ipaddress
 import json
 import socket
+import time
+import uuid
 from datetime import datetime, timezone
+from threading import Lock
 from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -18,6 +21,39 @@ from config import ALLOW_INTERNAL_TARGETS
 from proxy_app import refresh_port_cache
 
 router = APIRouter(prefix="/api/ports", tags=["ports"])
+
+# ── One-time download ticket store (in-memory, no DB needed) ──
+# Tickets allow browser-native <a> downloads without exposing the JWT
+# in URL query strings (which would leak into nginx logs, browser
+# history, and Referer headers).  Each ticket is single-use and
+# expires after DOWNLOAD_TICKET_TTL seconds.
+_DOWNLOAD_TICKET_TTL = 60
+_export_tickets: dict[str, tuple[int, int, float]] = {}  # ticket → (port_id, user_id, expires_at)
+_tickets_lock = Lock()
+
+
+def _create_ticket(port_id: int, user_id: int) -> str:
+    ticket = uuid.uuid4().hex
+    with _tickets_lock:
+        now = time.time()
+        # Purge expired tickets (cheap — dict is small)
+        expired = [t for t, (_, _, exp) in _export_tickets.items() if exp < now]
+        for t in expired:
+            del _export_tickets[t]
+        _export_tickets[ticket] = (port_id, user_id, now + _DOWNLOAD_TICKET_TTL)
+    return ticket
+
+
+def _consume_ticket(ticket: str) -> tuple[int, int] | None:
+    """Validate and consume a download ticket. Returns (port_id, user_id) or None."""
+    with _tickets_lock:
+        entry = _export_tickets.pop(ticket, None)
+    if entry is None:
+        return None
+    port_id, user_id, expires_at = entry
+    if expires_at < time.time():
+        return None
+    return (port_id, user_id)
 
 
 def _is_private_ip(hostname: str) -> bool:
@@ -619,33 +655,65 @@ def get_raw_sse(
     return {"raw_sse": row[0] or ""}
 
 
+@router.post("/{port_id}/export-ticket")
+def create_export_ticket(
+    port_id: int,
+    current_user: User = Depends(require_approved),
+    db: Session = Depends(get_db),
+):
+    """Create a one-time download ticket for browser-native export.
+
+    Browser <a> tag downloads cannot carry an Authorization header, so
+    we issue a short-lived single-use ticket that the browser appends as
+    ``?ticket=...``.  The real JWT never appears in URLs, nginx logs, or
+    browser history.
+    """
+    port = db.query(Port).filter(Port.id == port_id).first()
+    if not port:
+        raise HTTPException(status_code=404, detail="Port not found")
+    if current_user.role != "admin" and port.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    ticket = _create_ticket(port_id, current_user.id)
+    return {"ticket": ticket, "expires_in": _DOWNLOAD_TICKET_TTL}
+
+
 @router.get("/{port_id}/export")
 def export_port_history(
     port_id: int,
     method_filter: str = "all",
     format: str = "full",
-    token: str = None,
+    ticket: str = None,
     credentials: HTTPAuthorizationCredentials = Depends(security_optional),
     db: Session = Depends(get_db),
 ):
     """Export all request history for a port as a streaming JSON download.
 
-    Supports two auth methods so the browser can trigger a direct download
-    (where custom headers are impossible — use ``?token=...``) while the
-    fetch-based path keeps using the Bearer header.
+    Supports two auth modes so the browser can trigger a direct download
+    (where custom headers are impossible — use ``?ticket=...`` from
+    ``POST /{port_id}/export-ticket``) while the fetch-based path keeps
+    using the Bearer header.
 
     Args:
         method_filter: ``all`` (default) or ``api`` (POST/PUT/PATCH/DELETE only).
         format: ``full`` (default, all fields + port metadata) or
                 ``simple`` (flat array of {index, method, path, status_code,
                 request, response} — no headers, no port wrapper).
-        token: JWT for browser-direct download (no Authorization header support).
+        ticket: One-time download ticket (from POST /{port_id}/export-ticket).
     """
-    # ── Auth: prefer Bearer header, fallback to ?token= query param ──
+    # ── Auth: prefer Bearer header, fallback to ?ticket= one-time token ──
     if credentials:
         current_user = _verify_token_str(credentials.credentials, db)
-    elif token:
-        current_user = _verify_token_str(token, db)
+    elif ticket:
+        entry = _consume_ticket(ticket)
+        if entry is None:
+            raise HTTPException(status_code=401, detail="Invalid or expired ticket")
+        _ticket_port_id, _ticket_user_id = entry
+        if _ticket_port_id != port_id:
+            raise HTTPException(status_code=403, detail="Ticket does not match port")
+        current_user = db.query(User).filter(User.id == _ticket_user_id).first()
+        if not current_user:
+            raise HTTPException(status_code=401, detail="User not found")
     else:
         raise HTTPException(status_code=401, detail="Authentication required")
 

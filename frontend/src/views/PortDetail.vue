@@ -478,17 +478,7 @@ function goBack() {
 function toggleCopyMenu() { copyMenuOpen.value = !copyMenuOpen.value }
 function closeCopyMenu() { copyMenuOpen.value = false }
 
-// 构建导出 URL — 浏览器直接导航到此 URL 即可触发下载
-// 后端返回 Content-Disposition: attachment，浏览器弹出原生下载对话框
-function buildExportUrl(portId, { methodFilter = 'all', format = 'full' } = {}) {
-  const params = new URLSearchParams()
-  if (methodFilter !== 'all') params.set('method_filter', methodFilter)
-  if (format !== 'full') params.set('format', format)
-  params.set('token', localStorage.getItem('token'))
-  return `/api/ports/${portId}/export?${params.toString()}`
-}
-
-// 浏览器原生下载：直接导航到导出 URL
+// 浏览器原生下载：直接导航到导出 URL（带一次性 ticket）
 // 后端有 Content-Disposition: attachment 头，浏览器会自动弹出下载对话框（含进度条）
 function downloadDirect(url) {
   const a = document.createElement('a')
@@ -497,6 +487,17 @@ function downloadDirect(url) {
   document.body.appendChild(a)
   a.click()
   document.body.removeChild(a)
+}
+
+// 发起浏览器原生下载：先通过 Bearer 鉴权获取一次性 ticket，再用 ticket 触发下载
+// JWT 不会出现在 URL/nignx日志/浏览器历史中 — ticket 单次使用，60 秒过期
+async function downloadWithTicket(portId, { methodFilter = 'all', format = 'full' } = {}) {
+  const { ticket } = await api.createExportTicket(portId)
+  const params = new URLSearchParams()
+  if (methodFilter !== 'all') params.set('method_filter', methodFilter)
+  if (format !== 'full') params.set('format', format)
+  params.set('ticket', ticket)
+  downloadDirect(`/api/ports/${portId}/export?${params.toString()}`)
 }
 
 function downloadJson(filename, data) {
@@ -541,17 +542,17 @@ function exportJsonOnly() {
   }
 }
 
-function exportAllData() {
+async function exportAllData() {
   closeCopyMenu()
   if (exporting.value) return
   exporting.value = true
   try {
-    // all/api — 浏览器直接下载：服务器每发一批 MySQL 就 flush 一批
-    // → nginx 透传 → 浏览器原生下载管理器（弹出对话框 + 进度条）
-    // 不需要前端缓冲/解析，数据从数据库直接流到用户硬盘
+    // all/api — 获取一次性 ticket → 浏览器直接下载
+    // 服务器每发一批 MySQL 就 flush 一批 → nginx 透传 → 浏览器原生下载管理器
+    // （弹出对话框 + 进度条），数据从数据库直接流到用户硬盘
     if (methodFilter.value === 'all' || methodFilter.value === 'api') {
       const serverFilter = methodFilter.value === 'api' ? 'api' : 'all'
-      downloadDirect(buildExportUrl(portId, { methodFilter: serverFilter }))
+      await downloadWithTicket(portId, { methodFilter: serverFilter })
       showToast('下载已开始，请查看浏览器下载进度', 'success')
     } else {
       // 'other' 过滤器后端不支持，只能从前端已加载的分页数据导出
@@ -573,14 +574,14 @@ function exportAllData() {
   }
 }
 
-function exportApiFromServer() {
+async function exportApiFromServer() {
   closeCopyMenu()
   if (exporting.value) return
   exporting.value = true
   try {
     // format=simple 由后端完成 JSON 提取（省去前端解析/转换）
-    // 浏览器原生下载，对话框立即弹出
-    downloadDirect(buildExportUrl(portId, { methodFilter: 'api', format: 'simple' }))
+    // 获取一次性 ticket → 浏览器原生下载，对话框立即弹出
+    await downloadWithTicket(portId, { methodFilter: 'api', format: 'simple' })
     showToast('下载已开始，请查看浏览器下载进度', 'success')
   } catch (e) {
     showToast('后端导出失败', 'error')
