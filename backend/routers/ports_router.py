@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from threading import Lock
 from urllib.parse import urlparse
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, defer
 from sqlalchemy import func, text
@@ -684,6 +684,7 @@ def create_export_ticket(
 @router.get("/{port_id}/export")
 def export_port_history(
     port_id: int,
+    request: Request,
     method_filter: str = "all",
     format: str = "full",
     ticket: str = None,
@@ -764,20 +765,6 @@ def export_port_history(
         port.port_number, port.target_url, time.time() - _t_port,
     )
 
-    # ── Count total on the request-scoped session (cheap) ──
-    _t_count_query = time.time()
-    total_q = db.query(func.count(RequestModel.id)).filter(
-        RequestModel.port_id == port.id
-    )
-    if method_filter == "api":
-        total_q = total_q.filter(RequestModel.method.in_(["POST", "PUT", "PATCH", "DELETE"]))
-    total_count = total_q.scalar() or 0
-    _t_count_done = time.time()
-    logger.info(
-        "Export count query: port=%d total_rows=%d filter=%s elapsed=%.3fs",
-        port_id, total_count, method_filter, _t_count_done - _t_count_query,
-    )
-
     # Capture immutable values for use inside the generator
     _port_number = port.port_number
     _port_target = port.target_url
@@ -791,17 +778,9 @@ def export_port_history(
     fmt_label = "-simple" if _simple else ""
     filename = f"llm-proxy-port{_port_number}{filter_label}{fmt_label}-{ts}.json"
 
-    _t_setup_done = time.time()
-    _t_auth_elapsed = _t_port - _t_auth
-    _t_port_elapsed = _t_count_query - _t_port
-    _t_count_elapsed = _t_count_done - _t_count_query
-    _t_other_elapsed = _t_setup_done - _t_count_done  # filename, helpers
     logger.info(
-        "Export setup done: port=%d total=%d format=%s filename=%s "
-        "setup_total=%.3fs breakdown=[auth=%.3fs port_lookup=%.3fs count=%.3fs helpers=%.3fs]",
-        _port_number, total_count, "simple" if _simple else "full", filename,
-        _t_setup_done - _req_start_ts,
-        _t_auth_elapsed, _t_port_elapsed, _t_count_elapsed, _t_other_elapsed,
+        "Export setup: port=%d format=%s filename=%s",
+        _port_number, "simple" if _simple else "full", filename,
     )
 
     # ── JSON building helpers (module-level, outside the generator) ──
@@ -869,24 +848,13 @@ def export_port_history(
         parts.append(b'}')
         return b"".join(parts)
 
-    def stream_jsonl():
-        _t_stream_enter = time.time()
+    async def stream_jsonl():
         own_db = database.StreamSessionLocal()
-        _t_session = time.time()
-        logger.info(
-            "Export stream: SSCursor session acquired in %.3fs",
-            _t_session - _t_stream_enter,
-        )
-        _row_count = 0  # mutable so the except block can report how far we got
+        _row_count = 0
         try:
             # Build query, deferring columns the output format does not need.
-            # LONGTEXT columns live in InnoDB overflow pages — each one costs a
-            # random disk read per row.  Deferring unused LONGTEXT columns cuts
-            # the I/O in half for simple format (2 LONGTEXTs instead of 4–5).
             _deferred = [RequestModel.response_body_raw]  # never needed for export
             if _simple:
-                # Simple format only needs: method, path, status_code, request_body, response_body.
-                # Defer the rest — especially LONGTEXT headers.
                 _deferred.extend([
                     RequestModel.id,
                     RequestModel.port_id,
@@ -904,39 +872,9 @@ def export_port_history(
             if method_filter == "api":
                 query = query.filter(RequestModel.method.in_(["POST", "PUT", "PATCH", "DELETE"]))
             query = query.order_by(RequestModel.created_at.asc())
-            _t_query = time.time()
+            query = query.with_hint(RequestModel, "USE INDEX (ix_requests_port_created)")
 
-            # Emit the compiled SQL so the operator can EXPLAIN it manually
-            # when diagnosing slow exports.
-            try:
-                _compiled = query.statement.compile(
-                    compile_kwargs={"literal_binds": True}
-                )
-                logger.info(
-                    "Export stream: query compiled in %.3fs\n"
-                    "  -- run this on MySQL to see the execution plan:\n"
-                    "  -- EXPLAIN %s",
-                    _t_query - _t_session,
-                    str(_compiled)[:2000],
-                )
-            except Exception:
-                logger.info(
-                    "Export stream: query compiled in %.3fs (SQL suppressed — "
-                    "bind literal rendering failed, likely due to LONGTEXT params)",
-                    _t_query - _t_session,
-                )
-
-            # Progress tracking
-            _start_ts = time.time()
-            _report_every = max(500, total_count // 10) if total_count > 0 else 500
-            _next_report = _report_every
-            _t_last_report = _start_ts  # for per-interval rows/s
-            _first_row = True
-            _t_first = 0.0  # time to first row (set after first iteration)
-            logger.info(
-                "Export started: port=%d count=%d filter=%s format=%s",
-                _port_number, total_count, method_filter, "simple" if _simple else "full",
-            )
+            logger.info("Export stream started: port=%d", _port_number)
 
             if _simple:
                 # Flat array: [{"index":1,...}, ...]
@@ -947,54 +885,32 @@ def export_port_history(
                     for r in query.yield_per(500):
                         idx += 1
                         _row_count = idx
-                        if _first_row:
-                            _t_first = time.time() - _start_ts
-                            _first_row = False
-                            logger.info(
-                                "Export first row: port=%d time_to_first_row=%.2fs "
-                                "(MySQL query execution + first fetch from SSCursor)",
-                                _port_number, _t_first,
-                            )
                         if not first:
                             yield b","
                         first = False
                         yield _build_simple_row(r, idx)
-                        if idx >= _next_report:
-                            now = time.time()
-                            pct = (idx / total_count * 100) if total_count > 0 else 0
-                            interval_s = now - _t_last_report
-                            interval_rows = _report_every
-                            logger.info(
-                                "Export progress: port=%d %d/%d (%.0f%%) "
-                                "elapsed=%.1fs interval=[%d rows in %.1fs, %.0f rows/s]",
-                                _port_number, idx, total_count, pct,
-                                now - _start_ts, interval_rows, interval_s,
-                                interval_rows / interval_s if interval_s > 0 else 0,
-                            )
-                            _next_report += _report_every
-                            _t_last_report = now
+                        # Heartbeat: check client connection every 100 rows
+                        if idx % 100 == 0 and await request.is_disconnected():
+                            logger.info("Export client disconnected: port=%d rows=%d", _port_number, _row_count)
+                            return
                     yield b"]"
+                except GeneratorExit:
+                    logger.info("Export cancelled by client: port=%d rows=%d", _port_number, _row_count)
+                    return
                 except Exception as _export_err:
-                    elapsed = time.time() - _start_ts
-                    logger.error(
-                        "Export interrupted: port=%d %d/%d rows in %.1fs — %s: %s",
-                        _port_number, _row_count, total_count, elapsed,
-                        type(_export_err).__name__, _export_err,
-                    )
-                    # Close the JSON array with an error sentinel so the
-                    # downloaded file is still valid JSON (partial data).
+                    logger.error("Export interrupted: port=%d %d rows — %s: %s",
+                                 _port_number, _row_count, type(_export_err).__name__, _export_err)
                     if _row_count > 0:
                         yield b","
                     _err_obj = json.dumps({
                         "_export_error": "incomplete",
                         "rows_received": _row_count,
-                        "total_expected": total_count,
                         "error": f"{type(_export_err).__name__}: {_export_err}",
                     }, ensure_ascii=False).encode("utf-8")
                     yield _err_obj
                     yield b"]"
             else:
-                # Full: {"port":{...},"total_requests":N,"requests":[...]}
+                # Full: {"port":{...},"requests":[...]}
                 yield b'{"port":'
                 yield json.dumps({
                     "port_number": _port_number,
@@ -1002,7 +918,7 @@ def export_port_history(
                     "description": _port_desc,
                     "created_at": _port_created,
                 }, ensure_ascii=False).encode("utf-8")
-                yield f',"total_requests":{total_count},"requests":['.encode("utf-8")
+                yield b',"requests":['
 
                 first = True
                 row = 0
@@ -1010,73 +926,35 @@ def export_port_history(
                     for r in query.yield_per(500):
                         row += 1
                         _row_count = row
-                        if _first_row:
-                            _t_first = time.time() - _start_ts
-                            _first_row = False
-                            logger.info(
-                                "Export first row: port=%d time_to_first_row=%.2fs "
-                                "(MySQL query execution + first fetch from SSCursor)",
-                                _port_number, _t_first,
-                            )
                         if not first:
                             yield b","
                         first = False
                         yield _build_full_row(r)
-                        if row >= _next_report:
-                            now = time.time()
-                            pct = (row / total_count * 100) if total_count > 0 else 0
-                            interval_s = now - _t_last_report
-                            interval_rows = _report_every
-                            logger.info(
-                                "Export progress: port=%d %d/%d (%.0f%%) "
-                                "elapsed=%.1fs interval=[%d rows in %.1fs, %.0f rows/s]",
-                                _port_number, row, total_count, pct,
-                                now - _start_ts, interval_rows, interval_s,
-                                interval_rows / interval_s if interval_s > 0 else 0,
-                            )
-                            _next_report += _report_every
-                            _t_last_report = now
+                        # Heartbeat: check client connection every 100 rows
+                        if row % 100 == 0 and await request.is_disconnected():
+                            logger.info("Export client disconnected: port=%d rows=%d", _port_number, _row_count)
+                            return
                     yield b"]}"
+                except GeneratorExit:
+                    logger.info("Export cancelled by client: port=%d rows=%d", _port_number, _row_count)
+                    return
                 except Exception as _export_err:
-                    elapsed = time.time() - _start_ts
-                    logger.error(
-                        "Export interrupted: port=%d %d/%d rows in %.1fs — %s: %s",
-                        _port_number, _row_count, total_count, elapsed,
-                        type(_export_err).__name__, _export_err,
-                    )
-                    # Build error sentinel and close JSON cleanly.
-                    # Result: {...,"requests":[...,{"_export_error":...}],"_export_error":"incomplete"}
+                    logger.error("Export interrupted: port=%d %d rows — %s: %s",
+                                 _port_number, _row_count, type(_export_err).__name__, _export_err)
                     if _row_count > 0:
                         yield b","
                     _err_obj = json.dumps({
                         "_export_error": "incomplete",
                         "rows_received": _row_count,
-                        "total_expected": total_count,
                         "error": f"{type(_export_err).__name__}: {_export_err}",
                     }, ensure_ascii=False).encode("utf-8")
                     yield _err_obj
                     yield b'],"_export_error":"incomplete"}'
 
-            elapsed = time.time() - _start_ts
-            final = row if not _simple else idx
-            _t_first_val = _t_first if not _first_row else elapsed
-            logger.info(
-                "Export finished: port=%d %d rows in %.1fs (%.0f rows/s) "
-                "breakdown=[first_row=%.2fs, transfer+process=%.2fs]",
-                _port_number, final, elapsed,
-                final / elapsed if elapsed > 0 else 0,
-                _t_first_val, elapsed - _t_first_val,
-            )
+            logger.info("Export finished: port=%d %d rows", _port_number, _row_count)
         finally:
             own_db.close()
-            logger.info("Export stream: SSCursor session closed")
 
-    _t_handoff = time.time()
-    logger.info(
-        "Export handoff: returning StreamingResponse to ASGI server "
-        "(total_handler_elapsed=%.3fs, rows=%d, filename=%s)",
-        _t_handoff - _req_start_ts, total_count, filename,
-    )
     return StreamingResponse(
         stream_jsonl(),
         media_type="application/json",

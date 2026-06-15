@@ -39,6 +39,15 @@
             </div>
           </div>
         </div>
+        <!-- Export progress and cancel button -->
+        <div v-if="exporting" class="flex gap-8" style="align-items:center">
+          <span class="text-sm text-muted">
+            {{ exportProgress }}
+          </span>
+          <button class="btn btn-danger btn-sm" @click="cancelExport">
+            ✕ 取消导出
+          </button>
+        </div>
         <button class="btn btn-danger btn-sm" @click="clearHistory">
           🗑 清空全部历史
         </button>
@@ -255,6 +264,8 @@ const scrollLocked = ref(false)
 const methodFilter = ref('all')
 const initialLoading = ref(true)
 const exporting = ref(false)  // server-side export in progress
+const exportProgress = ref('')  // export progress text
+let _abortController = null  // AbortController for fetch-based exports
 
 // API requests = POST/PUT/PATCH/DELETE (intelligent agent calls)
 // Other = GET/OPTIONS/HEAD (browser scans, probes, etc.)
@@ -478,15 +489,80 @@ function goBack() {
 function toggleCopyMenu() { copyMenuOpen.value = !copyMenuOpen.value }
 function closeCopyMenu() { copyMenuOpen.value = false }
 
-// 浏览器原生下载：直接导航到导出 URL（带一次性 ticket）
-// 后端有 Content-Disposition: attachment 头，浏览器会自动弹出下载对话框（含进度条）
-function downloadDirect(url) {
-  const a = document.createElement('a')
-  a.href = url
-  a.style.display = 'none'
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
+// Cancel the current export
+function cancelExport() {
+  if (_abortController) {
+    _abortController.abort()
+    _abortController = null
+    exporting.value = false
+    exportProgress.value = ''
+    showToast('导出已取消', 'info')
+  }
+}
+
+// Format bytes to human-readable string
+function formatBytes(bytes) {
+  if (bytes === 0) return '0 B'
+  const k = 1024
+  const sizes = ['B', 'KB', 'MB', 'GB']
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i]
+}
+
+// Fetch-based download with AbortController support
+async function downloadWithAbort(url, filename) {
+  _abortController = new AbortController()
+  const signal = _abortController.signal
+
+  try {
+    const response = await fetch(url, { signal })
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+    }
+
+    const contentLength = response.headers.get('content-length')
+    const total = contentLength ? parseInt(contentLength, 10) : 0
+
+    const reader = response.body.getReader()
+    const chunks = []
+    let received = 0
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      chunks.push(value)
+      received += value.length
+
+      // Update progress
+      if (total > 0) {
+        const pct = Math.round((received / total) * 100)
+        exportProgress.value = `${formatBytes(received)} / ${formatBytes(total)} (${pct}%)`
+      } else {
+        exportProgress.value = `${formatBytes(received)}`
+      }
+    }
+
+    // Combine chunks and trigger download
+    const blob = new Blob(chunks)
+    const blobUrl = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = blobUrl
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(blobUrl)
+
+    return true
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw err  // Re-throw abort errors
+    }
+    throw err
+  } finally {
+    _abortController = null
+  }
 }
 
 // 发起浏览器原生下载：先通过 Bearer 鉴权获取一次性 ticket，再用 ticket 触发下载
@@ -497,7 +573,14 @@ async function downloadWithTicket(portId, { methodFilter = 'all', format = 'full
   if (methodFilter !== 'all') params.set('method_filter', methodFilter)
   if (format !== 'full') params.set('format', format)
   params.set('ticket', ticket)
-  downloadDirect(`/api/ports/${portId}/export?${params.toString()}`)
+
+  // Generate filename
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  const filterLabel = methodFilter === 'api' ? '-api' : ''
+  const fmtLabel = format === 'simple' ? '-simple' : ''
+  const filename = `llm-proxy-port${portId}${filterLabel}${fmtLabel}-${ts}.json`
+
+  await downloadWithAbort(`/api/ports/${portId}/export?${params.toString()}`, filename)
 }
 
 function downloadJson(filename, data) {
@@ -546,31 +629,33 @@ async function exportAllData() {
   closeCopyMenu()
   if (exporting.value) return
   exporting.value = true
+  exportProgress.value = '准备中...'
   try {
-    // all/api — 获取一次性 ticket → 浏览器直接下载
-    // 服务器每发一批 MySQL 就 flush 一批 → nginx 透传 → 浏览器原生下载管理器
-    // （弹出对话框 + 进度条），数据从数据库直接流到用户硬盘
     if (methodFilter.value === 'all' || methodFilter.value === 'api') {
       const serverFilter = methodFilter.value === 'api' ? 'api' : 'all'
       await downloadWithTicket(portId, { methodFilter: serverFilter })
-      showToast('下载已开始，请查看浏览器下载进度', 'success')
+      showToast('导出完成', 'success')
     } else {
-      // 'other' 过滤器后端不支持，只能从前端已加载的分页数据导出
       const source = _getExportRequests()
       downloadJson(getExportFilename('full'), { port: data.value.port, requests: source, total_requests: source.length })
       showToast(`已导出 ${source.length} 条完整交互记录（当前页面数据）`, 'success')
     }
   } catch (e) {
-    // 降级：从已加载的分页数据中导出
-    try {
-      const source = _getExportRequests()
-      downloadJson(getExportFilename('full'), { port: data.value.port, requests: source, total_requests: source.length })
-      showToast('已导出全部数据（当前页面数据）', 'success')
-    } catch (e2) {
-      showToast('导出失败', 'error')
+    if (e.name === 'AbortError') {
+      // User cancelled, already handled
+    } else {
+      // Fallback to client-side export
+      try {
+        const source = _getExportRequests()
+        downloadJson(getExportFilename('full'), { port: data.value.port, requests: source, total_requests: source.length })
+        showToast('已导出全部数据（当前页面数据）', 'success')
+      } catch (e2) {
+        showToast('导出失败', 'error')
+      }
     }
   } finally {
     exporting.value = false
+    exportProgress.value = ''
   }
 }
 
@@ -578,15 +663,27 @@ async function exportApiFromServer() {
   closeCopyMenu()
   if (exporting.value) return
   exporting.value = true
+  exportProgress.value = '准备中...'
   try {
-    // format=simple 由后端完成 JSON 提取（省去前端解析/转换）
-    // 获取一次性 ticket → 浏览器原生下载，对话框立即弹出
-    await downloadWithTicket(portId, { methodFilter: 'api', format: 'simple' })
-    showToast('下载已开始，请查看浏览器下载进度', 'success')
+    // 浏览器原生下载：<a> 标签直接触发，数据从后端流到磁盘，不经过前端内存
+    const { ticket } = await api.createExportTicket(portId)
+    const params = new URLSearchParams()
+    params.set('method_filter', 'api')
+    params.set('format', 'simple')
+    params.set('ticket', ticket)
+    const url = `/api/ports/${portId}/export?${params.toString()}`
+    const a = document.createElement('a')
+    a.href = url
+    a.download = ''
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    showToast('导出已开始，请查看浏览器下载列表', 'success')
   } catch (e) {
     showToast('后端导出失败', 'error')
   } finally {
     exporting.value = false
+    exportProgress.value = ''
   }
 }
 

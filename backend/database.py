@@ -81,7 +81,7 @@ def _init_engine():
         pool_recycle=600,
         connect_args={
             "connect_timeout": 10,
-            "read_timeout": 3600,   # 1 hour — SSCursor may wait long for first row on slow queries
+            "read_timeout": 600,   # 10 minutes — enough for large result sets without filesort
             "write_timeout": 60,
             "cursorclass": pymysql.cursors.SSCursor,
         },
