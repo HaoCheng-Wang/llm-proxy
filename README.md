@@ -537,7 +537,7 @@ MySQL LONGTEXT  →  raw[0] 第一个字符检查  →  原样嵌入输出  → 
 
 ```mermaid
 flowchart TD
-    A[请求到达 :3998/{port}/{path}] --> B[aget_target_url(port)]
+    A["请求到达 :3998/{port}/{path}"] --> B[aget_target_url(port)]
     B --> C{port.prefer_http2?}
 
     C -->|NULL 或 False| D[get_shared_client()]
