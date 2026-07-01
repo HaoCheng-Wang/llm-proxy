@@ -359,9 +359,9 @@ flowchart TD
     H --> I --> J
     J --> K
 
-    style Layer1 fill:#1a2a3a,stroke:#5dade2,color:#5dade2
-    style Layer2 fill:#1a3a1a,stroke:#2ecc71,color:#2ecc71
-    style Layer3 fill:#1a1a3a,stroke:#bb8fce,color:#bb8fce
+    style Layer1 fill:#d6eaf8,stroke:#2980b9,color:#154360
+    style Layer2 fill:#d5f5e3,stroke:#27ae60,color:#145a32
+    style Layer3 fill:#e8daef,stroke:#8e44ad,color:#4a235a
 ```
 
 **解析器类层次**
@@ -369,139 +369,317 @@ flowchart TD
 ```mermaid
 classDiagram
     class BaseSSEParser {
-        <<abstract>>
-        +parse_line(line: str) StreamChunk | None*
-        +finalize() dict | None*
-        +parse(raw_sse: str) str | None$
+        <<abstract 抽象基类>>
+        +parse_line(line) 解析单行 → StreamChunk*
+        +finalize() 构建完整响应 → dict*
+        +parse(raw_sse) 批量解析入口 → JSON 字符串$
     }
     class AnthropicSSEParser {
-        -blocks: dict[int, dict]
-        -stop_reason: str | None
-        -usage_input: dict | None
-        -usage_output: dict | None
-        +parse_line(line) StreamChunk | None
-        +finalize() dict | None
+        <<Anthropic Messages API>>
+        -blocks 按 index 索引的 content_blocks
+        -stop_reason 触发停止原因
+        -usage_input / usage_output 输入输出token
+        状态机驱动的事件分发解析
     }
     class OpenAIChatSSEParser {
-        -_acc: ChunkAccumulator
-        +parse_line(line) StreamChunk | None
-        +finalize() dict | None
+        <<OpenAI Chat Completions>>
+        -ChunkAccumulator 字段累加器
+        delta累积：content / reasoning / tool_calls
     }
     class OpenAIResponsesSSEParser {
-        -output_text: str
-        -reasoning_text: str
-        -function_args: str
-        -output_items: list[dict]
-        +parse_line(line) StreamChunk | None
-        +finalize() dict | None
+        <<OpenAI Responses API>>
+        -output_text / reasoning_text 输出文本
+        -function_args 函数调用参数
+        -output_items response.completed 输出
+        事件类型分发解析
     }
     class GeminiSSEParser {
-        -_acc: ChunkAccumulator
-        -_role: str
-        +parse_line(line) StreamChunk | None
-        +finalize() dict | None
+        <<Google Gemini>>
+        -ChunkAccumulator 字段累加器
+        -_role 角色 (model)
+        candidates[].parts[].text 累积
     }
     class GenericSSEParser {
-        -_merged: dict
-        -_raw_lines: list[str]
-        +parse_line(line) StreamChunk | None
-        +finalize() dict | None
+        <<通用回退解析器>>
+        -_merged 深度合并后的 dict
+        -_raw_lines 原始 SSE 行
+        三阶段：深度合并 → 树遍历 → 原始文本
     }
     class StreamChunk {
-        +text_delta: str
-        +reasoning_delta: str
-        +tool_call_delta: dict | None
-        +finish_reason: str | None
-        +usage: dict | None
-        +metadata: dict
-        +raw: dict | None
+        <<dataclass 统一中间表示>>
+        +text_delta 文本增量
+        +reasoning_delta 推理增量
+        +tool_call_delta 工具调用增量
+        +finish_reason 结束原因
+        +usage token用量
+        +metadata 元数据(id/model/role)
+        +raw 原始Provider数据
     }
     class ChunkAccumulator {
-        -_text: str
-        -_reasoning: str
-        -_tool_calls: dict
-        -_finish_reason: str | None
-        -_usage: dict | None
-        -_metadata: dict
-        +add(chunk: StreamChunk)
-        +text str
-        +reasoning str
-        +tool_calls dict
-        +finish_reason str | None
-        +usage dict | None
-        +metadata dict
+        <<字段累加器>>
+        +add(chunk) 合并一个StreamChunk
+        +text 累积文本(字符串拼接)
+        +reasoning 累积推理文本
+        +tool_calls 按index合并工具调用
+        +finish_reason 最后非None值
+        +usage dict合并
+        +metadata 首次出现为准
     }
 
-    BaseSSEParser <|-- AnthropicSSEParser
-    BaseSSEParser <|-- OpenAIChatSSEParser
-    BaseSSEParser <|-- OpenAIResponsesSSEParser
-    BaseSSEParser <|-- GeminiSSEParser
-    BaseSSEParser <|-- GenericSSEParser
-    OpenAIChatSSEParser --> ChunkAccumulator : 使用
-    GeminiSSEParser --> ChunkAccumulator : 使用
+    BaseSSEParser <|-- AnthropicSSEParser : 继承
+    BaseSSEParser <|-- OpenAIChatSSEParser : 继承
+    BaseSSEParser <|-- OpenAIResponsesSSEParser : 继承
+    BaseSSEParser <|-- GeminiSSEParser : 继承
+    BaseSSEParser <|-- GenericSSEParser : 继承
+    OpenAIChatSSEParser --> ChunkAccumulator : 组合使用
+    GeminiSSEParser --> ChunkAccumulator : 组合使用
     BaseSSEParser ..> StreamChunk : 生成
+    ChunkAccumulator ..> StreamChunk : 消费
+```
+
+**StreamChunk — 统一中间表示（Layer 2 核心）**
+
+```mermaid
+flowchart LR
+    subgraph Provider输出
+        A1["Anthropic<br/>content_block_delta<br/>delta.text / delta.partial_json"]
+        A2["OpenAI Chat<br/>choices[0].delta<br/>content / tool_calls / reasoning_content"]
+        A3["OpenAI Responses<br/>response.output_text.delta<br/>response.function_call_arguments.delta"]
+        A4["Gemini<br/>candidates[0].content.parts[*].text"]
+    end
+
+    subgraph StreamChunk字段
+        B["StreamChunk<br/>┌─ text_delta: 文本增量<br/>├─ reasoning_delta: 推理增量<br/>├─ tool_call_delta: 工具调用片段<br/>├─ finish_reason: 结束原因<br/>├─ usage: token用量<br/>├─ metadata: id/model/role<br/>└─ raw: 原始Provider JSON"]
+    end
+
+    subgraph 下游消费
+        C1["ChunkAccumulator.add()<br/>按字段类型合并"]
+        C2["parser.finalize()<br/>构建最终JSON"]
+    end
+
+    A1 & A2 & A3 & A4 -->|"各Parser的parse_line()"| B
+    B --> C1 --> C2
+
+    style B fill:#d5f5e3,stroke:#27ae60,color:#145a32
+```
+
+**ChunkAccumulator 合并规则**
+
+```mermaid
+flowchart TD
+    subgraph 输入
+        CHUNK["StreamChunk 到达<br/>{text_delta, reasoning_delta,<br/>tool_call_delta, finish_reason,<br/>usage, metadata}"]
+    end
+
+    subgraph 合并规则
+        T["📝 text_delta<br/>→ _text += text_delta<br/>(字符串拼接)"]
+        R["🧠 reasoning_delta<br/>→ _reasoning += reasoning_delta<br/>(字符串拼接)"]
+        TC["🔧 tool_call_delta<br/>→ 按 index 查找或创建条目<br/>→ id: 覆盖, name: 拼接<br/>→ arguments: 拼接JSON片段"]
+        FR["🏁 finish_reason<br/>→ 最后非None值覆盖"]
+        U["📊 usage<br/>→ dict.update() 合并"]
+        M["📋 metadata<br/>→ 首次非空值保留<br/>(first-wins)"]
+    end
+
+    subgraph 输出
+        OUT["可供 finalize() 读取的属性<br/>text / reasoning / tool_calls /<br/>finish_reason / usage / metadata"]
+    end
+
+    CHUNK --> T & R & TC & FR & U & M
+    T & R & TC & FR & U & M --> OUT
 ```
 
 **格式检测与分发**
 
 ```mermaid
+flowchart TD
+    A["🚪 收到完整 SSE 文本<br/>_reconstruct_sse_to_json(raw_sse)"] --> B["🔍 扫描首个有效 data: 行<br/>跳过空行、注释、[DONE]"]
+    B --> C{"chunk.type 字段<br/>in _ANTHROPIC_EVENT_TYPES?"}
+    
+    C -->|"✅ 是<br/>(message_start/content_block_start/<br/>content_block_delta/message_delta/...)"| D["📌 格式 = anthropic<br/>AnthropicSSEParser.parse(raw_sse)"]
+    
+    C -->|"❌ 否"| E{"chunk.type 字段<br/>startswith 'response.'?"}
+    E -->|"✅ 是<br/>(response.created/<br/>response.output_text.delta/<br/>response.completed/...)"| F["📌 格式 = openai_responses<br/>OpenAIResponsesSSEParser.parse(raw_sse)"]
+    
+    E -->|"❌ 否"| G{"'candidates' 键<br/>存在于 chunk?"}
+    G -->|"✅ 是<br/>(Gemini 的<br/>GenerateContentResponse)"| H["📌 格式 = gemini<br/>GeminiSSEParser.parse(raw_sse)"]
+    
+    G -->|"❌ 否"| I{"'choices' 键<br/>存在于 chunk?"}
+    I -->|"✅ 是<br/>(OpenAI / DeepSeek / Mistral /<br/>通义千问 / 等兼容格式)"| J["📌 格式 = openai_chat<br/>OpenAIChatSSEParser.parse(raw_sse)"]
+    
+    I -->|"❌ 否"| K["📌 格式 = generic<br/>GenericSSEParser.parse(raw_sse)"]
+
+    D --> L{"Parser.parse()<br/>返回 JSON 字符串?"}
+    F --> L
+    H --> L
+    J --> L
+
+    L -->|"✅ 返回有效 JSON"| M["🎯 完成<br/>返回重建的完整 JSON"]
+    L -->|"❌ 返回 None<br/>(解析异常/无有效内容)"| N["📢 记录 WARNING 日志<br/>'xxx parser returned None'"]
+    N --> K
+
+    K --> O{"GenericSSEParser<br/>三阶段回退"}
+    O -->|"阶段1: deep_merge 成功"| M
+    O -->|"阶段2: walk_json_for_text 有内容"| M
+    O -->|"阶段3: 以上均失败"| P["🔄 返回原始 SSE 文本<br/>(前端显示为原始文本)"]
+
+    style D fill:#d5f5e3,stroke:#27ae60,color:#145a32
+    style F fill:#d6eaf8,stroke:#2980b9,color:#154360
+    style H fill:#fdebd0,stroke:#e67e22,color:#7e5100
+    style J fill:#d5f5e3,stroke:#27ae60,color:#145a32
+    style K fill:#fadbd8,stroke:#e74c3c,color:#78281f
+    style M fill:#d5f5e3,stroke:#27ae60,color:#145a32
+    style P fill:#fadbd8,stroke:#e74c3c,color:#78281f
+```
+
+**格式检测规则详解**
+
+```mermaid
 flowchart LR
-    A["首个 SSE chunk"] --> B{"chunk.type<br/>in _ANTHROPIC_EVENT_TYPES?"}
-    B -->|是| C["anthropic → AnthropicSSEParser"]
-    B -->|否| D{"chunk.type<br/>startswith 'response.'?"}
-    D -->|是| E["openai_responses → OpenAIResponsesSSEParser"]
-    D -->|否| F{"'candidates'<br/>in chunk?"}
-    F -->|是| G["gemini → GeminiSSEParser"]
-    F -->|否| H{"'choices'<br/>in chunk?"}
-    H -->|是| I["openai_chat → OpenAIChatSSEParser"]
-    H -->|否| J["generic → GenericSSEParser"]
+    subgraph 检测依据
+        direction TB
+        R1["📋 Anthropic<br/>━━━━━━━━<br/>检测: type 字段 ∈ {message_start,<br/>content_block_start, content_block_delta,<br/>content_block_stop, message_delta,<br/>message_stop, ping, error}<br/><br/>SSE格式: 多事件类型<br/>event: message_start<br/>data: {...}<br/>event: content_block_delta<br/>data: {...}"]
+        R2["📋 OpenAI Responses<br/>━━━━━━━━<br/>检测: type 字段 startswith<br/>'response.' 或 'error'<br/><br/>SSE格式: 单事件类型<br/>data: {type:'response.created',...}<br/>data: {type:'response.output_text.delta',...}"]
+        R3["📋 Gemini<br/>━━━━━━━━<br/>检测: 'candidates' in chunk<br/><br/>SSE格式: 每行完整JSON<br/>data: {candidates:[{<br/>content:{parts:[{text:'...'}]}<br/>}], usageMetadata:{...}}"]
+        R4["📋 OpenAI Chat<br/>━━━━━━━━<br/>检测: 'choices' in chunk<br/><br/>SSE格式: 标准OpenAI<br/>data: {choices:[{delta:{<br/>content:'...'}}], ...}<br/>data: [DONE]"]
+    end
 
-    C & E & G & I --> K[Parser.parse raw_sse]
-    K --> L{返回 JSON?}
-    L -->|是| M["完成"]
-    L -->|否| J
-    J --> N{返回 JSON?}
-    N -->|是| M
-    N -->|否| O["回退：返回原始 SSE 文本"]
+    subgraph 优先级
+        direction TB
+        P1["① 先检查 type 字段<br/>(Anthropic / OpenAI Responses<br/>都有 type，需先后区分)"]
+        P2["② 再检查 candidates<br/>(Gemini 特有)"]
+        P3["③ 最后检查 choices<br/>(OpenAI Chat 及所有兼容格式<br/>覆盖面最广)"]
+    end
 
-    style C fill:#1a3a1a,stroke:#2ecc71
-    style E fill:#1a2a3a,stroke:#5dade2
-    style G fill:#3a2a1a,stroke:#f39c12
-    style I fill:#1a3a1a,stroke:#2ecc71
-    style J fill:#3a1a2a,stroke:#e74c3c
-    style O fill:#3a1a2a,stroke:#e74c3c
+    R1 --> P1
+    R2 --> P1
+    R3 --> P2
+    R4 --> P3
+    P1 --> P2 --> P3
+
+    style R1 fill:#d5f5e3,stroke:#27ae60,color:#145a32
+    style R2 fill:#d6eaf8,stroke:#2980b9,color:#154360
+    style R3 fill:#fdebd0,stroke:#e67e22,color:#7e5100
+    style R4 fill:#d5f5e3,stroke:#27ae60,color:#145a32
 ```
 
 **Anthropic 状态机**
 
+Anthropic 使用**多事件类型 SSE 协议**，不同于 OpenAI 的单一 `data:` 格式。解析器根据 `event_type` 维护内部状态，支持 text / thinking / tool_use / server_tool_use / search_tool / compaction 等 6 种 content block 类型。
+
+**顶层状态机：事件流转**
+
 ```mermaid
 stateDiagram-v2
-    [*] --> message_start : 收到消息
-    message_start --> content_block_start : 提取 model/id/usage
-    content_block_start --> content_block_delta : 初始化 block (text/tool_use/thinking/compaction)
-    content_block_delta --> content_block_delta : 累积 text_delta / thinking_delta / input_json_delta / citations_delta
-    content_block_delta --> content_block_stop : block 结束
-    content_block_stop --> content_block_start : 下一个 block
+    direction LR
+
+    [*] --> message_start : 流开始，首个事件
+    state message_start {
+        MS_body : 📥 提取 msg_id, model, role
+        MS_body2: 📥 提取 usage.input_tokens
+    }
+
+    message_start --> content_block_start : 进入第一个 block
+    state content_block_start {
+        CBS_body : 🏗️ 根据 content_block.type 初始化：
+        CBS_text : • text → {type, text, citations}
+        CBS_tool : • tool_use/server_tool_use/search_tool
+        CBS_tool2:   → {type, id, name, input_json}
+        CBS_think: • thinking → {type, thinking, signature}
+        CBS_comp : • compaction → {type, content, encrypted_content}
+        CBS_unk  : • 未知类型 → {type, _text}（通用适配）
+    }
+
+    content_block_start --> content_block_delta : 接收该 block 的增量数据
+    content_block_delta --> content_block_delta : 同一 block 的后续 delta
+    content_block_delta --> content_block_stop : 该 block 所有 delta 传完
+    content_block_stop --> content_block_start : 下一个 block 开始
     content_block_stop --> message_delta : 所有 block 完成
-    message_delta --> message_stop : 提取 stop_reason / usage
+    state message_delta {
+        MD_body : 📤 提取 stop_reason
+        MD_body2: 📤 提取 stop_sequence
+        MD_body3: 📤 提取 usage.output_tokens
+    }
+    message_delta --> message_stop : 流结束
     message_stop --> [*]
 
-    state content_block_delta {
-        [*] --> text_delta : delta.type="text_delta"
-        text_delta --> [*] : blocks[idx].text += text
+    state error_event <<choice>>
+    content_block_start --> error_event : error 事件到达
+    content_block_delta --> error_event : error 事件到达
+    message_start --> error_event : error 事件到达
+    error_event --> [*] : stop_reason="error"
+```
 
-        [*] --> thinking_delta : delta.type="thinking_delta"
-        thinking_delta --> [*] : blocks[idx].thinking += thinking
+**content_block_delta 内部：6 种 delta 类型的处理**
 
-        [*] --> input_json_delta : delta.type="input_json_delta"
-        input_json_delta --> [*] : blocks[idx].input_json += partial_json
+```mermaid
+flowchart TD
+    DELTA_IN["📥 content_block_delta 事件<br/>{index, delta: {type, text/thinking/partial_json/signature/citation}}"] --> TYPE{delta.type 判断}
 
-        [*] --> signature_delta : delta.type="signature_delta"
-        signature_delta --> [*] : blocks[idx].signature += signature
+    TYPE -->|"🔤 text_delta"| T1["blocks[idx]['text'] += delta.text<br/>━━━━━━━━━━<br/>纯文本增量追加<br/>最常用的 delta 类型"]
+    T1 --> DONE["✅ 返回 StreamChunk<br/>text_delta=delta.text"]
 
-        [*] --> citations_delta : delta.type="citations_delta"
-        citations_delta --> [*] : blocks[idx].citations += citation
-    }
+    TYPE -->|"🧠 thinking_delta"| T2["blocks[idx]['thinking'] += delta.thinking<br/>━━━━━━━━━━<br/>思考过程文本增量<br/>Claude 扩展思考功能"]
+    T2 --> DONE
+
+    TYPE -->|"✍️ signature_delta"| T3["blocks[idx]['signature'] += delta.signature<br/>━━━━━━━━━━<br/>思考过程签名<br/>与 thinking_delta 配对出现"]
+    T3 --> DONE
+
+    TYPE -->|"🔧 input_json_delta"| T4["blocks[idx]['input_json'] += delta.partial_json<br/>━━━━━━━━━━<br/>工具调用参数的 JSON 片段<br/>跨 delta 累积后 json.loads 解析"]
+    T4 --> DONE
+
+    TYPE -->|"📎 citations_delta"| T5["blocks[idx]['citations'].append(delta.citation)<br/>━━━━━━━━━━<br/>引用来源列表累积<br/>仅 text block 使用"]
+    T5 --> DONE
+
+    TYPE -->|"🗜️ compaction_delta"| T6["blocks[idx]['content'] = delta.content<br/>blocks[idx]['encrypted_content'] = delta.encrypted_content<br/>━━━━━━━━━━<br/>对话压缩块（长对话上下文压缩）"]
+    T6 --> DONE
+
+    TYPE -->|"❓ 未知类型"| T7["遍历 delta 的所有非 type 字段<br/>如果是 str → blocks[idx]['text'] += 值<br/>━━━━━━━━━━<br/>前向兼容：未来的 delta 类型<br/>自动按文本处理"]
+    T7 --> DONE
+```
+
+**缺失 content_block_start 的容错处理**
+
+```mermaid
+flowchart LR
+    A["delta 到达时 idx 不在 blocks 中"] --> B{"delta.type?"}
+    B -->|"input_json_delta"| C["推断为 tool_use block<br/>{type:'tool_use', id:'', name:'', input_json:''}"]
+    B -->|"thinking_delta"| D["推断为 thinking block<br/>{type:'thinking', thinking:'', signature:''}"]
+    B -->|"signature_delta"| E["推断为 thinking block<br/>(同上)"]
+    B -->|"compaction_delta"| F["推断为 compaction block<br/>{type:'compaction', content:'', encrypted_content:''}"]
+    B -->|"其他"| G["推断为 text block<br/>{type:'text', text:'', citations:[]}"]
+    C & D & E & F & G --> H["正常继续累积 delta"]
+```
+
+**finalize()：从累积状态重建完整 JSON**
+
+```mermaid
+flowchart TD
+    subgraph 累积的状态
+        S1["blocks: dict[int, dict]<br/>按 index 排序遍历"]
+        S2["stop_reason / stop_sequence<br/>stop_details"]
+        S3["usage_input / usage_output"]
+        S4["msg_id / model / role"]
+    end
+
+    subgraph 按类型组装
+        B1["text block<br/>→ {type:'text', text, citations?}"]
+        B2["thinking block<br/>→ {type:'thinking', thinking, signature}"]
+        B3["compaction block<br/>→ {type:'compaction', content, encrypted_content}"]
+        B4["tool_use / server_tool_use / search_tool<br/>→ {type, id, name, input}<br/>input: json.loads(input_json) 或 回退原文"]
+        B5["未知 block<br/>→ {type, ...累积的属性}"]
+    end
+
+    subgraph 重建结果
+        R["完整 Messages JSON<br/>━━━━━━━━<br/>{<br/>  id, type:'message', role,<br/>  content: [各block按index顺序],<br/>  model, stop_reason, stop_sequence,<br/>  stop_details?, usage?<br/>}"]
+    end
+
+    S1 --> B1 & B2 & B3 & B4 & B5
+    B1 & B2 & B3 & B4 & B5 --> R
+    S2 --> R
+    S3 -->|"input 和 output 两处 usage<br/>dict.update() 合并"| R
+    S4 --> R
+
+    style R fill:#d5f5e3,stroke:#27ae60,color:#145a32
 ```
 
 | 层级 | 组件 | 位置 | 对应 LiteLLM |
