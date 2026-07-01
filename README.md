@@ -9,7 +9,7 @@
 - [数据模型](#数据模型)
 - [安全设计](#安全设计)
 - [高并发设计](#高并发设计)
-- [SSE 流式处理](#sse-流式处理)
+- [SSE 流式处理](#sse-流式处理spooledtemporaryfile-架构)
 - [大数据量导出：端到端流式架构](#大数据量导出端到端流式架构)
   - [各层关键设计](#各层关键设计)
   - [一次性 Ticket 鉴权](#一次性-ticket-鉴权)
@@ -315,15 +315,215 @@ users                        ports                              requests
 
 ## SSE 流式处理（SpooledTemporaryFile 架构）
 
+### SSE 解析架构 (LiteLLM-inspired)
+
+借鉴 LiteLLM 的三层设计模式，SSE 解析从原始的单文件函数拆分为独立的 `sse_parsers` 模块。
+
+**三层数据流**
+
+```mermaid
+flowchart TD
+    subgraph 输入
+        A[原始 SSE 文本<br/>已完整收集的流式响应]
+    end
+
+    subgraph Layer1["Layer 1: Provider 解析器"]
+        B["detect_sse_format()<br/>首个 chunk 自动检测格式"]
+        C["AnthropicSSEParser<br/>状态机驱动<br/>多事件协议解析"]
+        D["OpenAIChatSSEParser<br/>ChunkAccumulator<br/>delta 累积"]
+        E["OpenAIResponsesSSEParser<br/>事件类型分发<br/>output_text/reasoning/function_call"]
+        F["GeminiSSEParser<br/>ChunkAccumulator<br/>candidates[].parts[].text"]
+        G["GenericSSEParser<br/>三阶段回退"]
+    end
+
+    subgraph Layer2["Layer 2: 统一中间表示"]
+        H["StreamChunk dataclass<br/>{text_delta, reasoning_delta,<br/>tool_call_delta, finish_reason,<br/>usage, metadata, raw}"]
+    end
+
+    subgraph Layer3["Layer 3: 响应组装"]
+        I["ChunkAccumulator<br/>按字段类型合并<br/>text 拼接 / tool_calls 按 index 合并<br/>usage dict merge / finish_reason last-wins"]
+        J["parser.finalize()<br/>构建完整 JSON"]
+    end
+
+    subgraph 输出
+        K["Reconstructed JSON<br/>保留原始厂商格式<br/>Anthropic / OpenAI / Gemini"]
+    end
+
+    A --> B
+    B -->|"anthropic"| C
+    B -->|"openai_chat"| D
+    B -->|"openai_responses"| E
+    B -->|"gemini"| F
+    B -->|"generic"| G
+    C & D & E & F & G --> H
+    H --> I --> J
+    J --> K
+
+    style Layer1 fill:#1a2a3a,stroke:#5dade2,color:#5dade2
+    style Layer2 fill:#1a3a1a,stroke:#2ecc71,color:#2ecc71
+    style Layer3 fill:#1a1a3a,stroke:#bb8fce,color:#bb8fce
+```
+
+**解析器类层次**
+
+```mermaid
+classDiagram
+    class BaseSSEParser {
+        <<abstract>>
+        +parse_line(line: str) StreamChunk | None*
+        +finalize() dict | None*
+        +parse(raw_sse: str) str | None$
+    }
+    class AnthropicSSEParser {
+        -blocks: dict[int, dict]
+        -stop_reason: str | None
+        -usage_input: dict | None
+        -usage_output: dict | None
+        +parse_line(line) StreamChunk | None
+        +finalize() dict | None
+    }
+    class OpenAIChatSSEParser {
+        -_acc: ChunkAccumulator
+        +parse_line(line) StreamChunk | None
+        +finalize() dict | None
+    }
+    class OpenAIResponsesSSEParser {
+        -output_text: str
+        -reasoning_text: str
+        -function_args: str
+        -output_items: list[dict]
+        +parse_line(line) StreamChunk | None
+        +finalize() dict | None
+    }
+    class GeminiSSEParser {
+        -_acc: ChunkAccumulator
+        -_role: str
+        +parse_line(line) StreamChunk | None
+        +finalize() dict | None
+    }
+    class GenericSSEParser {
+        -_merged: dict
+        -_raw_lines: list[str]
+        +parse_line(line) StreamChunk | None
+        +finalize() dict | None
+    }
+    class StreamChunk {
+        +text_delta: str
+        +reasoning_delta: str
+        +tool_call_delta: dict | None
+        +finish_reason: str | None
+        +usage: dict | None
+        +metadata: dict
+        +raw: dict | None
+    }
+    class ChunkAccumulator {
+        -_text: str
+        -_reasoning: str
+        -_tool_calls: dict
+        -_finish_reason: str | None
+        -_usage: dict | None
+        -_metadata: dict
+        +add(chunk: StreamChunk)
+        +text str
+        +reasoning str
+        +tool_calls dict
+        +finish_reason str | None
+        +usage dict | None
+        +metadata dict
+    }
+
+    BaseSSEParser <|-- AnthropicSSEParser
+    BaseSSEParser <|-- OpenAIChatSSEParser
+    BaseSSEParser <|-- OpenAIResponsesSSEParser
+    BaseSSEParser <|-- GeminiSSEParser
+    BaseSSEParser <|-- GenericSSEParser
+    OpenAIChatSSEParser --> ChunkAccumulator : 使用
+    GeminiSSEParser --> ChunkAccumulator : 使用
+    BaseSSEParser ..> StreamChunk : 生成
+```
+
+**格式检测与分发**
+
+```mermaid
+flowchart LR
+    A["首个 SSE chunk"] --> B{"chunk.type<br/>in _ANTHROPIC_EVENT_TYPES?"}
+    B -->|是| C["anthropic → AnthropicSSEParser"]
+    B -->|否| D{"chunk.type<br/>startswith 'response.'?"}
+    D -->|是| E["openai_responses → OpenAIResponsesSSEParser"]
+    D -->|否| F{"'candidates'<br/>in chunk?"}
+    F -->|是| G["gemini → GeminiSSEParser"]
+    F -->|否| H{"'choices'<br/>in chunk?"}
+    H -->|是| I["openai_chat → OpenAIChatSSEParser"]
+    H -->|否| J["generic → GenericSSEParser"]
+
+    C & E & G & I --> K[Parser.parse raw_sse]
+    K --> L{返回 JSON?}
+    L -->|是| M["完成"]
+    L -->|否| J
+    J --> N{返回 JSON?}
+    N -->|是| M
+    N -->|否| O["回退：返回原始 SSE 文本"]
+
+    style C fill:#1a3a1a,stroke:#2ecc71
+    style E fill:#1a2a3a,stroke:#5dade2
+    style G fill:#3a2a1a,stroke:#f39c12
+    style I fill:#1a3a1a,stroke:#2ecc71
+    style J fill:#3a1a2a,stroke:#e74c3c
+    style O fill:#3a1a2a,stroke:#e74c3c
+```
+
+**Anthropic 状态机**
+
+```mermaid
+stateDiagram-v2
+    [*] --> message_start : 收到消息
+    message_start --> content_block_start : 提取 model/id/usage
+    content_block_start --> content_block_delta : 初始化 block (text/tool_use/thinking/compaction)
+    content_block_delta --> content_block_delta : 累积 text_delta / thinking_delta / input_json_delta / citations_delta
+    content_block_delta --> content_block_stop : block 结束
+    content_block_stop --> content_block_start : 下一个 block
+    content_block_stop --> message_delta : 所有 block 完成
+    message_delta --> message_stop : 提取 stop_reason / usage
+    message_stop --> [*]
+
+    state content_block_delta {
+        [*] --> text_delta : delta.type="text_delta"
+        text_delta --> [*] : blocks[idx].text += text
+
+        [*] --> thinking_delta : delta.type="thinking_delta"
+        thinking_delta --> [*] : blocks[idx].thinking += thinking
+
+        [*] --> input_json_delta : delta.type="input_json_delta"
+        input_json_delta --> [*] : blocks[idx].input_json += partial_json
+
+        [*] --> signature_delta : delta.type="signature_delta"
+        signature_delta --> [*] : blocks[idx].signature += signature
+
+        [*] --> citations_delta : delta.type="citations_delta"
+        citations_delta --> [*] : blocks[idx].citations += citation
+    }
+```
+
+| 层级 | 组件 | 位置 | 对应 LiteLLM |
+|------|------|------|-------------|
+| Layer 1 | `AnthropicSSEParser`, `OpenAIChatSSEParser`, `OpenAIResponsesSSEParser`, `GeminiSSEParser`, `GenericSSEParser` | `sse_parsers.py` | `BaseModelResponseIterator` + 各 provider 的 `chunk_parser` |
+| Layer 2 | `StreamChunk` dataclass — `{text_delta, reasoning_delta, tool_call_delta, finish_reason, usage, metadata, raw}` | `sse_parsers.py` | `ModelResponseStream` / `GenericStreamingChunk` |
+| Layer 3 | `ChunkAccumulator` — 按字段类型合并 chunks；各 parser 的 `finalize()` 构建最终 JSON | `sse_parsers.py` | `ChunkProcessor` / `stream_chunk_builder` |
+
+**关键设计决策**：
+- **保留原始厂商格式**（与 LiteLLM 不同）：LiteLLM 将所有 provider 的流式输出实时转换为 OpenAI 格式，本项目的目标是透明日志记录，因此 `finalize()` 直接输出 Anthropic / OpenAI / Gemini 的原生 JSON 结构
+- **批量处理**：先收集完整 SSE 流再一次性重建（而非 LiteLLM 的逐 chunk 实时输出），适合代理日志场景
+- **解析器注册表**：`detect_sse_format()` 从首个 chunk 自动检测格式，查表分发到对应 parser
+
 ### 格式支持
 
-| API | 检测标志 | 解析方式 |
-|-----|----------|----------|
-| OpenAI Chat Completions | `choices[].delta` | 逐 chunk 累积 content + tool_calls |
-| OpenAI Responses | `type` 以 `response.` 开头 | 按事件类型累积 output_text / reasoning |
-| Anthropic Messages | `type` 为已知事件名 | 按 content_block 索引累积 text / thinking / tool_use |
-| Google Gemini | `candidates[]` 存在 | 累积 parts[].text |
-| 通用/未知 | 以上均不匹配 | 深度合并 + content 字段提取 + 递归遍历 |
+| API | 检测标志 | 解析器 | 解析方式 |
+|-----|----------|--------|----------|
+| OpenAI Chat Completions | `choices[].delta` | `OpenAIChatSSEParser` | ChunkAccumulator 累积 content + reasoning_content + tool_calls（按 index 合并） |
+| OpenAI Responses | `type` 以 `response.` 开头 | `OpenAIResponsesSSEParser` | 按事件类型（`response.created`/`output_text.delta`/`completed`）累积 |
+| Anthropic Messages | `type` 为已知事件名 | `AnthropicSSEParser` | 状态机驱动：`message_start` → `content_block_start` → `content_block_delta` → `content_block_stop` → `message_delta` → `message_stop` |
+| Google Gemini | `candidates[]` 存在 | `GeminiSSEParser` | ChunkAccumulator 累积 parts[].text |
+| 通用/未知 | 以上均不匹配 | `GenericSSEParser` | 三阶段回退：深度合并 → JSON 树遍历提取文本 → 返回原始 SSE 文本 |
 
 ### 流内缓冲
 
@@ -1148,7 +1348,8 @@ llm-proxy/
 │   ├── models.py            # ORM 模型（User / Port / Request）
 │   ├── schemas.py           # Pydantic 请求/响应模型
 │   ├── auth.py              # JWT 认证 + bcrypt 密码哈希
-│   ├── proxy_app.py         # 代理核心：HTTP/1.1 + HTTP/2 双客户端、SSE 解析、DB 记录
+│   ├── proxy_app.py         # 代理核心：HTTP/1.1 + HTTP/2 双客户端、DB 记录、SSE 解析入口
+│   ├── sse_parsers.py       # SSE 解析模块（LiteLLM 三层架构）：StreamChunk + ChunkAccumulator + 5 个 Provider 解析器
 │   ├── shared_proxy.py      # 共享代理端点 /{port_number}/{path}
 │   ├── proxy_manager.py     # 端口配置查询 + 缓存刷新
 │   ├── requirements.txt     # pip 依赖
