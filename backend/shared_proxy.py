@@ -28,6 +28,7 @@ from proxy_app import (
     aget_target_url,
     _serialize_body,
     _save_record_async,
+    _fire_and_forget_save,
     EXCLUDE_HEADERS,
 )
 from config import PROXY_BODY_MEMORY_LIMIT
@@ -204,6 +205,72 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                 if _read_err is not None:
                     _RETRYABLE = (*_RETRYABLE, _read_err)
 
+                # When the client disconnects mid-stream (common with codex
+                # CLI), Starlette injects GeneratorExit at the yield point,
+                # skipping all code after the for-loop.  Moving the save into
+                # a helper called from finally ensures the record is still
+                # written even on premature disconnect.
+                _record_saved = False
+
+                def _save_stream_record():
+                    """Read resp_buf → reconstruct → schedule DB save.
+
+                    Uses only sync operations + _fire_and_forget_save (no
+                    await) so it is safe to call from a finally block under
+                    GeneratorExit.
+                    """
+                    nonlocal _record_saved
+                    if _record_saved:
+                        return
+                    _record_saved = True  # set first to prevent double-save
+                    try:
+                        resp_buf.seek(0)
+                        full_body = resp_buf.read()
+                        if not full_body:
+                            return
+                        raw_sse_text = full_body.decode(
+                            "utf-8", errors="replace")
+                        try:
+                            reconstructed_json = _reconstruct_sse_to_json(
+                                raw_sse_text)
+                        except Exception as recon_err:
+                            logger.warning(
+                                "SSE reconstruction failed for port %d: "
+                                "%s: %s — saving raw text",
+                                port_number,
+                                type(recon_err).__name__, recon_err,
+                            )
+                            reconstructed_json = raw_sse_text
+
+                        reconstruction_error = (
+                            reconstructed_json is None
+                            or (isinstance(reconstructed_json, str)
+                                and reconstructed_json.lstrip()
+                                .startswith("data:"))
+                        )
+                        if reconstruction_error \
+                                and reconstructed_json is None:
+                            reconstructed_json = raw_sse_text
+
+                        duration_ms = int((time.time() - start_time) * 1000)
+                        _fire_and_forget_save(_save_record_async(
+                            port_number, request.method,
+                            forward_path
+                            + ("?" + query_string
+                               if query_string else ""),
+                            req_headers_json, req_body_str,
+                            resp_headers_json, reconstructed_json,
+                            status_code, duration_ms,
+                            resp_body_raw=raw_sse_text,
+                            reconstruction_error=reconstruction_error,
+                        ))
+                    except Exception as e:
+                        logger.error(
+                            "Failed to save stream record for port %d: "
+                            "%s: %s",
+                            port_number, type(e).__name__, e,
+                        )
+
                 try:
                     for attempt in range(2):
                         try:
@@ -253,34 +320,20 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                                 )
                                 break  # graceful end
 
-                    # Stream ended (success or graceful termination) —
-                    # reconstruct JSON and save record.
-                    resp_buf.seek(0)
-                    full_body = resp_buf.read()
-                    raw_sse_text = full_body.decode("utf-8", errors="replace")
-                    reconstructed_json = _reconstruct_sse_to_json(raw_sse_text)
-
-                    # Detect reconstruction failure: None means all parsers exhausted;
-                    # raw SSE text (starts with "data:") means generic fallback returned.
-                    reconstruction_error = (
-                        reconstructed_json is None
-                        or reconstructed_json.lstrip().startswith("data:")
-                    )
-                    if reconstruction_error and reconstructed_json is None:
-                        reconstructed_json = raw_sse_text
-
-                    duration_ms = int((time.time() - start_time) * 1000)
-                    asyncio.create_task(_save_record_async(
-                        port_number, request.method,
-                        forward_path
-                        + ("?" + query_string if query_string else ""),
-                        req_headers_json, req_body_str,
-                        resp_headers_json, reconstructed_json,
-                        status_code, duration_ms,
-                        resp_body_raw=raw_sse_text,
-                        reconstruction_error=reconstruction_error,
-                    ))
+                    # Stream ended normally — save record
+                    _save_stream_record()
                 finally:
+                    # If the client disconnected (GeneratorExit) or the stream
+                    # was interrupted, _record_saved is still False — save
+                    # whatever partial data we collected so the request is
+                    # never lost.
+                    if not _record_saved:
+                        logger.debug(
+                            "Saving stream record from finally block "
+                            "(client disconnect?) — port %d",
+                            port_number,
+                        )
+                    _save_stream_record()
                     resp_buf.close()
                     try:
                         await current_ctx.__aexit__(None, None, None)
@@ -400,7 +453,7 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
         # For non-streaming responses, resp_body_str holds the pretty-printed
         # JSON; resp_body_raw_str holds the raw decoded response body so
         # response_body_raw is populated consistently with the streaming path.
-        asyncio.create_task(_save_record_async(
+        _fire_and_forget_save(_save_record_async(
             port_number, request.method,
             forward_path + ("?" + query_string if query_string else ""),
             req_headers_json, req_body_str,

@@ -40,6 +40,71 @@ def _sanitize_text(value: str | None) -> str | None:
         return cleaned
 
 
+# ──────────────────────────────────────────────
+#  Background task tracking — prevent GC of save tasks
+# ──────────────────────────────────────────────
+# asyncio.create_task() only holds a *weak* reference to the task.  If the
+# caller doesn't save the returned Task object, Python's garbage collector
+# can collect it before it runs, silently losing the database write.
+# This is a well-documented gotcha:
+#   https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
+_pending_save_tasks: set[asyncio.Task] = set()
+
+
+def _fire_and_forget_save(coro):
+    """Schedule a background DB-save task and prevent garbage collection.
+
+    The task is tracked in ``_pending_save_tasks``; a done-callback removes
+    it and logs any unhandled exception so failures appear in docker logs
+    instead of being silently swallowed.
+    """
+    try:
+        task = asyncio.create_task(coro)
+    except RuntimeError:
+        # No running event loop (e.g. during shutdown) — can't schedule
+        logger.warning("No running event loop — background save skipped")
+        return None
+    _pending_save_tasks.add(task)
+
+    def _on_done(t: asyncio.Task):
+        _pending_save_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error(
+                "Background save task failed: %s: %s",
+                type(exc).__name__, exc,
+                exc_info=exc,
+            )
+
+    task.add_done_callback(_on_done)
+    return task
+
+
+async def drain_pending_saves(timeout: float = 10.0):
+    """Wait for all pending background save tasks to complete.
+
+    Called during graceful shutdown to ensure no records are lost when
+    the database engine and thread pool are disposed.  A timeout prevents
+    the server from hanging indefinitely if a save is stuck.
+    """
+    if not _pending_save_tasks:
+        return
+    logger.info("Draining %d pending save task(s)...", len(_pending_save_tasks))
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*_pending_save_tasks, return_exceptions=True),
+            timeout=timeout,
+        )
+        logger.info("All pending save tasks completed")
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Drain timed out after %.1fs — %d task(s) still pending",
+            timeout, len(_pending_save_tasks),
+        )
+
+
 # Shared httpx clients — HTTP/1.1 (default, stable) and HTTP/2 (opt-in per port).
 # HTTP/2 multiplexing causes GOAWAY races: upstream APIs (especially relays like
 # dmxapi.cn) periodically recycle idle connections, and a mid-stream GOAWAY
@@ -258,7 +323,6 @@ def _save_to_db(port_number: int, method: str, path: str,
     Uses the dedicated log engine (LogSessionLocal) so that burst writes from
     proxy logging never compete with FastAPI management API connections.
     """
-    import time as _time
     last_error = None
     for attempt in range(3):
         db = database.LogSessionLocal()
@@ -295,7 +359,7 @@ def _save_to_db(port_number: int, method: str, path: str,
             db.rollback()
             last_error = e
             if attempt < 2:
-                _time.sleep(0.5 * (attempt + 1))  # 0.5s, 1.0s backoff
+                time.sleep(0.5 * (attempt + 1))  # 0.5s, 1.0s backoff
         finally:
             db.close()
 
@@ -352,6 +416,8 @@ __all__ = [
     "_save_to_db",
     "_save_record_async",
     "_sanitize_text",
+    "_fire_and_forget_save",
+    "drain_pending_saves",
     "_reconstruct_sse_to_json",
     "EXCLUDE_HEADERS",
 ]

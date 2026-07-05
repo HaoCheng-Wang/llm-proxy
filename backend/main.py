@@ -22,7 +22,11 @@ from config import (
     API_PORT, CORS_ORIGINS,
 )
 from proxy_manager import ProxyManager
-from proxy_app import close_shared_client, close_http2_client, init_shared_client, init_http2_client
+from proxy_app import (
+    close_shared_client, close_http2_client,
+    init_shared_client, init_http2_client,
+    drain_pending_saves,
+)
 
 
 # Configure project logger — only touches the llm_proxy namespace,
@@ -73,6 +77,11 @@ async def lifespan(app: FastAPI):
     await close_shared_client()
     logger.info("Closing HTTP/2 client...")
     await close_http2_client()
+
+    # Wait for in-flight background saves before disposing DB resources.
+    # Without this, records from the last few requests before shutdown
+    # would be silently lost when the engine/pool is torn down.
+    await drain_pending_saves(timeout=10.0)
 
     logger.info("Disposing database connection pools...")
     if database.engine:
