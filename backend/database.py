@@ -193,6 +193,13 @@ def _migrate_columns_on_engine(eng):
             "Added column: ports.prefer_http2 (nullable)",
         )
 
+        # Add api_key column to ports — NULL=pass-through, set=override agent's key
+        _run_migration_ddl(
+            conn,
+            "ALTER TABLE ports ADD COLUMN api_key VARCHAR(500) NULL",
+            "Added column: ports.api_key (nullable)",
+        )
+
         for col in ["request_headers", "request_body", "response_headers",
                      "response_body", "response_body_raw"]:
             _run_migration_ddl(

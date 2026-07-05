@@ -60,7 +60,7 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
             {"error": f"No active proxy configured for port {port_number}"},
             status_code=404,
         )
-    target_url, prefer_http2 = _port_config
+    target_url, prefer_http2, api_key = _port_config
 
     # Build the actual forward path (strip the /{port_number} prefix)
     forward_path = "/" + path if path else "/"
@@ -99,6 +99,22 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
     }
     parsed_target = urlparse(target_url)
     forward_headers["host"] = parsed_target.netloc
+
+    # If an API key is configured for this port, override the auth headers
+    # sent by the agent with the system-configured key.  If the agent didn't
+    # send any auth header, add one so the request can authenticate upstream.
+    if api_key:
+        _auth_hdrs = {"authorization", "x-api-key", "api-key", "x-goog-api-key"}
+        _found_auth = False
+        for _hdr in list(forward_headers.keys()):
+            if _hdr.lower() in _auth_hdrs:
+                if _hdr.lower() == "authorization":
+                    forward_headers[_hdr] = f"Bearer {api_key}"
+                else:
+                    forward_headers[_hdr] = api_key
+                _found_auth = True
+        if not _found_auth:
+            forward_headers["Authorization"] = f"Bearer {api_key}"
 
     # Forward the request
     status_code = 502

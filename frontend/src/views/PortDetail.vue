@@ -124,13 +124,13 @@
             <span v-if="req.duration_ms" class="text-sm text-muted">{{ req.duration_ms }}ms</span>
           </div>
           <div class="flex gap-8" style="align-items:center">
-            <button class="btn btn-sm" style="color:#e74c3c;font-size:11px;padding:2px 6px;background:transparent;border:1px solid rgba(231,76,60,0.3);border-radius:4px"
+            <button class="btn btn-sm" style="color:var(--color-danger);font-size:11px;padding:2px 6px;background:transparent;border:1px solid var(--color-danger-bg);border-radius:4px"
                     @click.stop="handleDeleteRequest(req)"
                     title="删除此条记录">
               ✕
             </button>
             <span class="text-sm text-muted">{{ formatTime(req.created_at) }}</span>
-            <span style="color:#85929e;font-size:12px">{{ expanded[req.id] ? '▲' : '▼' }}</span>
+            <span style="color:var(--text-muted);font-size:12px">{{ expanded[req.id] ? '▲' : '▼' }}</span>
           </div>
         </div>
 
@@ -168,7 +168,7 @@
                       @click.stop="toggleRawSse(req)">
                 {{ rawSseExpanded[req.id] ? '🔽 隐藏原始SSE' : '📄 查看完整SSE原始文本' }}
               </button>
-              <span v-if="rawSseLoading[req.id]" style="margin-left:8px;color:#f0ad4e">⏳ 加载中...</span>
+              <span v-if="rawSseLoading[req.id]" style="margin-left:8px;color:var(--color-warning)">⏳ 加载中...</span>
               <pre v-if="rawSseExpanded[req.id]" class="raw-sse-text">{{ rawSseData[req.id] }}</pre>
             </div>
           </div>
@@ -226,9 +226,9 @@
     </div>
 
     <!-- Usage hints -->
-    <div class="card mt-16" style="border-color:#2c3e50;background:rgba(255,255,255,0.02)">
-      <div style="font-size:13px;line-height:1.8;color:#85929e">
-        <p style="color:#aeb6bf;margin-bottom:4px">💡 使用提示</p>
+    <div class="card mt-16" style="border-color:var(--border);background:var(--white-fade)">
+      <div style="font-size:13px;line-height:1.8;color:var(--text-muted)">
+        <p style="color:var(--text-secondary);margin-bottom:4px">💡 使用提示</p>
         <p>• 为降低负载，首次仅加载 10 条记录，可点击 <strong>加载更多</strong> 分批查看，或 <strong>加载全部</strong> 一键拉取所有记录（大量数据时可能较慢）。</p>
         <p>• <strong>📥 一键导出</strong> 默认只导出当前已加载且符合筛选条件的记录；如需导出全部 API 请求，请使用菜单中的 <strong>🔄 从后端导出</strong>，无需在前端全部加载。</p>
       </div>

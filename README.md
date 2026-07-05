@@ -52,6 +52,8 @@ flowchart LR
 | 配置存储 | MySQL，所有状态持久化，内存缓存 + TTL 加速 |
 | 安全 | JWT 认证 + bcrypt + SSRF 防护 + CORS |
 | 转发协议 | HTTP/1.1 默认 + HTTP/2 按端口可选择 |
+| API Key 覆盖 | 按端口可选配置专属 api_key，替换智能体原始认证头 |
+| 前端主题 | 浅色/深色/跟随系统三种模式，CSS 变量 + localStorage 持久化 |
 | 流式处理 | SpooledTemporaryFile 流内缓冲，流结束一次性写入 MySQL |
 
 ### 路由优先级
@@ -230,7 +232,7 @@ stateDiagram-v2
     [*] --> 运行中 : 用户创建
     运行中 --> 停用 : stop_port()
     停用 --> 运行中 : start_port()
-    运行中 --> 运行中 : 编辑(目标地址/描述/编号)
+    运行中 --> 运行中 : 编辑(目标地址/描述/编号/api_key)
     运行中 --> 已删除 : 软删除
     停用 --> 已删除 : 软删除
     已删除 --> 停用 : 管理员恢复
@@ -264,9 +266,9 @@ users                        ports                              requests
 │ is_approved  │            │ description             │────────│ request_headers      │
 │ created_at   │            │ is_active               │        │ request_body         │
 └──────────────┘            │ prefer_http2            │        │ response_headers     │
-                            │ deleted_at              │        │ response_body        │
-                            │ created_at              │        │ response_body_raw    │
-                            └─────────────────────────┘        │ status_code          │
+                            │ api_key                 │        │ response_body        │
+                            │ deleted_at              │        │ response_body_raw    │
+                            │ created_at              │        │ status_code          │
                                                                │ duration_ms          │
                                                                │ reconstruction_error │
                                                                │ created_at           │
@@ -284,7 +286,8 @@ users                        ports                              requests
 | SSRF 防护 | URL 校验 | 阻止内网 IP / localhost / metadata 端点 |
 | CORS | FastAPI Middleware | 可配置来源白名单 |
 | 端口分配锁 | MySQL GET_LOCK | 序列化分配，防止编号冲突 |
-| API Key | 原样透传并记录 | Authorization 头原样转发到上游，同时完整记录到数据库 request_headers 字段 |
+| API Key 透传 | 默认原样透传 | 默认行为：Authorization 头原样转发到上游，完整记录到数据库 |
+| API Key 覆盖 | 按端口可选配置 | 每个代理端口可配置专属 api_key，配置后替换智能体发送的 Authorization/x-api-key 等认证头；不配置则原样透传 |
 
 ## 高并发设计
 
@@ -857,7 +860,24 @@ Export progress: 3624/12087 (30%) elapsed=124.3s interval=[1208 rows in 38.4s, 3
 | `content-encoding` | httpx 自动解压响应，无需透传 |
 | `accept-encoding` | 显式移除，避免上游返回压缩内容 |
 
-`Authorization` 头（API Key）**原样透传**，代理不修改，但会完整记录到数据库 `request_headers` 字段。
+`Authorization` 头（API Key）默认**原样透传**，代理不修改，但会完整记录到数据库 `request_headers` 字段。
+
+#### API Key 覆盖（按端口可选）
+
+每个代理端口可配置专属 `api_key`（在创建/编辑代理弹窗中设置）。配置后，代理转发时会**替换**智能体原始发送的认证头：
+
+| 原始头 | 替换为 |
+|--------|--------|
+| `Authorization: Bearer xxx` | `Authorization: Bearer {配置的api_key}` |
+| `x-api-key: xxx` | `x-api-key: {配置的api_key}` |
+| `api-key: xxx` | `api-key: {配置的api_key}` |
+| `x-goog-api-key: xxx` | `x-goog-api-key: {配置的api_key}` |
+
+- **配置了 api_key** → 替换上述任一存在的认证头；若原始请求无认证头，则自动添加 `Authorization: Bearer {api_key}`
+- **未配置 api_key（NULL）** → 原样透传，不修改任何认证头
+- 无论是否覆盖，原始请求头仍完整记录到数据库 `request_headers` 字段
+
+> **使用场景**：多个智能体共用同一个代理端口时，可用系统配置的统一 api_key 替换各智能体自带的 key，避免因个别 key 失效导致请求失败。
 
 > **实际案例**：Claude CLI（`claude-cli/2.1.98`）等客户端会在请求中携带 `accept-encoding: gzip, deflate`，表示客户端能接受压缩响应。代理在转发前移除此头，确保上游返回未压缩的原始 SSE 流——否则压缩后的二进制数据会打碎 SSE 事件边界，导致逐 chunk 透传和 JSON 重组均无法工作。原始 `accept-encoding` 值仍完整保存在数据库 `request_headers` 中，可在前端查看详情时看到。
 
@@ -1155,11 +1175,11 @@ npm run dev
 #### 7. 使用流程
 
 1. 用户注册账号并登录（`REQUIRE_APPROVAL=false` 时注册后直接登录；设为 `true` 则由管理员审批后登录）
-2. 用户登录 → 点击「创建代理」→ 输入目标 API 地址并**选择转发协议**（默认 HTTP/1.1，中转站场景推荐；直连模型 API 可选 HTTP/2）
+2. 用户登录 → 点击「创建代理」→ 输入目标 API 地址并**选择转发协议**（默认 HTTP/1.1，中转站场景推荐；直连模型 API 可选 HTTP/2），可选配置 **API Key 覆盖**（配置后替换智能体发送的认证头，不配置则原样透传）
 3. 在智能体中，把 API Base URL 改为 `http://<你的IP>:3998/<分配的端口号>`，路径部分保持不变：
    - 原来：`https://api.openai.com/v1/chat/completions`
    - 改为：`http://<IP>:3998/12345/v1/chat/completions`（`12345` 为系统分配的 5 位编号）
-   - API Key 等其他配置不需要任何修改
+   - API Key 等其他配置不需要任何修改（若端口配置了 API Key 覆盖，则智能体的 API Key 会被替换为系统配置的）
 4. 在「查看详情」页面实时查看所有交互记录
 
 ### Docker 生产部署
@@ -1345,10 +1365,11 @@ llm-proxy/
     ├── vite.config.js
     └── src/
         ├── main.js          # Vue 入口（createApp + Pinia + Router）
-        ├── App.vue          # 根组件（导航栏 + 用户信息 + toast 通知）
-        ├── style.css        # 全局样式
+        ├── App.vue          # 根组件（导航栏 + 用户信息 + 主题切换 + toast 通知）
+        ├── style.css        # 全局样式（CSS 变量主题系统：浅色/深色/跟随系统）
         ├── api/index.js     # API 客户端（axios 拦截器 + NDJSON 流式加载 + ticket 导出）
         ├── stores/auth.js   # Pinia 认证状态（token/用户信息/登录/登出）
+        ├── stores/theme.js  # Pinia 主题状态（浅色/深色/跟随系统 + localStorage 持久化）
         ├── router/index.js  # 路由配置 + 守卫（guest/auth/admin 三级权限）
         ├── components/
         │   └── JsonTree.vue # JSON 树形查看组件（搜索/折叠/展开/导航）
@@ -1374,6 +1395,7 @@ llm-proxy/
 | 一键导出 | 三合一：JSON 数据导出 / **流式全量导出**（浏览器原生 `<a>` 下载，不经过 JS 内存） / 后端全量 API 请求导出（浏览器原生下载，支持取消时自动释放后端资源） |
 | 分页加载 | 首次加载 10 条，支持"加载更多"和"加载全部"，上限 100 条/次 |
 | 滚动保护 | 阅读交互记录时新数据到达不跳动滚动位置 |
+| 颜色风格切换 | 浅色/深色/跟随系统三种模式，通过顶部下拉菜单切换，偏好持久化到 localStorage，跟随系统模式实时响应操作系统主题变化 |
 
 ## API 接口
 
@@ -1397,11 +1419,11 @@ llm-proxy/
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/ports` | 创建代理（自动分配编号） |
+| POST | `/api/ports` | 创建代理（自动分配编号，可配置 api_key 覆盖） |
 | GET | `/api/ports` | 列出我的代理（管理员看全部） |
 | GET | `/api/ports/active-ports` | 获取所有活跃端口号 |
 | GET | `/api/ports/{id}` | 代理详情 + 交互历史（流式 NDJSON，分页） |
-| PUT | `/api/ports/{id}` | 编辑代理（含转发协议） |
+| PUT | `/api/ports/{id}` | 编辑代理（含转发协议、api_key 覆盖） |
 | DELETE | `/api/ports/{id}` | 软删除（可恢复） |
 | POST | `/api/ports/{id}/stop` | 停用 |
 | POST | `/api/ports/{id}/start` | 启用 |

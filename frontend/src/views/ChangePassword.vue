@@ -68,9 +68,9 @@ async function handleChange() {
 
 <style scoped>
 .form-success {
-  background: rgba(39, 174, 96, 0.1);
-  border: 1px solid #27ae60;
-  color: #27ae60;
+  background: var(--color-success-bg);
+  border: 1px solid var(--btn-success);
+  color: var(--color-success);
   padding: 10px;
   border-radius: 6px;
   margin-top: 12px;

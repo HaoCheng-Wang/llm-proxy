@@ -135,28 +135,28 @@ onMounted(async () => {
   align-items: center;
   margin-bottom: 24px;
   padding-bottom: 16px;
-  border-bottom: 1px solid #2c3e50;
+  border-bottom: 1px solid var(--border);
   flex-wrap: wrap;
   gap: 12px;
 }
 
 .jtv-header h2 {
   font-size: 20px;
-  color: #e0e6ed;
+  color: var(--text-primary);
 }
 
 .jtv-label {
   font-size: 13px;
   font-weight: 600;
-  color: #5dade2;
+  color: var(--accent);
   padding: 4px 10px;
   border-radius: 4px;
-  background: rgba(93, 173, 226, 0.10);
+  background: var(--accent-bg-hover);
 }
 
 .jtv-path {
   font-size: 13px;
-  color: #aeb6bf;
+  color: var(--text-secondary);
   word-break: break-all;
   max-width: 400px;
   overflow: hidden;
@@ -165,21 +165,21 @@ onMounted(async () => {
 }
 
 .jtv-body {
-  background: #15222b;
-  border: 1px solid #2c3e50;
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border);
   border-radius: 10px;
   padding: 20px 24px;
 }
 
 .jtv-raw-hint {
   font-size: 13px;
-  color: #f39c12;
+  color: var(--color-warning);
   margin-bottom: 12px;
 }
 
 .jtv-raw-text {
-  background: #0f1923;
-  border: 1px solid #2c3e50;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
   border-radius: 6px;
   padding: 16px;
   font-size: 13px;
@@ -188,7 +188,7 @@ onMounted(async () => {
   word-break: break-all;
   max-height: 600px;
   overflow-y: auto;
-  color: #c8d6e5;
+  color: var(--text-code);
   font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
 }
 </style>

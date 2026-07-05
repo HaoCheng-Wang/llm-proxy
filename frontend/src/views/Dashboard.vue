@@ -26,10 +26,11 @@
           <tbody>
             <tr v-for="port in ports" :key="port.id">
               <td>
-                <strong style="font-size:16px;color:#5dade2">{{ port.port_number }}</strong>
+                <strong style="font-size:16px;color:var(--accent)">{{ port.port_number }}</strong>
+                <span v-if="port.api_key" title="已配置自定义 API Key" style="margin-left:4px">🔑</span>
               </td>
               <td>
-                <code style="font-size:12px;color:#aeb6bf;background:#15222b;padding:2px 6px;border-radius:4px">
+                <code style="font-size:12px;color:var(--text-secondary);background:var(--bg-card-alt);padding:2px 6px;border-radius:4px">
                   http://{{ displayIp }}:{{ apiPort }}/{{ port.port_number }}
                 </code>
               </td>
@@ -38,7 +39,7 @@
               </td>
               <td>{{ port.description || '-' }}</td>
               <td v-if="auth.isAdmin">
-                <span class="badge" style="background:rgba(93,173,226,0.15);color:#5dade2">{{ port.username || '-' }}</span>
+                <span class="badge" style="background:var(--accent-bg-active);color:var(--accent)">{{ port.username || '-' }}</span>
               </td>
               <td>{{ port.request_count }}</td>
               <td>
@@ -58,7 +59,7 @@
                   <button class="btn btn-outline btn-sm" @click="$router.push(`/port/${port.id}`)">
                     查看详情
                   </button>
-                  <button class="btn btn-outline btn-sm" @click="openEdit(port)" style="color:#f39c12;border-color:rgba(243,156,18,0.4)">
+                  <button class="btn btn-outline btn-sm" @click="openEdit(port)" style="color:var(--color-warning);border-color:var(--color-warning-bg)">
                     编辑
                   </button>
                   <button v-if="port.is_active" class="btn btn-warning btn-sm" @click="handleStop(port)">
@@ -86,7 +87,7 @@
     <!-- Usage Guide -->
     <div class="card mt-24">
       <div class="card-header">📖 使用说明</div>
-      <div style="font-size:14px;line-height:1.8;color:#aeb6bf">
+      <div style="font-size:14px;line-height:1.8;color:var(--text-secondary)">
         <p><strong>第 1 步：创建代理</strong></p>
         <p>点击 <strong>"创建代理"</strong>，输入大模型 API 的目标地址。常见示例：</p>
         <ul style="margin:4px 0 8px 20px">
@@ -94,7 +95,7 @@
           <li>Ollama 本地模型：<code>http://localhost:11434</code></li>
           <li>第三方兼容接口：<code>https://your-api-provider.com</code></li>
         </ul>
-        <p style="color:#e67e22">⚠️ 注意：只填域名和端口（如 <code>https://api.openai.com</code>），<strong>不要</strong>带 <code>/v1</code> 等路径，路径会在智能体配置中保留。</p>
+        <p style="color:var(--color-orange)">⚠️ 注意：只填域名和端口（如 <code>https://api.openai.com</code>），<strong>不要</strong>带 <code>/v1</code> 等路径，路径会在智能体配置中保留。</p>
 
         <p><strong>第 2 步：获取分配的代理编号</strong></p>
         <p>系统自动分配一个 5 位随机编号。此编号将放在 URL 路径中访问（例如 <code>http://{{ displayIp }}:{{ apiPort }}/12345/...</code>）。</p>
@@ -140,7 +141,13 @@
                    placeholder="用于区分不同用途的代理" />
           </div>
           <div class="form-group">
-            <label>🔗 转发协议 <span style="color:#e74c3c">*</span></label>
+            <label>� 自定义 API Key（可选）</label>
+            <input v-model="createForm.api_key" class="form-input" type="password"
+                   placeholder="留空则透传智能体原始 Key；填写则替换为本系统配置的 Key" />
+            <p style="font-size:12px;color:var(--text-muted);margin-top:4px">配置后，智能体发送的 Authorization / x-api-key 等认证头将被替换为此 Key</p>
+          </div>
+          <div class="form-group">
+            <label>🔗 转发协议 <span style="color:var(--color-danger)">*</span></label>
             <p class="protocol-hint">目标是中转站（如 dmxapi.cn）必须选 HTTP/1.1；直连模型厂商 API 可选 HTTP/2</p>
             <div class="protocol-selector">
               <label class="protocol-option" :class="{ active: createForm.prefer_http2 === false }">
@@ -187,7 +194,13 @@
                    placeholder="用于区分不同用途的代理" />
           </div>
           <div class="form-group">
-            <label>🔗 转发协议 <span style="color:#e74c3c">*</span></label>
+            <label>� 自定义 API Key</label>
+            <input v-model="editForm.api_key" class="form-input" type="password"
+                   placeholder="留空保存则清除自定义 Key（透传智能体原始 Key）" />
+            <p style="font-size:12px;color:var(--text-muted);margin-top:4px">留空保存将清除自定义 Key；填写则替换智能体发送的认证头</p>
+          </div>
+          <div class="form-group">
+            <label>🔗 转发协议 <span style="color:var(--color-danger)">*</span></label>
             <p class="protocol-hint">目标是中转站（如 dmxapi.cn）必须选 HTTP/1.1；直连模型厂商 API 可选 HTTP/2</p>
             <div class="protocol-selector">
               <label class="protocol-option" :class="{ active: editForm.prefer_http2 === false }">
@@ -230,12 +243,12 @@ const displayIp = ref('your-server-ip')
 const apiPort = ref(3998)
 const ports = ref([])
 const showCreateModal = ref(false)
-const createForm = ref({ target_url: '', description: '', prefer_http2: false })
+const createForm = ref({ target_url: '', description: '', prefer_http2: false, api_key: '' })
 const createError = ref('')
 const creating = ref(false)
 
 const showEditModal = ref(false)
-const editForm = ref({ id: null, target_url: '', description: '', prefer_http2: null })
+const editForm = ref({ id: null, target_url: '', description: '', prefer_http2: null, api_key: '' })
 const editError = ref('')
 const editing = ref(false)
 
@@ -253,7 +266,7 @@ async function handleCreate() {
   try {
     await api.createPort(createForm.value)
     showCreateModal.value = false
-    createForm.value = { target_url: '', description: '', prefer_http2: false }
+    createForm.value = { target_url: '', description: '', prefer_http2: false, api_key: '' }
     showToast('代理创建成功！', 'success')
     await loadPorts()
   } catch (e) {
@@ -302,6 +315,7 @@ function openEdit(port) {
     target_url: port.target_url,
     description: port.description || '',
     prefer_http2: port.prefer_http2,  // null=not set yet, true/false=user picked
+    api_key: port.api_key || '',
   }
   showEditModal.value = true
 }
@@ -318,6 +332,7 @@ async function handleEdit() {
       target_url: editForm.value.target_url,
       description: editForm.value.description,
       prefer_http2: editForm.value.prefer_http2,
+      api_key: editForm.value.api_key,
     })
     showEditModal.value = false
     showToast('代理配置已更新', 'success')

@@ -12,7 +12,7 @@
           <input v-model="form.password" class="form-input" type="password" placeholder="至少4个字符" required />
         </div>
         <div v-if="error" class="form-error">{{ error }}</div>
-        <div v-if="success" style="color:#2ecc71;font-size:13px;margin-top:8px">{{ success }}</div>
+        <div v-if="success" style="color:var(--color-success);font-size:13px;margin-top:8px">{{ success }}</div>
         <button class="btn btn-primary" style="width:100%;margin-top:12px" :disabled="loading">
           {{ loading ? '提交中...' : '注册' }}
         </button>

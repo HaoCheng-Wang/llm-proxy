@@ -17,7 +17,7 @@
           </thead>
           <tbody>
             <tr v-for="port in deletedPorts" :key="port.id">
-              <td><strong style="color:#95a5a6">{{ port.port_number }}</strong></td>
+              <td><strong style="color:var(--color-neutral)">{{ port.port_number }}</strong></td>
               <td><span style="font-size:13px;word-break:break-all">{{ port.target_url }}</span></td>
               <td>{{ port.username || '-' }}</td>
               <td>{{ port.request_count }}</td>

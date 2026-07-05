@@ -202,14 +202,14 @@ async def close_http2_client():
         _http2_client = None
 
 
-# In-memory cache of port_number → (target_url, prefer_http2) mappings.
+# In-memory cache of port_number → (target_url, prefer_http2, api_key) mappings.
 # Refreshed from DB on startup and after PORT_CACHE_TTL seconds.
-_port_target_cache: dict[int, tuple[str, bool | None]] = {}
+_port_target_cache: dict[int, tuple[str, bool | None, str | None]] = {}
 _cache_updated_at: float = 0.0
 
 
 def refresh_port_cache(db=None):
-    """Refresh the port_number → (target_url, prefer_http2) cache from DB."""
+    """Refresh the port_number → (target_url, prefer_http2, api_key) cache from DB."""
     global _port_target_cache, _cache_updated_at
     if db is None:
         db = database.SessionLocal()
@@ -218,7 +218,7 @@ def refresh_port_cache(db=None):
                 Port.is_active.is_(True), Port.deleted_at.is_(None)
             ).all()
             _port_target_cache = {
-                p.port_number: (p.target_url, p.prefer_http2) for p in ports
+                p.port_number: (p.target_url, p.prefer_http2, p.api_key) for p in ports
             }
         finally:
             db.close()
@@ -227,7 +227,7 @@ def refresh_port_cache(db=None):
             Port.is_active.is_(True), Port.deleted_at.is_(None)
         ).all()
         _port_target_cache = {
-            p.port_number: (p.target_url, p.prefer_http2) for p in ports
+            p.port_number: (p.target_url, p.prefer_http2, p.api_key) for p in ports
         }
     _cache_updated_at = time.time()
 
@@ -241,8 +241,8 @@ def _maybe_refresh_cache():
         refresh_port_cache()
 
 
-def get_target_url(port_number: int) -> tuple[str, bool | None] | None:
-    """Get (target_url, prefer_http2) for a port. Falls back to DB.
+def get_target_url(port_number: int) -> tuple[str, bool | None, str | None] | None:
+    """Get (target_url, prefer_http2, api_key) for a port. Falls back to DB.
 
     WARNING: This is a SYNC function — use ``aget_target_url()`` from async
     contexts to avoid blocking the event loop.
@@ -261,7 +261,7 @@ def get_target_url(port_number: int) -> tuple[str, bool | None] | None:
             Port.deleted_at.is_(None),
         ).first()
         if port:
-            entry = (port.target_url, port.prefer_http2)
+            entry = (port.target_url, port.prefer_http2, port.api_key)
             _port_target_cache[port.port_number] = entry
             return entry
         return None
@@ -278,8 +278,8 @@ async def _arefresh_port_cache():
     await loop.run_in_executor(None, refresh_port_cache)
 
 
-async def aget_target_url(port_number: int) -> tuple[str, bool | None] | None:
-    """Async: get (target_url, prefer_http2) for a port. Runs DB in thread pool."""
+async def aget_target_url(port_number: int) -> tuple[str, bool | None, str | None] | None:
+    """Async: get (target_url, prefer_http2, api_key) for a port. Runs DB in thread pool."""
     if time.time() - _cache_updated_at <= PORT_CACHE_TTL:
         cache = _port_target_cache
         if port_number in cache:
@@ -301,7 +301,7 @@ async def aget_target_url(port_number: int) -> tuple[str, bool | None] | None:
                 Port.deleted_at.is_(None),
             ).first()
             if port:
-                entry = (port.target_url, port.prefer_http2)
+                entry = (port.target_url, port.prefer_http2, port.api_key)
                 _port_target_cache[port.port_number] = entry
                 return entry
             return None

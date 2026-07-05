@@ -111,7 +111,7 @@ function scrollToCurrent() {
   const idx = ((currentMatch.value % marks.length) + marks.length) % marks.length
   currentMatch.value = idx
   marks[idx].scrollIntoView({ behavior: 'smooth', block: 'center' })
-  marks[idx].style.outline = '2px solid #f39c12'
+  marks[idx].style.outline = '2px solid var(--color-warning)'
   setTimeout(() => { if (marks[idx]) marks[idx].style.outline = '' }, 2000)
 }
 
@@ -131,7 +131,7 @@ function prevMatch() {
   font-family: 'Cascadia Code','Fira Code','JetBrains Mono','Consolas',monospace;
   font-size: 12px;
   line-height: 1.7;
-  color: #c8d6e5;
+  color: var(--text-code);
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -142,49 +142,49 @@ function prevMatch() {
   align-items: center;
   gap: 8px;
   padding: 6px 0 10px;
-  border-bottom: 1px solid #2c3e50;
+  border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
 
 .jv-input {
   padding: 4px 10px;
-  border: 1px solid #2c3e50;
+  border: 1px solid var(--border);
   border-radius: 4px;
-  background: #0f1923;
-  color: #c8d6e5;
+  background: var(--bg-code);
+  color: var(--text-code);
   font-size: 12px;
   outline: none;
   width: 180px;
 }
-.jv-input:focus { border-color: #5dade2; }
-.jv-input::placeholder { color: #566573; }
+.jv-input:focus { border-color: var(--accent); }
+.jv-input::placeholder { color: var(--placeholder); }
 
-.jv-cnt { font-size: 11px; color: #85929e; white-space: nowrap; }
+.jv-cnt { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
 
 .jv-nav {
   padding: 2px 8px;
-  border: 1px solid #2c3e50;
+  border: 1px solid var(--border);
   border-radius: 3px;
   background: transparent;
-  color: #85929e;
+  color: var(--text-muted);
   font-size: 11px;
   cursor: pointer;
 }
-.jv-nav:hover { background: rgba(93,173,226,0.08); color: #5dade2; }
+.jv-nav:hover { background: var(--accent-bg); color: var(--accent); }
 
 .jv-spacer { flex: 1; }
 
 .jv-btn {
   padding: 3px 10px;
-  border: 1px solid #2c3e50;
+  border: 1px solid var(--border);
   border-radius: 4px;
   background: transparent;
-  color: #85929e;
+  color: var(--text-muted);
   font-size: 11px;
   cursor: pointer;
   white-space: nowrap;
 }
-.jv-btn:hover { background: rgba(93,173,226,0.08); color: #5dade2; }
+.jv-btn:hover { background: var(--accent-bg); color: var(--accent); }
 
 .jv-body {
   overflow: auto;
@@ -193,32 +193,32 @@ function prevMatch() {
   padding-top: 8px;
 }
 
-.jv-empty { color: #7f8c8d; font-style: italic; }
+.jv-empty { color: var(--color-neutral); font-style: italic; }
 
 /* ---- vue-json-pretty dark theme overrides ---- */
 .vjs-tree {
   font-family: inherit !important;
   font-size: inherit !important;
   line-height: inherit !important;
-  color: #c8d6e5 !important;
+  color: var(--text-code) !important;
 }
-.vjs-tree .vjs-tree__content { border-left: 1px solid #2c3e50 !important; }
+.vjs-tree .vjs-tree__content { border-left: 1px solid var(--border) !important; }
 .vjs-tree .vjs-tree__node { cursor: pointer; }
-.vjs-tree .vjs-tree__node:hover { background: rgba(93,173,226,0.06); }
-.vjs-tree .vjs-key { color: #85c1e9 !important; }
-.vjs-tree .vjs-string { color: #2ecc71 !important; }
-.vjs-tree .vjs-number { color: #f39c12 !important; }
-.vjs-tree .vjs-boolean { color: #e74c3c !important; }
-.vjs-tree .vjs-null { color: #7f8c8d !important; }
-.vjs-tree .vjs-toggle { color: #566573 !important; }
-.vjs-tree .vjs-colon { color: #85929e !important; }
-.vjs-tree .vjs-bracket { color: #85929e !important; }
-.vjs-tree .vjs-comma { color: #85929e !important; }
+.vjs-tree .vjs-tree__node:hover { background: var(--accent-bg); }
+.vjs-tree .vjs-key { color: var(--accent-hover) !important; }
+.vjs-tree .vjs-string { color: var(--color-success) !important; }
+.vjs-tree .vjs-number { color: var(--color-warning) !important; }
+.vjs-tree .vjs-boolean { color: var(--color-danger) !important; }
+.vjs-tree .vjs-null { color: var(--color-neutral) !important; }
+.vjs-tree .vjs-toggle { color: var(--placeholder) !important; }
+.vjs-tree .vjs-colon { color: var(--text-muted) !important; }
+.vjs-tree .vjs-bracket { color: var(--text-muted) !important; }
+.vjs-tree .vjs-comma { color: var(--text-muted) !important; }
 
 /* search highlight */
 .jv-search-hl {
-  background: rgba(241,196,15,0.3);
-  color: #f1c40f;
+  background: var(--color-warning-bg);
+  color: var(--btn-warning-hover);
   border-radius: 2px;
   padding: 0 1px;
 }

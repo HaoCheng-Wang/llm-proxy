@@ -42,6 +42,7 @@ class PortCreate(BaseModel):
     target_url: str = Field(..., min_length=5, max_length=500)
     description: str = Field(default="", max_length=200)
     prefer_http2: Optional[bool] = None  # None=HTTP/1.1, set later on edit
+    api_key: Optional[str] = Field(None, max_length=500)  # None=pass-through, set=override
 
 
 class PortUpdate(BaseModel):
@@ -54,6 +55,7 @@ class PortUpdate(BaseModel):
     target_url: Optional[str] = Field(None, min_length=5, max_length=500)
     description: Optional[str] = Field(None, max_length=200)
     prefer_http2: Optional[bool] = None  # None=don't change, False/True=set
+    api_key: Optional[str] = Field(None, max_length=500)  # None=don't change, ""=clear, set=override
 
 
 class PortInfo(BaseModel):
@@ -63,6 +65,7 @@ class PortInfo(BaseModel):
     description: str
     is_active: bool
     prefer_http2: Optional[bool] = None  # None/False=HTTP/1.1, True=HTTP/2
+    api_key: Optional[str] = None  # None=pass-through, set=override agent's key
     deleted_at: Optional[datetime] = None
     created_at: datetime
     request_count: int = 0

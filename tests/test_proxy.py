@@ -262,9 +262,9 @@ class TestPortCache:
         import proxy_app
         # Prevent cache refresh (which needs DB) by setting TTL not yet expired
         proxy_app._cache_updated_at = time.time()
-        proxy_app._port_target_cache[9999] = ("https://cached.example.com", None)
+        proxy_app._port_target_cache[9999] = ("https://cached.example.com", None, None)
         result = proxy_app.get_target_url(9999)
-        assert result == ("https://cached.example.com", None)
+        assert result == ("https://cached.example.com", None, None)
         del proxy_app._port_target_cache[9999]
 
     def test_cache_miss_returns_none(self):
