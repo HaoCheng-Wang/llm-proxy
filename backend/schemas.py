@@ -65,7 +65,7 @@ class PortInfo(BaseModel):
     description: str
     is_active: bool
     prefer_http2: Optional[bool] = None  # None/False=HTTP/1.1, True=HTTP/2
-    api_key: Optional[str] = None  # None=pass-through, set=override agent's key
+    has_api_key: bool = False  # True if api_key is configured (actual value never exposed)
     deleted_at: Optional[datetime] = None
     created_at: datetime
     request_count: int = 0

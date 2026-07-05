@@ -27,7 +27,7 @@
             <tr v-for="port in ports" :key="port.id">
               <td>
                 <strong style="font-size:16px;color:var(--accent)">{{ port.port_number }}</strong>
-                <span v-if="port.api_key" title="已配置自定义 API Key" style="margin-left:4px">🔑</span>
+                <span v-if="port.has_api_key" title="已配置自定义 API Key" style="margin-left:4px">🔑</span>
               </td>
               <td>
                 <code style="font-size:12px;color:var(--text-secondary);background:var(--bg-card-alt);padding:2px 6px;border-radius:4px">
@@ -143,6 +143,7 @@
           <div class="form-group">
             <label>� 自定义 API Key（可选）</label>
             <input v-model="createForm.api_key" class="form-input" type="password"
+                   autocomplete="new-password" name="api-key-override"
                    placeholder="留空则透传智能体原始 Key；填写则替换为本系统配置的 Key" />
             <p style="font-size:12px;color:var(--text-muted);margin-top:4px">配置后，智能体发送的 Authorization / x-api-key 等认证头将被替换为此 Key</p>
           </div>
@@ -194,10 +195,22 @@
                    placeholder="用于区分不同用途的代理" />
           </div>
           <div class="form-group">
-            <label>� 自定义 API Key</label>
+            <label>🔑 自定义 API Key</label>
+            <div v-if="editForm.has_api_key" style="margin-bottom:8px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+              <span class="badge badge-active">已配置自定义 Key</span>
+              <label style="font-size:13px;cursor:pointer;display:flex;align-items:center;gap:4px">
+                <input type="checkbox" v-model="editForm.clear_api_key" />
+                清除自定义 Key（恢复透传智能体原始 Key）
+              </label>
+            </div>
+            <span v-else class="badge badge-inactive" style="margin-bottom:8px;display:inline-block">未配置（透传智能体原始 Key）</span>
             <input v-model="editForm.api_key" class="form-input" type="password"
-                   placeholder="留空保存则清除自定义 Key（透传智能体原始 Key）" />
-            <p style="font-size:12px;color:var(--text-muted);margin-top:4px">留空保存将清除自定义 Key；填写则替换智能体发送的认证头</p>
+                   autocomplete="new-password" name="api-key-override"
+                   :disabled="editForm.clear_api_key"
+                   :placeholder="editForm.has_api_key ? '如需修改请输入新的 API Key（留空则保持不变）' : '留空则透传智能体原始 Key；填写则替换'" />
+            <p style="font-size:12px;color:var(--text-muted);margin-top:4px">
+              {{ editForm.has_api_key ? '已配置自定义 Key。留空保存则保持不变；勾选上方选项可清除。' : '留空则透传智能体原始 Key；填写则替换智能体发送的认证头' }}
+            </p>
           </div>
           <div class="form-group">
             <label>🔗 转发协议 <span style="color:var(--color-danger)">*</span></label>
@@ -248,7 +261,7 @@ const createError = ref('')
 const creating = ref(false)
 
 const showEditModal = ref(false)
-const editForm = ref({ id: null, target_url: '', description: '', prefer_http2: null, api_key: '' })
+const editForm = ref({ id: null, target_url: '', description: '', prefer_http2: null, api_key: '', has_api_key: false, clear_api_key: false })
 const editError = ref('')
 const editing = ref(false)
 
@@ -315,7 +328,9 @@ function openEdit(port) {
     target_url: port.target_url,
     description: port.description || '',
     prefer_http2: port.prefer_http2,  // null=not set yet, true/false=user picked
-    api_key: port.api_key || '',
+    api_key: '',  // always empty — actual value is never sent from backend
+    has_api_key: port.has_api_key || false,
+    clear_api_key: false,
   }
   showEditModal.value = true
 }
@@ -328,12 +343,19 @@ async function handleEdit() {
   }
   editing.value = true
   try {
-    await api.updatePort(editForm.value.id, {
+    const payload = {
       target_url: editForm.value.target_url,
       description: editForm.value.description,
       prefer_http2: editForm.value.prefer_http2,
-      api_key: editForm.value.api_key,
-    })
+    }
+    // api_key: only send when user explicitly types a new value or checks "clear"
+    if (editForm.value.clear_api_key) {
+      payload.api_key = ''  // clear (set to NULL)
+    } else if (editForm.value.api_key) {
+      payload.api_key = editForm.value.api_key  // override with new value
+    }
+    // else: don't include api_key → backend treats as None → don't change
+    await api.updatePort(editForm.value.id, payload)
     showEditModal.value = false
     showToast('代理配置已更新', 'success')
     await loadPorts()

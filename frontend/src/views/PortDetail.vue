@@ -68,6 +68,11 @@
             {{ data.port.prefer_http2 ? 'HTTP/2' : 'HTTP/1.1' }}
           </span>
         </div>
+        <div>
+          <span class="text-muted">API Key：</span>
+          <span v-if="data.port.has_api_key" class="badge badge-active" title="已配置自定义 API Key，转发时替换智能体原始认证头">已配置</span>
+          <span v-else class="badge badge-inactive" title="未配置自定义 API Key，原样透传智能体发送的认证头">未配置（透传）</span>
+        </div>
         <div><span class="text-muted">创建时间：</span>{{ formatTime(data.port.created_at) }}</div>
         <div>
           <span class="text-muted">代理地址：</span>
