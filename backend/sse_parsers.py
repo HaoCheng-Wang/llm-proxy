@@ -822,7 +822,11 @@ class GenericSSEParser(BaseSSEParser):
             self._merged = deep_merge(self._merged, chunk)
         except Exception:
             # deep merge failed for this line; skip and continue
-            pass
+            logger.debug(
+                "%s deep_merge failed for line — skipping chunk",
+                type(self).__name__,
+                exc_info=True,
+            )
 
         return StreamChunk(raw=chunk)
 

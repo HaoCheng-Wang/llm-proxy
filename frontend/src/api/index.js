@@ -86,14 +86,18 @@ export default {
             requests.push(obj)
             if (onRecord) onRecord(obj)  // incremental render
           }
-        } catch (e) { /* skip */ }
+        } catch (e) {
+          console.warn('[stream] Failed to parse NDJSON line:', line.slice(0, 200), e)
+        }
       }
     }
     if (buffer.trim()) {
       try {
         const obj = JSON.parse(buffer)
         if (port !== null) { requests.push(obj); if (onRecord) onRecord(obj) }
-      } catch (e) { /* skip */ }
+      } catch (e) {
+        console.warn("[stream] Failed to parse trailing NDJSON line:", buffer.slice(0, 200), e)
+      }
     }
     return { port, requests }
   },

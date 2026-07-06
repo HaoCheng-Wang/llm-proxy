@@ -411,7 +411,8 @@ async function pollNewRecords() {
       showToast(`收到 ${newReqs.length} 条新交互记录`, 'info')
     }
   } catch (e) {
-    // Silently ignore poll errors
+    console.warn('[poll] Failed to poll new records:', e.message || e)
+    // Silently ignore poll errors — will retry on next interval
   } finally {
     polling.value = false
   }
@@ -703,7 +704,12 @@ async function handleDeleteRequest(req) {
     await api.deleteRequest(portId, req.id)
     const idx = requests.value.findIndex(r => r.id === req.id)
     if (idx !== -1) requests.value.splice(idx, 1)
+    // Decrement _offset so the next "load more" doesn't skip a record
+    _offset = Math.max(0, _offset - 1)
     newCount.value = Math.max(0, newCount.value - 1)
+    if (data.value.port?.request_count != null) {
+      data.value.port.request_count = Math.max(0, data.value.port.request_count - 1)
+    }
     showToast('已删除', 'success')
   } catch (e) {
     showToast('删除失败', 'error')

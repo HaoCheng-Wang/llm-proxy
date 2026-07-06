@@ -22,7 +22,7 @@
         :deep="currentDeep"
         :show-length="true"
         :show-line="false"
-        theme="dark"
+        :theme="resolvedTheme"
       />
       <span v-else class="jv-empty">(empty)</span>
     </div>
@@ -31,6 +31,7 @@
 
 <script setup>
 import { ref, computed, watch, nextTick } from 'vue'
+import { useThemeStore } from '../stores/theme'
 import VueJsonPretty from 'vue-json-pretty'
 import 'vue-json-pretty/lib/styles.css'
 
@@ -44,6 +45,9 @@ const matchCount = ref(0)
 const currentMatch = ref(-1)
 const currentDeep = ref(999)
 const treeKey = ref(0)
+
+const themeStore = useThemeStore()
+const resolvedTheme = computed(() => themeStore.resolvedTheme)
 
 const parsed = computed(() => {
   const d = props.data
@@ -205,6 +209,10 @@ function prevMatch() {
 .vjs-tree .vjs-tree__content { border-left: 1px solid var(--border) !important; }
 .vjs-tree .vjs-tree__node { cursor: pointer; }
 .vjs-tree .vjs-tree__node:hover { background: var(--accent-bg); }
+
+/* In light mode, ensure hover uses a visible background (not the dark theme's black) */
+[data-theme="light"] .vjs-tree .vjs-tree__node:hover { background: var(--accent-bg); }
+
 .vjs-tree .vjs-key { color: var(--accent-hover) !important; }
 .vjs-tree .vjs-string { color: var(--color-success) !important; }
 .vjs-tree .vjs-number { color: var(--color-warning) !important; }

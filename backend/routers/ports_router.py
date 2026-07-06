@@ -66,7 +66,7 @@ def _is_private_ip(hostname: str) -> bool:
         addr = ipaddress.ip_address(hostname)
         return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
     except ValueError:
-        pass  # Not an IP, treat as hostname
+        pass  # Not an IP, treat as hostname (expected for domain names like api.openai.com)
 
     # DNS resolution check
     try:
@@ -76,7 +76,8 @@ def _is_private_ip(hostname: str) -> bool:
             if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
                 return True
     except socket.gaierror:
-        pass  # DNS resolution failed, allow it (will fail at connect time)
+        logger.warning("SSRF check: DNS resolution failed for '%s' — allowing (will fail at connect time if unreachable)", hostname)
+        pass
 
     return False
 
@@ -275,6 +276,7 @@ def get_active_port_numbers(
 @router.get("/{port_id}")
 def get_port_history(
     port_id: int,
+    request: Request,
     since_id: int = 0,
     limit: int = 20,
     offset: int = 0,
@@ -288,7 +290,9 @@ def get_port_history(
              use GET .../raw-sse to fetch on demand)
 
     The generator owns its own session so it outlives the route handler.
-    yield_per(50) keeps memory constant regardless of total record count.
+    Uses StreamSessionLocal (SSCursor) for true server-side streaming —
+    yield_per(50) fetches rows incrementally instead of buffering all
+    results in client memory.
     """
     port = db.query(Port).filter(Port.id == port_id).first()
     if not port:
@@ -340,8 +344,8 @@ def get_port_history(
             "created_at": r.created_at,
         }
 
-    def stream_ndjson():
-        own_db = database.SessionLocal()
+    async def stream_ndjson():
+        own_db = database.StreamSessionLocal()
         try:
             query = (
                 own_db.query(RequestModel)
@@ -355,6 +359,7 @@ def get_port_history(
                 # Offset only makes sense without since_id filtering
                 query = query.offset(_offset)
             query = query.limit(_limit)
+            query = query.with_hint(RequestModel, "USE INDEX (ix_requests_port_created)")
 
             # Line 1 – port metadata
             yield (
@@ -362,13 +367,32 @@ def get_port_history(
             ).encode("utf-8")
 
             # Subsequent lines – one record each
+            _row_idx = 0
             for r in query.yield_per(50):
+                _row_idx += 1
                 rec = _record_to_dict(r)
                 yield (
                     json.dumps(rec, default=str, ensure_ascii=False) + "\n"
                 ).encode("utf-8")
+                # Detect client disconnect every 20 rows → stop early,
+                # so the DB connection is still healthy when we close it.
+                if _row_idx % 20 == 0 and await request.is_disconnected():
+                    logger.info("History client disconnected: port=%d rows=%d", _port_id, _row_idx)
+                    return
         finally:
-            own_db.close()
+            try:
+                own_db.close()
+            except Exception:
+                # Connection already broken (client disconnect / MySQL timeout).
+                # Invalidate discards the raw DBAPI connection without rollback.
+                try:
+                    own_db.invalidate()
+                except Exception:
+                    logger.warning(
+                        "Stream session cleanup failed for port=%d: "
+                        "connection already destroyed, pool will discard on next use",
+                        _port_id,
+                    )
 
     return StreamingResponse(
         stream_ndjson(),
@@ -813,19 +837,29 @@ def export_port_history(
     def _embed_body(raw):
         """Embed a raw body/header string as a JSON value.
 
-        All body fields stored in this application come from LLM API
-        request/response payloads — they are always valid JSON strings.
-        We embed directly with zero validation overhead.
+        Body fields may not always be valid JSON — _serialize_body() can
+        return raw text (non-JSON UTF-8) or a binary-data placeholder like
+        ``[binary data, 100 bytes]`` which starts with ``[`` but is NOT
+        valid JSON.  We validate with json.loads(): valid JSON embeds
+        directly (zero re-serialization); everything else gets wrapped via
+        json.dumps() so the export is always well-formed JSON.
         """
-        return raw or "null"
+        if not raw:
+            return "null"
+        try:
+            json.loads(raw)
+            return raw                       # valid JSON — embed as-is
+        except (json.JSONDecodeError, ValueError):
+            return json.dumps(raw, ensure_ascii=False)  # plain text — wrap as string
 
     def _build_full_row(r):
         """Build one row's JSON bytes directly — no intermediate dict, no json.loads.
 
-        The body/header fields in MySQL are already valid JSON strings
-        (they come from LLM API request/response bodies).  We verify with a
-        single-character structural check and embed directly, eliminating the
-        dominant CPU cost of large exports: json.loads() + json.dumps() per row.
+        The body/header fields in MySQL are usually valid JSON strings
+        (they come from LLM API request/response bodies).  _embed_body()
+        does a fast structural check and embeds valid JSON directly,
+        falling back to json.dumps() for non-JSON text.  This eliminates
+        the dominant CPU cost of large exports: json.loads() per row.
         """
         parts = [
             b'{"id":', str(r.id).encode(),
@@ -833,6 +867,7 @@ def export_port_history(
             b',"path":', json.dumps(r.path, ensure_ascii=False).encode(),
             b',"status_code":', _json_literal(r.status_code).encode(),
             b',"duration_ms":', _json_literal(r.duration_ms).encode(),
+            b',"reconstruction_error":', json.dumps(r.reconstruction_error, ensure_ascii=False).encode(),
             b',"timestamp":',
             json.dumps(r.created_at.isoformat() if r.created_at else None, ensure_ascii=False).encode(),
         ]
@@ -968,7 +1003,17 @@ def export_port_history(
 
             logger.info("Export finished: port=%d %d rows", _port_number, _row_count)
         finally:
-            own_db.close()
+            try:
+                own_db.close()
+            except Exception:
+                try:
+                    own_db.invalidate()
+                except Exception:
+                    logger.warning(
+                        "Export stream cleanup failed for port=%d: "
+                        "connection already destroyed, pool will discard on next use",
+                        _port_number,
+                    )
 
     return StreamingResponse(
         stream_jsonl(),
