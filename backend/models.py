@@ -15,7 +15,7 @@ class User(Base):
     is_approved = Column(Boolean, default=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
-    ports = relationship("Port", back_populates="user", cascade="all, delete-orphan")
+    ports = relationship("Port", back_populates="user", cascade="save-update, merge, refresh-expire, expunge")
 
 
 class Port(Base):
@@ -30,6 +30,7 @@ class Port(Base):
     prefer_http2 = Column(Boolean, nullable=True)  # NULL=HTTP/1.1, False=HTTP/1.1, True=HTTP/2
     api_key = Column(String(500), nullable=True)   # NULL=pass-through, set=override agent's key
     deleted_at = Column(DateTime, nullable=True)
+    cleaning_started_at = Column(DateTime, nullable=True)  # non-NULL = async cleanup in progress
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     user = relationship("User", back_populates="ports")
@@ -43,6 +44,8 @@ class Request(Base):
         # Composite index for fast filtering by port_id, method, and ordering by created_at.
         # Without this, COUNT/ORDER BY on a port's requests requires a filesort.
         Index("ix_requests_port_method_created", "port_id", "method", "created_at"),
+        # Index for the port history NDJSON stream — filters by port_id, orders by created_at DESC.
+        Index("ix_requests_port_created", "port_id", "created_at"),
         {"mysql_charset": "utf8mb4"},
     )
 

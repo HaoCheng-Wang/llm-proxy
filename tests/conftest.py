@@ -65,7 +65,14 @@ async def setup_database():
 
     yield
 
-    # Cleanup
+    # Cleanup — only drop tables in the TEST database.
+    # Guard: refuse to drop if we somehow connected to production.
+    _db_name = getattr(database.engine.url, 'database', '')
+    if 'test' not in _db_name.lower():
+        raise RuntimeError(
+            f"SAFETY: refusing to drop_all() on non-test database '{_db_name}'. "
+            f"Expected a database name containing 'test'."
+        )
     if database.engine:
         Base.metadata.drop_all(bind=database.engine)
         database.engine.dispose()

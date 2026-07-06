@@ -1,7 +1,9 @@
 import ipaddress
 import json
 import logging
+import random
 import socket
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -13,12 +15,12 @@ from sqlalchemy.orm import Session, defer
 from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 import database
-from database import get_db
+from database import get_db, get_raw_connection, warn_fragmented_raw
 from models import User, Port, Request as RequestModel
 from schemas import PortCreate, PortUpdate, PortInfo, PortHistory, RequestInfo
 from auth import require_approved, _verify_token_str, security_optional
 from fastapi.security import HTTPAuthorizationCredentials
-from config import ALLOW_INTERNAL_TARGETS
+from config import ALLOW_INTERNAL_TARGETS, CLEANUP_BATCH_SIZE, CLEANUP_LOG_INTERVAL
 from proxy_app import refresh_port_cache
 
 logger = logging.getLogger("llm_proxy.ports")
@@ -107,19 +109,122 @@ def _validate_target_url(url: str) -> None:
         )
 
 
+# ── Background history-cleanup infrastructure ──────────────────────
+# Similar to admin_router's port cleanup, but for clear_port_history
+# which only deletes requests (NOT the port itself).
+# Thread dedup prevents duplicate cleanups if the user clicks rapidly.
+_history_cleanup_threads: dict[int, threading.Thread] = {}
+_history_cleanup_lock = threading.Lock()
+# Cap concurrent cleanup threads — shared with admin_router's cleanup
+# to prevent exhausting MySQL connections when many cleanups fire at once.
+_HISTORY_CLEANUP_SEMAPHORE = threading.BoundedSemaphore(3)
+
+
+def _do_history_cleanup(port_id: int, port_number: int):
+    """Batch-delete all requests for *port_id* on a background daemon thread.
+
+    Unlike _do_port_cleanup in admin_router, this does NOT delete the port
+    row — it only removes the request history.  If the process dies
+    mid-cleanup, the remaining requests stay (user can retry).
+    """
+    logger.info(
+        "[HistoryCleanup] Starting background history cleanup for port %s (id=%s)",
+        port_number, port_id,
+    )
+    _HISTORY_CLEANUP_SEMAPHORE.acquire()
+    try:
+        raw_conn = get_raw_connection()
+        try:
+            total_deleted = 0
+            batch_num = 0
+            with raw_conn.cursor() as cur:
+                while True:
+                    cur.execute(
+                        "DELETE FROM requests WHERE port_id = %s LIMIT %s",
+                        (port_id, CLEANUP_BATCH_SIZE),
+                    )
+                    n = cur.rowcount
+                    if n == 0:
+                        break
+                    total_deleted += n
+                    batch_num += 1
+                    raw_conn.commit()
+                    if batch_num % CLEANUP_LOG_INTERVAL == 0:
+                        logger.info(
+                            "[HistoryCleanup] Port %s: %s request(s) "
+                            "removed so far...",
+                            port_number, total_deleted,
+                        )
+                        time.sleep(0.1)
+            # Check fragmentation after large deletions
+            warn_fragmented_raw(raw_conn)
+            logger.info(
+                "[HistoryCleanup] Port %s: all %s request(s) deleted.",
+                port_number, total_deleted,
+            )
+        except Exception:
+            logger.exception(
+                "[HistoryCleanup] Port %s (id=%s) history cleanup failed — "
+                "remaining records can be cleared by retrying",
+                port_number, port_id,
+            )
+        finally:
+            try:
+                raw_conn.close()
+            except Exception:
+                logger.warning(
+                    "[HistoryCleanup] Port %s: failed to close raw connection "
+                    "(already closed or broken)", port_number,
+                )
+    finally:
+        _HISTORY_CLEANUP_SEMAPHORE.release()
+        with _history_cleanup_lock:
+            _history_cleanup_threads.pop(port_id, None)
+            logger.debug(
+                "[HistoryCleanup] Port %s: unregistered from cleanup tracker",
+                port_number,
+            )
+
+
 @router.post("", response_model=PortInfo)
 def create_port(
     data: PortCreate,
     current_user: User = Depends(require_approved),
     db: Session = Depends(get_db),
 ):
-    """Create a new proxy for the current user.
+    """Create a new proxy for the current user (or a specified user if admin).
 
     In the shared-proxy architecture, this only creates a DB record.
     A random 5-digit proxy number is assigned (10000–99999).
     Retries up to 10 times on IntegrityError / collision.
+
+    Admin users may specify ``user_id`` to create a proxy on behalf of
+    another approved user.  Non-admin users cannot specify ``user_id``.
     """
-    import random
+
+    # ── Determine owner ──
+    if data.user_id is not None:
+        if current_user.role != "admin":
+            raise HTTPException(
+                status_code=403,
+                detail="Only administrators can assign proxies to other users"
+            )
+        owner = db.query(User).filter(User.id == data.user_id).first()
+        if not owner:
+            raise HTTPException(
+                status_code=404,
+                detail=f"User with id {data.user_id} not found"
+            )
+        if not owner.is_approved and owner.role != "admin":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot create proxy for unapproved user '{owner.username}'"
+            )
+        owner_id = owner.id
+        owner_username = owner.username
+    else:
+        owner_id = current_user.id
+        owner_username = current_user.username
 
     # In SQLAlchemy 2.0, session.commit() may release the connection back to
     # the pool, so the finally-block RELEASE_LOCK could land on a different
@@ -137,17 +242,21 @@ def create_port(
         )
 
     try:
-        # Get all currently-active port numbers to avoid assignment collisions
-        active_numbers = set(
-            p[0] for p in db.query(Port.port_number)
-            .filter(Port.is_active.is_(True), Port.deleted_at.is_(None)).all()
-        )
-
-        # Random 5-digit number, retry with new random if collision
+        # Query-based collision check — try random candidates, verify with DB.
+        # Avoids loading all active port numbers into memory (O(n) problem
+        # when there are tens of thousands of ports).
         assigned_port = None
-        for _ in range(10):
+        for _ in range(50):  # generous retry budget — 50 random tries is plenty
             candidate = random.randint(10000, 99999)
-            if candidate not in active_numbers:
+            conflict = db.execute(
+                text(
+                    "SELECT 1 FROM ports "
+                    "WHERE port_number = :pn AND is_active = 1 AND deleted_at IS NULL "
+                    "LIMIT 1"
+                ),
+                {"pn": candidate},
+            ).first()
+            if conflict is None:
                 assigned_port = candidate
                 break
 
@@ -166,7 +275,7 @@ def create_port(
         # Create port record in DB (active immediately — shared proxy handles traffic)
         port = Port(
             port_number=assigned_port,
-            user_id=current_user.id,
+            user_id=owner_id,
             target_url=target_url,
             description=data.description,
             prefer_http2=data.prefer_http2,
@@ -193,6 +302,7 @@ def create_port(
     return PortInfo(
         id=port.id,
         port_number=port.port_number,
+        user_id=port.user_id,
         target_url=port.target_url,
         description=port.description or "",
         is_active=port.is_active,
@@ -200,7 +310,7 @@ def create_port(
         has_api_key=port.api_key is not None,
         created_at=port.created_at,
         request_count=0,
-        username=current_user.username,
+        username=owner_username,
     )
 
 
@@ -208,15 +318,22 @@ def create_port(
 def list_ports(
     current_user: User = Depends(require_approved),
     db: Session = Depends(get_db),
+    skip: int = 0,
+    limit: int = 5000,
 ):
-    """List ports — admin sees all users' ports, regular users see their own."""
+    """List ports — admin sees all users' ports, regular users see their own.
+
+    Pagination via ``skip`` / ``limit`` query params.  Defaults to a large
+    window so existing callers work unchanged; set lower limits for paginated UIs.
+    """
+    limit = min(max(limit, 1), 5000)
     if current_user.role == "admin":
-        ports = db.query(Port).filter(Port.deleted_at.is_(None)).order_by(Port.created_at.desc()).all()
+        ports = db.query(Port).filter(Port.deleted_at.is_(None)).order_by(Port.created_at.desc()).offset(skip).limit(limit).all()
     else:
         ports = db.query(Port).filter(
             Port.user_id == current_user.id,
             Port.deleted_at.is_(None),
-        ).order_by(Port.created_at.desc()).all()
+        ).order_by(Port.created_at.desc()).offset(skip).limit(limit).all()
 
     if not ports:
         return []
@@ -242,6 +359,7 @@ def list_ports(
         result.append(PortInfo(
             id=port.id,
             port_number=port.port_number,
+            user_id=port.user_id,
             target_url=port.target_url,
             description=port.description or "",
             is_active=port.is_active,
@@ -313,6 +431,7 @@ def get_port_history(
     _port_dict = {
         "id": port.id,
         "port_number": port.port_number,
+        "user_id": port.user_id,
         "target_url": port.target_url,
         "description": port.description or "",
         "is_active": port.is_active,
@@ -482,10 +601,13 @@ def update_port(
     current_user: User = Depends(require_approved),
     db: Session = Depends(get_db),
 ):
-    """Edit a port's description, target URL, and/or port number.
+    """Edit a port's description, target URL, port number, and/or owner (admin only).
 
     In the shared-proxy architecture, changes take effect immediately
     (no server restart needed). Target URL changes apply on the next request.
+
+    Admin users may reassign the port to a different approved user via
+    ``user_id``.  Non-admin users cannot change ownership.
     """
     port = db.query(Port).filter(Port.id == port_id, Port.deleted_at.is_(None)).first()
     if not port:
@@ -494,8 +616,28 @@ def update_port(
     if current_user.role != "admin" and port.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
 
+    # ── Owner reassignment (admin-only) ──
+    new_user_id = data.user_id
+    if new_user_id is not None and new_user_id != port.user_id:
+        if current_user.role != "admin":
+            raise HTTPException(
+                status_code=403,
+                detail="Only administrators can reassign ports to other users"
+            )
+        new_owner = db.query(User).filter(User.id == new_user_id).first()
+        if not new_owner:
+            raise HTTPException(
+                status_code=404,
+                detail=f"User with id {new_user_id} not found"
+            )
+        if not new_owner.is_approved and new_owner.role != "admin":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot reassign port to unapproved user '{new_owner.username}'"
+            )
+
     new_port_number = data.port_number
-    _port_lock_held = False
+    _lock_raw_conn = None
 
     # ── Validate port_number change ──
     if new_port_number is not None and new_port_number != port.port_number:
@@ -504,29 +646,41 @@ def update_port(
                 status_code=400,
                 detail="Port number must be a positive integer"
             )
-        # Acquire MySQL lock to prevent concurrent update races
-        lock_acquired = db.execute(
+        if not (10000 <= new_port_number <= 99999):
+            raise HTTPException(
+                status_code=400,
+                detail="Port number must be a 5-digit integer between 10000 and 99999"
+            )
+        # Acquire MySQL lock on a dedicated raw connection (consistent with create_port)
+        # so GET_LOCK and RELEASE_LOCK are guaranteed on the same MySQL connection
+        # even if SQLAlchemy session.commit() recycles the session's connection.
+        _lock_raw_conn = db.bind.connect()
+        lock_acquired = _lock_raw_conn.execute(
             text("SELECT GET_LOCK('llm_proxy_port_alloc', 10)")
         ).scalar()
         if lock_acquired != 1:
+            _lock_raw_conn.close()
+            _lock_raw_conn = None
             raise HTTPException(
                 status_code=503,
                 detail="Server is busy processing port allocation, please try again"
             )
-        _port_lock_held = True
-
-        # Check DB for conflicts
-        existing = db.query(Port).filter(
-            Port.port_number == new_port_number,
-            Port.id != port.id
-        ).first()
-        if existing:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Port {new_port_number} is already assigned to another proxy."
-            )
 
     try:
+        # ── Check DB for conflicts (inside try so lock is released on error) ──
+        if new_port_number is not None and new_port_number != port.port_number:
+            existing = db.query(Port).filter(
+                Port.port_number == new_port_number,
+                Port.id != port.id,
+                Port.is_active.is_(True),
+                Port.deleted_at.is_(None),
+            ).first()
+            if existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Port {new_port_number} is already assigned to another proxy."
+                )
+
         # ── Apply changes ──
         if data.target_url is not None:
             port.target_url = data.target_url.rstrip("/")
@@ -545,6 +699,10 @@ def update_port(
         if new_port_number is not None and new_port_number != port.port_number:
             port.port_number = new_port_number
 
+        # ── Reassign owner (admin-only, validated above) ──
+        if new_user_id is not None and new_user_id != port.user_id:
+            port.user_id = new_user_id
+
         # ── Commit changes ──
         try:
             db.commit()
@@ -557,10 +715,20 @@ def update_port(
 
         refresh_port_cache(db)
     finally:
-        if _port_lock_held:
-            db.execute(text("SELECT RELEASE_LOCK('llm_proxy_port_alloc')"))
+        if _lock_raw_conn is not None:
+            try:
+                _lock_raw_conn.execute(text("SELECT RELEASE_LOCK('llm_proxy_port_alloc')"))
+            except Exception:
+                logger.warning("Failed to release MySQL named lock for port update")
+            finally:
+                try:
+                    _lock_raw_conn.close()
+                except Exception:
+                    pass
 
-    # Get request count
+    # Get request count and owner username (not necessarily current_user for admin)
+    owner = db.query(User).filter(User.id == port.user_id).first()
+    owner_username = owner.username if owner else ""
     request_count = db.query(func.count(RequestModel.id)).filter(
         RequestModel.port_id == port.id
     ).scalar() or 0
@@ -568,6 +736,7 @@ def update_port(
     return PortInfo(
         id=port.id,
         port_number=port.port_number,
+        user_id=port.user_id,
         target_url=port.target_url,
         description=port.description or "",
         is_active=port.is_active,
@@ -575,7 +744,7 @@ def update_port(
         has_api_key=port.api_key is not None,
         created_at=port.created_at,
         request_count=request_count,
-        username=current_user.username,
+        username=owner_username,
     )
 
 
@@ -585,7 +754,12 @@ def clear_port_history(
     current_user: User = Depends(require_approved),
     db: Session = Depends(get_db),
 ):
-    """Clear all request history for a port, but keep the port active."""
+    """Clear all request history for a port, but keep the port active.
+
+    The actual batch-DELETE runs on a background daemon thread so large
+    histories never block the FastAPI event loop.  If the process dies
+    mid-cleanup, the remaining history stays (user can retry).
+    """
     port = db.query(Port).filter(Port.id == port_id, Port.deleted_at.is_(None)).first()
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
@@ -593,12 +767,55 @@ def clear_port_history(
     if current_user.role != "admin" and port.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    deleted_count = db.query(RequestModel).filter(
-        RequestModel.port_id == port_id
-    ).delete()
-    db.commit()
+    # Quick COUNT(*) — uses port_id index
+    count = db.execute(
+        text("SELECT COUNT(*) FROM requests WHERE port_id = :pid"),
+        {"pid": port_id},
+    ).scalar()
 
-    return {"message": f"Cleared {deleted_count} request records from port {port.port_number}."}
+    if count == 0:
+        return {"message": f"No history to clear for port {port.port_number}."}
+
+    # Dedup: if a cleanup thread is already running for this port, reject.
+    with _history_cleanup_lock:
+        if port_id in _history_cleanup_threads:
+            logger.warning(
+                "History cleanup already in progress for port %s — skipping duplicate request",
+                port.port_number,
+            )
+            return {
+                "message":
+                    f"History cleanup for port {port.port_number} "
+                    f"is already running in background."
+            }
+
+    logger.info(
+        "Clearing history for port %s: %s total request(s) — "
+        "cleanup running in background.",
+        port.port_number, count,
+    )
+
+    # Spawn background daemon thread — returns immediately
+    t = threading.Thread(
+        target=_do_history_cleanup,
+        args=(port.id, port.port_number),
+        daemon=True,
+        name=f"history-cleanup-port-{port.port_number}",
+    )
+    with _history_cleanup_lock:
+        _history_cleanup_threads[port_id] = t
+    t.start()
+
+    logger.info(
+        "[HistoryCleanup] Spawned cleanup thread for port %s (%s records)",
+        port.port_number, count,
+    )
+
+    return {
+        "message":
+            f"Clearing {count} request record(s) from port "
+            f"{port.port_number} in background."
+    }
 
 
 @router.delete("/{port_id}/history/{request_id}", response_model=dict)

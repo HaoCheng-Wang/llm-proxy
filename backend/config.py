@@ -9,7 +9,11 @@ _env_paths = [
 ]
 for _p in _env_paths:
     if _p.exists():
-        load_dotenv(_p, override=True)
+        # override=False: 环境变量已设置的值优先于 .env 文件。
+        # 这确保测试（通过 os.environ 设置 DATABASE_NAME=llm_proxy_test）、
+        # Docker（通过 docker-compose environment 注入）等场景下，
+        # .env 文件不会覆盖运行时注入的配置。
+        load_dotenv(_p, override=False)
         break
 
 # ---------------------------------------------------------------------------
@@ -107,3 +111,21 @@ _DB_PASS_FOR_AUTO = _DB_PASS
 _DB_HOST_FOR_AUTO = _DB_HOST
 _DB_PORT_FOR_AUTO = int(_DB_PORT)
 _DB_NAME_FOR_AUTO = _DB_NAME
+
+# ── 后台清理批量参数 ──────────────────────────────
+# 每次 DELETE 的行数上限，避免单条语句长时间锁表
+CLEANUP_BATCH_SIZE = int(os.getenv("CLEANUP_BATCH_SIZE", "1000"))
+# 每 N 批输出一次进度日志
+CLEANUP_LOG_INTERVAL = int(os.getenv("CLEANUP_LOG_INTERVAL", "10"))
+
+# ── 安全限制 ──────────────────────────────────────
+# SSE 原始文本最大处理大小（字节）。超过此大小的 SSE 流将不会被重建为 JSON，
+# 仅保存截断后的原始文本，防止超长流导致 Python 进程 OOM。
+# 默认 50 MB — 对于典型 LLM 对话足够，极端情况下的超长流会被截断。
+SSE_RECONSTRUCT_MAX_BYTES = int(os.getenv("SSE_RECONSTRUCT_MAX_BYTES", str(50 * 1024 * 1024)))
+
+# DB 保存时单字段最大大小（字节）。超过此大小的 request_body/response_body
+# 在写入数据库前会被截断并追加警告标记，防止单条 LONGTEXT 记录撑爆 MySQL
+# 或导致 _sanitize_text() 在超大文本上消耗过多 CPU。
+# 默认 100 MB，与 MySQL max_allowed_packet 64MB 留有安全余量。
+DB_SAVE_FIELD_MAX_BYTES = int(os.getenv("DB_SAVE_FIELD_MAX_BYTES", str(100 * 1024 * 1024)))

@@ -140,6 +140,20 @@
             <input v-model="createForm.description" class="form-input"
                    placeholder="用于区分不同用途的代理" />
           </div>
+          <div v-if="auth.isAdmin" class="form-group">
+            <label>👤 所属用户</label>
+            <select v-model="createForm.user_id" class="form-input"
+                    :disabled="usersLoading">
+              <option :value="null">— 选择用户（默认：自己）—</option>
+              <option v-for="u in userList" :key="u.id" :value="u.id"
+                      :disabled="!u.is_approved">
+                {{ u.username }} ({{ u.role === 'admin' ? '管理员' : u.is_approved ? '已审批' : '待审批' }})
+              </option>
+            </select>
+            <p style="font-size:12px;color:var(--text-muted);margin-top:4px">
+              管理员可为其他用户创建代理。默认创建给自己。只能为已审批用户创建。
+            </p>
+          </div>
           <div class="form-group">
             <label>� 自定义 API Key（可选）</label>
             <input v-model="createForm.api_key" class="form-input" type="password"
@@ -184,6 +198,13 @@
         <h3>编辑代理配置</h3>
         <form @submit.prevent="handleEdit">
           <div class="form-group">
+            <label>编号（5位数字，10000–99999）</label>
+            <input v-model.number="editForm.port_number" class="form-input" type="number"
+                   min="10000" max="99999"
+                   placeholder="修改代理编号（不修改则保持原编号）" />
+            <p style="font-size:12px;color:var(--text-muted);margin-top:4px">修改编号后，需使用新编号访问代理。请确保新编号未被其他代理占用。</p>
+          </div>
+          <div class="form-group">
             <label>目标API地址</label>
             <input v-model="editForm.target_url" class="form-input"
                    placeholder="例如: https://api.openai.com"
@@ -210,6 +231,20 @@
                    :placeholder="editForm.has_api_key ? '如需修改请输入新的 API Key（留空则保持不变）' : '留空则透传智能体原始 Key；填写则替换'" />
             <p style="font-size:12px;color:var(--text-muted);margin-top:4px">
               {{ editForm.has_api_key ? '已配置自定义 Key。留空保存则保持不变；勾选上方选项可清除。' : '留空则透传智能体原始 Key；填写则替换智能体发送的认证头' }}
+            </p>
+          </div>
+          <div v-if="auth.isAdmin" class="form-group">
+            <label>👤 所属用户</label>
+            <select v-model="editForm.user_id" class="form-input"
+                    :disabled="usersLoading">
+              <option :value="null">— 不修改（保持当前用户）—</option>
+              <option v-for="u in userList" :key="u.id" :value="u.id"
+                      :disabled="!u.is_approved">
+                {{ u.username }} ({{ u.role === 'admin' ? '管理员' : u.is_approved ? '已审批' : '待审批' }})
+              </option>
+            </select>
+            <p style="font-size:12px;color:var(--text-muted);margin-top:4px">
+              管理员可将代理转移给其他已审批用户。默认不修改。
             </p>
           </div>
           <div class="form-group">
@@ -246,7 +281,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, inject } from 'vue'
+import { ref, watch, onMounted, inject } from 'vue'
 import { useAuthStore } from '../stores/auth'
 import api from '../api'
 
@@ -256,9 +291,11 @@ const displayIp = ref('your-server-ip')
 const apiPort = ref(3998)
 const ports = ref([])
 const showCreateModal = ref(false)
-const createForm = ref({ target_url: '', description: '', prefer_http2: false, api_key: '' })
+const createForm = ref({ target_url: '', description: '', prefer_http2: false, api_key: '', user_id: null })
 const createError = ref('')
 const creating = ref(false)
+const userList = ref([])
+const usersLoading = ref(false)
 
 const showEditModal = ref(false)
 const editForm = ref({ id: null, target_url: '', description: '', prefer_http2: null, api_key: '', has_api_key: false, clear_api_key: false })
@@ -277,9 +314,19 @@ async function handleCreate() {
   createError.value = ''
   creating.value = true
   try {
-    await api.createPort(createForm.value)
+    const payload = {
+      target_url: createForm.value.target_url,
+      description: createForm.value.description,
+      prefer_http2: createForm.value.prefer_http2,
+      api_key: createForm.value.api_key || undefined,
+    }
+    // Only include user_id when admin explicitly selects a different user
+    if (auth.isAdmin && createForm.value.user_id !== null && createForm.value.user_id !== undefined) {
+      payload.user_id = createForm.value.user_id
+    }
+    await api.createPort(payload)
     showCreateModal.value = false
-    createForm.value = { target_url: '', description: '', prefer_http2: false, api_key: '' }
+    createForm.value = { target_url: '', description: '', prefer_http2: false, api_key: '', user_id: null }
     showToast('代理创建成功！', 'success')
     await loadPorts()
   } catch (e) {
@@ -325,6 +372,10 @@ function openEdit(port) {
   editError.value = ''
   editForm.value = {
     id: port.id,
+    port_number: port.port_number,
+    _original_port_number: port.port_number,
+    user_id: null,  // admin-only: null = don't change
+    _original_user_id: port.user_id || null,
     target_url: port.target_url,
     description: port.description || '',
     prefer_http2: port.prefer_http2,  // null=not set yet, true/false=user picked
@@ -348,6 +399,22 @@ async function handleEdit() {
       description: editForm.value.description,
       prefer_http2: editForm.value.prefer_http2,
     }
+    // port_number: only send if user changed it to a valid 5-digit number
+    if (editForm.value.port_number !== editForm.value._original_port_number) {
+      const pn = editForm.value.port_number
+      if (pn === '' || pn === null || pn === undefined || isNaN(Number(pn))) {
+        // User cleared the field — treat as "no change"
+      } else {
+        const numPn = Number(pn)
+        if (Number.isInteger(numPn) && numPn >= 10000 && numPn <= 99999) {
+          payload.port_number = numPn
+        } else {
+          editError.value = '编号必须是 10000-99999 范围的整数'
+          editing.value = false
+          return
+        }
+      }
+    }
     // api_key: only send when user explicitly types a new value or checks "clear"
     if (editForm.value.clear_api_key) {
       payload.api_key = ''  // clear (set to NULL)
@@ -355,6 +422,12 @@ async function handleEdit() {
       payload.api_key = editForm.value.api_key  // override with new value
     }
     // else: don't include api_key → backend treats as None → don't change
+    // user_id: only send when admin explicitly selects a different user
+    if (auth.isAdmin && editForm.value.user_id !== null && editForm.value.user_id !== undefined) {
+      if (editForm.value.user_id !== editForm.value._original_user_id) {
+        payload.user_id = editForm.value.user_id
+      }
+    }
     await api.updatePort(editForm.value.id, payload)
     showEditModal.value = false
     showToast('代理配置已更新', 'success')
@@ -375,6 +448,27 @@ async function loadConfig() {
     // keep default
   }
 }
+
+async function loadUsersForCreate() {
+  // Only admin needs the user list for the create modal
+  if (!auth.isAdmin) return
+  usersLoading.value = true
+  try {
+    const res = await api.listUsers()
+    userList.value = res.users || []
+  } catch (e) {
+    // silently ignore — admin can still create for themselves
+  } finally {
+    usersLoading.value = false
+  }
+}
+
+// Watch modals: load user list when admin opens create or edit modal
+watch([showCreateModal, showEditModal], ([createVal, editVal]) => {
+  if ((createVal || editVal) && auth.isAdmin) {
+    loadUsersForCreate()
+  }
+})
 
 function formatTime(t) {
   if (!t) return '-'

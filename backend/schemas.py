@@ -43,6 +43,10 @@ class PortCreate(BaseModel):
     description: str = Field(default="", max_length=200)
     prefer_http2: Optional[bool] = None  # None=HTTP/1.1, set later on edit
     api_key: Optional[str] = Field(None, max_length=500)  # None=pass-through, set=override
+    # Admin-only: specify which user this port belongs to.
+    # When omitted, the port is created for the current user.
+    # When set by a non-admin, the request is rejected.
+    user_id: Optional[int] = None
 
 
 class PortUpdate(BaseModel):
@@ -50,17 +54,22 @@ class PortUpdate(BaseModel):
 
     All fields optional — only provided fields are updated.
     Changing port_number requires the new port to be free.
+    Admin-only: user_id reassigns the port to a different approved user.
     """
     port_number: Optional[int] = None
     target_url: Optional[str] = Field(None, min_length=5, max_length=500)
     description: Optional[str] = Field(None, max_length=200)
     prefer_http2: Optional[bool] = None  # None=don't change, False/True=set
     api_key: Optional[str] = Field(None, max_length=500)  # None=don't change, ""=clear, set=override
+    # Admin-only: reassign port owner.  None=don't change.
+    # Non-admin users cannot change the owner of any port.
+    user_id: Optional[int] = None
 
 
 class PortInfo(BaseModel):
     id: int
     port_number: int
+    user_id: int = 0  # owner's user ID (visible to admin; always present)
     target_url: str
     description: str
     is_active: bool
@@ -107,10 +116,6 @@ class UserApproval(BaseModel):
 class AdminUserList(BaseModel):
     users: List[UserInfo]
 
-
-class DeletedPortInfo(PortInfo):
-    """Extended port info for admin's deleted-ports view."""
-    creator_username: str = ""
 
 
 class DeletedPortList(BaseModel):

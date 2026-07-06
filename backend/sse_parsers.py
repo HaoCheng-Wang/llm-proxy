@@ -998,7 +998,12 @@ def reconstruct_sse_to_json(raw_sse: str) -> str | None:
                     fmt,
                 )
 
-            # Always try generic as ultimate fallback
+            # Always try generic as ultimate fallback.
+            # GenericSSEParser.parse() returns the raw SSE text when even
+            # best-effort extraction fails.  The caller (_save_stream_record
+            # in shared_proxy.py) detects this via the reconstruction_error
+            # flag and marks the record accordingly — the raw SSE is still
+            # saved in response_body_raw for later inspection.
             return GenericSSEParser.parse(raw_sse)
         except (json.JSONDecodeError, Exception) as e:
             logger.debug(

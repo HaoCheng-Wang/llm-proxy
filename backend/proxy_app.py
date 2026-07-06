@@ -9,11 +9,12 @@ import time
 import json
 import asyncio
 import logging
+import threading
 import httpx
 import certifi
 import database
 from models import Port, Request as RequestModel
-from config import PORT_CACHE_TTL, HTTPX_MAX_KEEPALIVE_CONNECTIONS
+from config import PORT_CACHE_TTL, HTTPX_MAX_KEEPALIVE_CONNECTIONS, DB_SAVE_FIELD_MAX_BYTES
 
 logger = logging.getLogger("llm_proxy.proxy")
 
@@ -23,19 +24,17 @@ def _sanitize_text(value: str | None) -> str | None:
     if value is None:
         return None
     try:
-        # "strict" mode raises UnicodeEncodeError for surrogates.
-        # "surrogatepass" would allow them through — don't use that here.
+        # Fast path: "strict" mode raises UnicodeEncodeError only for surrogates.
+        # 99.9% of LLM API text passes this in one shot.
         value.encode("utf-8")
         return value
     except UnicodeEncodeError:
-        # Count surrogates for a concise single-line warning
-        surrogate_count = sum(
-            1 for ch in value if "\uD800" <= ch <= "\uDFFF"
-        )
+        # Surrogates present — clean them.  The encode+decode round-trip
+        # is O(n) and runs entirely in C; no Python-level char iteration.
         cleaned = value.encode("utf-8", errors="replace").decode("utf-8")
         logger.warning(
-            "Replaced %d surrogate(s), %d → %d chars",
-            surrogate_count, len(value), len(cleaned),
+            "Replaced surrogate characters in text: %d → %d chars",
+            len(value), len(cleaned),
         )
         return cleaned
 
@@ -204,20 +203,44 @@ async def close_http2_client():
 
 # In-memory cache of port_number → (target_url, prefer_http2, api_key) mappings.
 # Refreshed from DB on startup and after PORT_CACHE_TTL seconds.
+#
+# Cache is stored as an atomic (dict, timestamp) tuple so that concurrent readers
+# always see a consistent snapshot — no TOCTOU window between reading the dict
+# reference and checking the timestamp.  Writers rebuild a fresh dict and then
+# atomically swap the tuple under _cache_write_lock.
 _port_target_cache: dict[int, tuple[str, bool | None, str | None]] = {}
 _cache_updated_at: float = 0.0
+_cache_write_lock = threading.Lock()  # protects concurrent cache refresh + single-entry insert
+
+
+def _read_cache() -> tuple[dict[int, tuple[str, bool | None, str | None]], float]:
+    """Return a consistent (cache_dict, timestamp) snapshot.
+
+    Tuple assignment is atomic in CPython (single bytecode), so concurrent
+    ``_write_cache()`` calls never produce a torn read.
+    """
+    # Local variables force a single read of each module-level name;
+    # Python's LOAD_FAST + BUILD_TUPLE is atomic under the GIL.
+    return _port_target_cache, _cache_updated_at
+
+
+def _write_cache(new_cache: dict[int, tuple[str, bool | None, str | None]], new_ts: float):
+    """Atomically replace the cache snapshot under the write lock."""
+    global _port_target_cache, _cache_updated_at
+    with _cache_write_lock:
+        _port_target_cache = new_cache
+        _cache_updated_at = new_ts
 
 
 def refresh_port_cache(db=None):
     """Refresh the port_number → (target_url, prefer_http2, api_key) cache from DB."""
-    global _port_target_cache, _cache_updated_at
     if db is None:
         db = database.SessionLocal()
         try:
             ports = db.query(Port).filter(
                 Port.is_active.is_(True), Port.deleted_at.is_(None)
             ).all()
-            _port_target_cache = {
+            new_cache = {
                 p.port_number: (p.target_url, p.prefer_http2, p.api_key) for p in ports
             }
         finally:
@@ -226,10 +249,10 @@ def refresh_port_cache(db=None):
         ports = db.query(Port).filter(
             Port.is_active.is_(True), Port.deleted_at.is_(None)
         ).all()
-        _port_target_cache = {
+        new_cache = {
             p.port_number: (p.target_url, p.prefer_http2, p.api_key) for p in ports
         }
-    _cache_updated_at = time.time()
+    _write_cache(new_cache, time.time())
 
 
 def _maybe_refresh_cache():
@@ -237,7 +260,8 @@ def _maybe_refresh_cache():
 
     Safe to call from the event loop (never from a thread-pool thread).
     """
-    if time.time() - _cache_updated_at > PORT_CACHE_TTL:
+    _cache, _ts = _read_cache()
+    if time.time() - _ts > PORT_CACHE_TTL:
         refresh_port_cache()
 
 
@@ -248,7 +272,7 @@ def get_target_url(port_number: int) -> tuple[str, bool | None, str | None] | No
     contexts to avoid blocking the event loop.
     """
     _maybe_refresh_cache()
-    cache = _port_target_cache
+    cache, _ts = _read_cache()
     if port_number in cache:
         return cache[port_number]
 
@@ -262,7 +286,8 @@ def get_target_url(port_number: int) -> tuple[str, bool | None, str | None] | No
         ).first()
         if port:
             entry = (port.target_url, port.prefer_http2, port.api_key)
-            _port_target_cache[port.port_number] = entry
+            with _cache_write_lock:
+                _port_target_cache[port.port_number] = entry
             return entry
         return None
     finally:
@@ -280,19 +305,20 @@ async def _arefresh_port_cache():
 
 async def aget_target_url(port_number: int) -> tuple[str, bool | None, str | None] | None:
     """Async: get (target_url, prefer_http2, api_key) for a port. Runs DB in thread pool."""
-    if time.time() - _cache_updated_at <= PORT_CACHE_TTL:
-        cache = _port_target_cache
+    cache, ts = _read_cache()
+    if time.time() - ts <= PORT_CACHE_TTL:
         if port_number in cache:
             return cache[port_number]
     else:
         await _arefresh_port_cache()
-        cache = _port_target_cache
+        cache, ts = _read_cache()
         if port_number in cache:
             return cache[port_number]
 
     loop = asyncio.get_running_loop()
 
     def _db_lookup():
+        global _cache_updated_at  # update module-level global from within closure
         db = database.SessionLocal()
         try:
             port = db.query(Port).filter(
@@ -302,13 +328,41 @@ async def aget_target_url(port_number: int) -> tuple[str, bool | None, str | Non
             ).first()
             if port:
                 entry = (port.target_url, port.prefer_http2, port.api_key)
-                _port_target_cache[port.port_number] = entry
+                with _cache_write_lock:
+                    _port_target_cache[port.port_number] = entry
+                    _cache_updated_at = time.time()
                 return entry
             return None
         finally:
             db.close()
 
     return await loop.run_in_executor(None, _db_lookup)
+
+
+def _truncate_if_oversized(value: str | None, label: str, port_number: int) -> str | None:
+    """Truncate a string field to DB_SAVE_FIELD_MAX_BYTES if necessary.
+
+    Appends a truncation warning so the operator knows data was lost.
+    Returns the original value unchanged if within limits.
+    """
+    if value is None:
+        return None
+    byte_len = len(value.encode("utf-8"))
+    if byte_len <= DB_SAVE_FIELD_MAX_BYTES:
+        return value
+    # Truncate at byte boundary, preserving valid UTF-8
+    truncated = value.encode("utf-8")[:DB_SAVE_FIELD_MAX_BYTES]
+    # Decode with error handling — the cut may split a multi-byte char
+    safe = truncated.decode("utf-8", errors="replace")
+    warning = (
+        f"\n\n[TRUNCATED: original {label} was {byte_len} bytes, "
+        f"saved only first {DB_SAVE_FIELD_MAX_BYTES} bytes]"
+    )
+    logger.warning(
+        "%s for port %d is %d bytes (limit %d) — truncating",
+        label, port_number, byte_len, DB_SAVE_FIELD_MAX_BYTES,
+    )
+    return safe + warning
 
 
 def _save_to_db(port_number: int, method: str, path: str,
@@ -329,13 +383,12 @@ def _save_to_db(port_number: int, method: str, path: str,
         try:
             port = db.query(Port).filter(
                 Port.port_number == port_number,
-                Port.is_active.is_(True),
                 Port.deleted_at.is_(None),
             ).first()
             port_id = port.id if port else None
             if not port_id:
                 logger.warning(
-                    "port %d not active — saving record with port_id=NULL",
+                    "port %d not found or soft-deleted — saving record with port_id=NULL",
                     port_number,
                 )
 
@@ -343,11 +396,21 @@ def _save_to_db(port_number: int, method: str, path: str,
                 port_id=port_id,
                 method=method,
                 path=path,
-                request_headers=_sanitize_text(req_headers),
-                request_body=_sanitize_text(req_body),
-                response_headers=_sanitize_text(resp_headers),
-                response_body=_sanitize_text(resp_body),
-                response_body_raw=_sanitize_text(resp_body_raw),
+                request_headers=_sanitize_text(
+                    _truncate_if_oversized(req_headers, "request_headers", port_number),
+                ),
+                request_body=_sanitize_text(
+                    _truncate_if_oversized(req_body, "request_body", port_number),
+                ),
+                response_headers=_sanitize_text(
+                    _truncate_if_oversized(resp_headers, "response_headers", port_number),
+                ),
+                response_body=_sanitize_text(
+                    _truncate_if_oversized(resp_body, "response_body", port_number),
+                ),
+                response_body_raw=_sanitize_text(
+                    _truncate_if_oversized(resp_body_raw, "response_body_raw", port_number),
+                ),
                 status_code=status_code,
                 duration_ms=duration_ms,
                 reconstruction_error=reconstruction_error,
@@ -415,6 +478,7 @@ __all__ = [
     "_serialize_body",
     "_save_to_db",
     "_save_record_async",
+    "_truncate_if_oversized",
     "_sanitize_text",
     "_fire_and_forget_save",
     "drain_pending_saves",

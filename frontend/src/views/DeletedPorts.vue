@@ -71,13 +71,18 @@ async function restorePort(port) {
 }
 
 async function permanentDelete(port) {
-  if (!confirm(`⚠️ 确定彻底删除代理 ${port.port_number} 吗？\n\n所有历史记录将被永久清除，不可恢复！`)) return
+  if (!confirm(`⚠️ 确定彻底删除代理 ${port.port_number} 吗？\n\n所有历史记录将在后台异步清除，不可恢复！`)) return
+  // Optimistic: remove from list immediately
+  const idx = deletedPorts.value.findIndex(p => p.id === port.id)
+  if (idx !== -1) deletedPorts.value.splice(idx, 1)
+  showToast(`代理 ${port.port_number} 正在后台删除...`, 'info')
   try {
     await api.permanentDeletePort(port.id)
-    showToast(`代理 ${port.port_number} 已彻底删除`, 'success')
-    await loadDeletedPorts()
+    showToast(`代理 ${port.port_number} 已提交删除`, 'success')
   } catch (e) {
     showToast(e.response?.data?.detail || '删除失败', 'error')
+    // Reload to restore the entry on failure
+    await loadDeletedPorts()
   }
 }
 

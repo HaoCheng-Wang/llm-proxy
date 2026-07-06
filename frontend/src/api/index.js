@@ -94,7 +94,14 @@ export default {
     if (buffer.trim()) {
       try {
         const obj = JSON.parse(buffer)
-        if (port !== null) { requests.push(obj); if (onRecord) onRecord(obj) }
+        if (port === null) {
+          // Trailing buffer is the port metadata line (should not happen,
+          // but handle gracefully in case stream order is unexpected).
+          port = obj
+        } else {
+          requests.push(obj)
+          if (onRecord) onRecord(obj)
+        }
       } catch (e) {
         console.warn("[stream] Failed to parse trailing NDJSON line:", buffer.slice(0, 200), e)
       }

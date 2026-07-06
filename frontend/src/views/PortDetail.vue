@@ -48,7 +48,12 @@
             ✕ 取消导出
           </button>
         </div>
-        <button class="btn btn-danger btn-sm" @click="clearHistory">
+        <button
+          class="btn btn-danger btn-sm"
+          :disabled="!!data.port?.deleted_at"
+          :title="data.port?.deleted_at ? '请先到已删除端口页面恢复此代理后再清空历史' : '清空全部历史'"
+          @click="clearHistory"
+        >
           🗑 清空全部历史
         </button>
       </div>
@@ -234,7 +239,8 @@
     <div class="card mt-16" style="border-color:var(--border);background:var(--white-fade)">
       <div style="font-size:13px;line-height:1.8;color:var(--text-muted)">
         <p style="color:var(--text-secondary);margin-bottom:4px">💡 使用提示</p>
-        <p>• 为降低负载，首次仅加载 10 条记录，可点击 <strong>加载更多</strong> 分批查看，或 <strong>加载全部</strong> 一键拉取所有记录（大量数据时可能较慢）。</p>
+        <p>• 为降低负载，首次仅加载 10 条记录，可点击 <strong>加载更多</strong> 分批查看。</p>
+        <p>• <strong>加载全部</strong> 最多在浏览器中缓存 {{ MAX_LOADED_RECORDS }} 条记录（防止内存溢出）；超出部分请使用 <strong>📥 一键导出 → 🔄 从后端导出</strong> 下载完整文件。</p>
         <p>• <strong>📥 一键导出</strong> 默认只导出当前已加载且符合筛选条件的记录；如需导出全部 API 请求，请使用菜单中的 <strong>🔄 从后端导出</strong>，无需在前端全部加载。</p>
       </div>
     </div>
@@ -289,6 +295,9 @@ let _maxId = 0
 let _pollTimer = null
 let _offset = 0
 const PAGE_SIZE = 10
+const MAX_LOADED_RECORDS = 5000  // Soft cap — prevent browser OOM on huge datasets
+const MAX_CLIENT_EXPORT_RECORDS = 500  // Max records for client-side JSON export — beyond this, use server-side
+let _loadAllWarned = false        // Only warn once per session
 
 // Click-outside directive
 const vClickOutside = {
@@ -361,8 +370,24 @@ async function loadAll() {
   loadingMore.value = true
   try {
     while (hasMore.value) {
+      // Soft cap — prevent browser OOM on huge datasets (100k+ records).
+      // Users should use the server-side export instead for bulk downloads.
+      if (requests.value.length >= MAX_LOADED_RECORDS) {
+        hasMore.value = false
+        if (!_loadAllWarned) {
+          _loadAllWarned = true
+          showToast(
+            `已加载上限 ${MAX_LOADED_RECORDS} 条记录，更多数据请使用「📥 一键导出 → 🔄 从后端导出」下载完整文件`,
+            'warning'
+          )
+        }
+        break
+      }
+      // Dynamic batch size: larger batches when many records remain
+      const remaining = Math.max(0, (data.value.port?.request_count || 0) - _offset)
+      const batchSize = Math.min(200, Math.max(100, remaining))
       const { port, requests: newReqs } = await api.getPortHistoryStream(
-        portId, 0, 100, _offset,
+        portId, 0, batchSize, _offset,
         (rec) => requests.value.push(rec)
       )
       if (newReqs.length === 0) break
@@ -394,9 +419,17 @@ async function pollNewRecords() {
 
       const savedScrollY = scrollLocked.value ? window.scrollY : null
 
-      // Prepend new records (newest first)
-      requests.value = [...newReqs, ...requests.value]
-      _offset += newReqs.length
+      // Prepend new records (newest first) using unshift — O(k) amortized
+      // instead of spread which rebuilds the entire array O(n) each poll.
+      // If we're at the soft cap, drop the oldest records to stay within bounds.
+      for (let i = newReqs.length - 1; i >= 0; i--) {
+        requests.value.unshift(newReqs[i])
+      }
+      // Trim oldest records if we exceed the soft cap
+      while (requests.value.length > MAX_LOADED_RECORDS) {
+        requests.value.pop()
+      }
+      _offset = Math.min(_offset + newReqs.length, data.value.port?.request_count || _offset + newReqs.length)
       newCount.value += newReqs.length
       if (port?.request_count !== undefined) {
         data.value.port.request_count = port.request_count
@@ -617,6 +650,19 @@ function exportJsonOnly() {
   closeCopyMenu()
   try {
     const source = _getExportRequests()
+    // Guard: if too many records, force server-side export to avoid
+    // browser OOM from JSON.stringify + Blob on large datasets.
+    if (source.length > MAX_CLIENT_EXPORT_RECORDS) {
+      showToast(
+        `已加载 ${source.length} 条记录（超过 ${MAX_CLIENT_EXPORT_RECORDS} 条上限），` +
+        `正在通过后端导出...`,
+        'info'
+      )
+      // Trigger server-side export (same as exportApiFromServer but
+      // respects current methodFilter)
+      exportApiFromServer()
+      return
+    }
     const output = source.map((r, i) => {
       const entry = { index: i + 1, method: r.method, path: r.path, status_code: r.status_code }
       try { entry.request = JSON.parse(r.request_body) } catch (e) { entry.request = r.request_body }
@@ -637,24 +683,27 @@ async function exportAllData() {
   exporting.value = true
   exportProgress.value = '准备中...'
   try {
-    if (methodFilter.value === 'all' || methodFilter.value === 'api') {
-      const serverFilter = methodFilter.value === 'api' ? 'api' : 'all'
-      await downloadWithTicket(portId, { methodFilter: serverFilter })
-      showToast('导出完成', 'success')
-    } else {
-      const source = _getExportRequests()
-      downloadJson(getExportFilename('full'), { port: data.value.port, requests: source, total_requests: source.length })
-      showToast(`已导出 ${source.length} 条完整交互记录（当前页面数据）`, 'success')
-    }
+    // Always prefer server-side export — supports all method filters
+    const serverFilter = methodFilter.value === 'api' ? 'api' : 'all'
+    await downloadWithTicket(portId, { methodFilter: serverFilter })
+    showToast('导出完成', 'success')
   } catch (e) {
     if (e.name === 'AbortError') {
       // User cancelled, already handled
     } else {
-      // Fallback to client-side export
+      // Fallback to client-side export — with size guard
       try {
         const source = _getExportRequests()
+        if (source.length > MAX_CLIENT_EXPORT_RECORDS) {
+          showToast(
+            `已加载 ${source.length} 条记录（超过 ${MAX_CLIENT_EXPORT_RECORDS} 条上限），` +
+            `请使用「🔄 从后端导出」下载完整文件`,
+            'warning'
+          )
+          return
+        }
         downloadJson(getExportFilename('full'), { port: data.value.port, requests: source, total_requests: source.length })
-        showToast('已导出全部数据（当前页面数据）', 'success')
+        showToast(`已导出 ${source.length} 条完整交互记录（当前页面数据）`, 'success')
       } catch (e2) {
         showToast('导出失败', 'error')
       }
@@ -671,10 +720,14 @@ async function exportApiFromServer() {
   exporting.value = true
   exportProgress.value = '准备中...'
   try {
+    // Use current method filter; default to 'api' for the "from server" button
+    // since users clicking "从后端导出全部API请求" expect API-only export.
+    // If called from exportJsonOnly's overflow guard, methodFilter is preserved.
+    const filter = methodFilter.value === 'other' ? 'all' : (methodFilter.value === 'api' ? 'api' : 'all')
     // 浏览器原生下载：<a> 标签直接触发，数据从后端流到磁盘，不经过前端内存
     const { ticket } = await api.createExportTicket(portId)
     const params = new URLSearchParams()
-    params.set('method_filter', 'api')
+    params.set('method_filter', filter)
     params.set('format', 'simple')
     params.set('ticket', ticket)
     const url = `/api/ports/${portId}/export?${params.toString()}`
@@ -717,6 +770,10 @@ async function handleDeleteRequest(req) {
 }
 
 async function clearHistory() {
+  if (data.value.port?.deleted_at) {
+    showToast('请先到已删除端口页面恢复此代理后再清空历史', 'error')
+    return
+  }
   if (!confirm(`确定清空代理 ${data.value.port?.port_number} 的全部交互历史吗？此操作不可恢复！`)) return
   try {
     await api.clearPortHistory(portId)

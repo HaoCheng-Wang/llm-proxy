@@ -55,6 +55,10 @@ async def lifespan(app: FastAPI):
     logger.info("Seeding default admin account...")
     seed_admin()
 
+    logger.info("Resuming interrupted port cleanups (if any)...")
+    from routers.admin_router import resume_port_cleanups
+    resume_port_cleanups()
+
     logger.info("Initializing proxy manager...")
     proxy_manager = ProxyManager()
     app.state.proxy_manager = proxy_manager
@@ -83,14 +87,19 @@ async def lifespan(app: FastAPI):
     # would be silently lost when the engine/pool is torn down.
     await drain_pending_saves(timeout=10.0)
 
+    # Shut down the DB executor thread pool BEFORE disposing engines.
+    # _save_to_db tasks run on this executor and need LogSessionLocal
+    # (which depends on _log_engine) to still be alive.  A 15-second
+    # timeout prevents a stuck MySQL connection from blocking shutdown
+    # indefinitely — which is why kill $(cat back.pid) sometimes fails.
+    logger.info("Shutting down DB executor thread pool...")
+    database.shutdown_db_executor(timeout=15.0)
+
     logger.info("Disposing database connection pools...")
     if database.engine:
         database.engine.dispose()
     if database._log_engine:
         database._log_engine.dispose()
-
-    logger.info("Shutting down DB executor thread pool...")
-    database.shutdown_db_executor()
 
     logger.info("Shutdown complete.")
 

@@ -31,7 +31,7 @@ from proxy_app import (
     _fire_and_forget_save,
     EXCLUDE_HEADERS,
 )
-from config import PROXY_BODY_MEMORY_LIMIT
+from config import PROXY_BODY_MEMORY_LIMIT, SSE_RECONSTRUCT_MAX_BYTES
 
 logger = logging.getLogger("llm_proxy.proxy")
 logger.setLevel(logging.DEBUG)
@@ -120,6 +120,7 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
     status_code = 502
     resp_body_str = None
     resp_body_raw_str = None
+    full_body = None           # raw response bytes from upstream (non-streaming)
     resp_headers_json = "{}"
     resp_content_type = "application/json"
     is_streaming = False
@@ -241,32 +242,66 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                     _record_saved = True  # set first to prevent double-save
                     try:
                         resp_buf.seek(0)
-                        full_body = resp_buf.read()
-                        if not full_body:
-                            return
-                        raw_sse_text = full_body.decode(
-                            "utf-8", errors="replace")
+                        # Guard: get file size without reading into memory.
+                        # SpooledTemporaryFile.rollover() sets _file to a
+                        # real file; tell() works.  In-memory BytesIO also
+                        # supports tell().  If somehow unsupported, fall
+                        # back to reading the whole thing.
                         try:
-                            reconstructed_json = _reconstruct_sse_to_json(
-                                raw_sse_text)
-                        except Exception as recon_err:
+                            _buf_size = resp_buf.seek(0, 2)  # seek to end
+                            resp_buf.seek(0)                  # back to start
+                        except Exception:
+                            _buf_size = None
+
+                        if _buf_size is not None and _buf_size > SSE_RECONSTRUCT_MAX_BYTES:
+                            # Stream is too large — skip reconstruction,
+                            # save only the first SSE_RECONSTRUCT_MAX_BYTES
+                            # bytes with a truncation warning.
                             logger.warning(
-                                "SSE reconstruction failed for port %d: "
-                                "%s: %s — saving raw text",
-                                port_number,
-                                type(recon_err).__name__, recon_err,
+                                "SSE stream for port %d is %d bytes "
+                                "(limit %d) — truncating raw text and "
+                                "skipping JSON reconstruction",
+                                port_number, _buf_size,
+                                SSE_RECONSTRUCT_MAX_BYTES,
+                            )
+                            truncated = resp_buf.read(SSE_RECONSTRUCT_MAX_BYTES)
+                            raw_sse_text = truncated.decode(
+                                "utf-8", errors="replace",
+                            )
+                            raw_sse_text += (
+                                f"\n\n[TRUNCATED: {_buf_size} bytes total, "
+                                f"only first {SSE_RECONSTRUCT_MAX_BYTES} "
+                                f"bytes saved]"
                             )
                             reconstructed_json = raw_sse_text
+                            reconstruction_error = True
+                        else:
+                            full_body = resp_buf.read()
+                            if not full_body:
+                                return
+                            raw_sse_text = full_body.decode(
+                                "utf-8", errors="replace")
+                            try:
+                                reconstructed_json = _reconstruct_sse_to_json(
+                                    raw_sse_text)
+                            except Exception as recon_err:
+                                logger.warning(
+                                    "SSE reconstruction failed for port %d: "
+                                    "%s: %s — saving raw text",
+                                    port_number,
+                                    type(recon_err).__name__, recon_err,
+                                )
+                                reconstructed_json = raw_sse_text
 
-                        reconstruction_error = (
-                            reconstructed_json is None
-                            or (isinstance(reconstructed_json, str)
-                                and reconstructed_json.lstrip()
-                                .startswith("data:"))
-                        )
-                        if reconstruction_error \
-                                and reconstructed_json is None:
-                            reconstructed_json = raw_sse_text
+                            reconstruction_error = (
+                                reconstructed_json is None
+                                or (isinstance(reconstructed_json, str)
+                                    and reconstructed_json.lstrip()
+                                    .startswith("data:"))
+                            )
+                            if reconstruction_error \
+                                    and reconstructed_json is None:
+                                reconstructed_json = raw_sse_text
 
                         duration_ms = int((time.time() - start_time) * 1000)
                         _fire_and_forget_save(_save_record_async(
@@ -349,7 +384,7 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                             "(client disconnect?) — port %d",
                             port_number,
                         )
-                    _save_stream_record()
+                        _save_stream_record()
                     resp_buf.close()
                     try:
                         await current_ctx.__aexit__(None, None, None)
@@ -478,13 +513,24 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
             resp_body_raw=resp_body_raw_str or resp_body_str,
         ))
 
-    # Return response with original content-type
+    # Return response with original content-type for non-streaming.
+    # Uses raw ``full_body`` bytes (unmodified from upstream) so the
+    # response is byte-identical to what the target API returned.
+    # Falls back to ``resp_body_str`` (our generated error JSON) when
+    # the upstream returned no body (timeout, connect error, etc.).
     response_headers = {"X-Proxy-Port": str(port_number)}
-    if resp_body_str and status_code != 204:
+    if full_body and status_code != 204:
+        return Response(
+            content=full_body,
+            status_code=status_code,
+            media_type=resp_content_type,
+            headers=response_headers,
+        )
+    elif resp_body_str:
         return Response(
             content=resp_body_str,
             status_code=status_code,
-            media_type=resp_content_type,
+            media_type="application/json",
             headers=response_headers,
         )
     return Response(status_code=status_code, headers=response_headers)
