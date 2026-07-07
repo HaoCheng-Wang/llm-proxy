@@ -65,17 +65,46 @@ async def setup_database():
 
     yield
 
-    # Cleanup — only drop tables in the TEST database.
-    # Guard: refuse to drop if we somehow connected to production.
+    # Cleanup — drop tables then the entire TEST database.
+    # Double guard: ONLY databases whose name contains 'test' are eligible.
+    # 1) conftest sets DATABASE_NAME=llm_proxy_test before imports
+    # 2) config.py uses load_dotenv(override=False) so env var takes priority
+    # 3) This block raises RuntimeError if the guard fails (defense in depth)
     _db_name = getattr(database.engine.url, 'database', '')
     if 'test' not in _db_name.lower():
+        database.engine.dispose()
         raise RuntimeError(
-            f"SAFETY: refusing to drop_all() on non-test database '{_db_name}'. "
-            f"Expected a database name containing 'test'."
+            f"SAFETY: refusing to drop test database. "
+            f"Connected to '{_db_name}' which does not contain 'test'. "
+            f"Aborting to protect production data."
         )
+
+    # Step 1: drop all tables (fast, no need to scan rows)
     if database.engine:
         Base.metadata.drop_all(bind=database.engine)
         database.engine.dispose()
+
+    # Step 2: drop the test database itself via pymysql (DDL, no pool needed)
+    try:
+        import pymysql
+        from config import (
+            _DB_USER_FOR_AUTO, _DB_PASS_FOR_AUTO,
+            _DB_HOST_FOR_AUTO, _DB_PORT_FOR_AUTO,
+        )
+        conn = pymysql.connect(
+            host=_DB_HOST_FOR_AUTO, port=_DB_PORT_FOR_AUTO,
+            user=_DB_USER_FOR_AUTO, password=_DB_PASS_FOR_AUTO,
+            charset="utf8mb4", autocommit=True,
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"DROP DATABASE IF EXISTS `{_db_name}`")
+        finally:
+            conn.close()
+    except Exception:
+        # Non-fatal — the test DB may already be gone or inaccessible.
+        # The important thing is we didn't touch production.
+        pass
 
 
 @pytest_asyncio.fixture
