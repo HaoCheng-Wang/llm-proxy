@@ -299,12 +299,32 @@ const MAX_LOADED_RECORDS = 5000  // Soft cap — prevent browser OOM on huge dat
 const MAX_CLIENT_EXPORT_RECORDS = 500  // Max records for client-side JSON export — beyond this, use server-side
 let _loadAllWarned = false        // Only warn once per session
 
+// Active streaming fetch (loadData / loadMore / loadAll / poll) — aborted
+// when the page is hidden or unmounted so the backend never gets stuck
+// serving a stream to a browser that stopped reading (which used to freeze
+// the backend stream connection pool and block the detail page for everyone).
+let _activeStreamAbort = null
+
+function abortActiveStreams() {
+  if (_activeStreamAbort) {
+    _activeStreamAbort.abort()
+    _activeStreamAbort = null
+  }
+}
+
+function newStreamSignal() {
+  const controller = new AbortController()
+  _activeStreamAbort = controller
+  return controller.signal
+}
+
 // Click-outside directive
 const vClickOutside = {
   mounted(el, binding) {
     el._clickOutside = (event) => {
       if (!(el === event.target || el.contains(event.target))) {
-        binding.instance[binding.arg || 'closeCopyMenu']()
+        const fn = binding.instance?.[binding.arg || 'closeCopyMenu']
+        if (typeof fn === 'function') fn()
       }
     }
     document.addEventListener('click', el._clickOutside)
@@ -315,6 +335,8 @@ const vClickOutside = {
 }
 
 async function loadData() {
+  abortActiveStreams()
+  const signal = newStreamSignal()
   try {
     _offset = 0
     requests.value = []
@@ -329,7 +351,8 @@ async function loadData() {
           firstRecord = false
           initialLoading.value = false
         }
-      }
+      },
+      { signal }
     )
     data.value = { port, requests: all }
     _maxId = all.length > 0 ? Math.max(...all.map(r => r.id)) : 0
@@ -338,18 +361,25 @@ async function loadData() {
     expanded.value = {}
     if (firstRecord) initialLoading.value = false  // no records
   } catch (e) {
-    showToast('加载数据失败', 'error')
+    // AbortError = page hidden/unmounted → silent (already handled by caller)
+    if (e?.name !== 'AbortError') {
+      showToast(e?.message || '加载数据失败', 'error')
+    }
     initialLoading.value = false
+  } finally {
+    if (_activeStreamAbort?.signal === signal) _activeStreamAbort = null
   }
 }
 
 async function loadMore() {
   if (loadingMore.value || !hasMore.value) return
   loadingMore.value = true
+  const signal = newStreamSignal()
   try {
     const { port, requests: newReqs } = await api.getPortHistoryStream(
       portId, 0, PAGE_SIZE, _offset,
-      (rec) => requests.value.push(rec)  // append live
+      (rec) => requests.value.push(rec),  // append live
+      { signal }
     )
     if (newReqs.length > 0) {
       _offset += newReqs.length
@@ -359,8 +389,11 @@ async function loadMore() {
       hasMore.value = _offset < (port.request_count || 0)
     }
   } catch (e) {
-    showToast('加载更多失败', 'error')
+    if (e?.name !== 'AbortError') {
+      showToast('加载更多失败', 'error')
+    }
   } finally {
+    if (_activeStreamAbort?.signal === signal) _activeStreamAbort = null
     loadingMore.value = false
   }
 }
@@ -368,6 +401,7 @@ async function loadMore() {
 async function loadAll() {
   if (loadingMore.value || !hasMore.value) return
   loadingMore.value = true
+  const signal = newStreamSignal()
   try {
     while (hasMore.value) {
       // Soft cap — prevent browser OOM on huge datasets (100k+ records).
@@ -388,7 +422,8 @@ async function loadAll() {
       const batchSize = Math.min(200, Math.max(100, remaining))
       const { port, requests: newReqs } = await api.getPortHistoryStream(
         portId, 0, batchSize, _offset,
-        (rec) => requests.value.push(rec)
+        (rec) => requests.value.push(rec),
+        { signal }
       )
       if (newReqs.length === 0) break
       _offset += newReqs.length
@@ -398,8 +433,11 @@ async function loadAll() {
       }
     }
   } catch (e) {
-    showToast('加载全部失败', 'error')
+    if (e?.name !== 'AbortError') {
+      showToast('加载全部失败', 'error')
+    }
   } finally {
+    if (_activeStreamAbort?.signal === signal) _activeStreamAbort = null
     loadingMore.value = false
   }
 }
@@ -407,12 +445,14 @@ async function loadAll() {
 async function pollNewRecords() {
   if (!data.value.port?.is_active) return
   polling.value = true
+  const signal = newStreamSignal()
   try {
     // Collect streamed records so we can prepend them in batch
     const polled = []
     const { port, requests: newReqs } = await api.getPortHistoryStream(
       portId, _maxId, 100, 0,
-      (rec) => polled.push(rec)
+      (rec) => polled.push(rec),
+      { signal }
     )
     if (newReqs.length > 0) {
       _maxId = Math.max(_maxId, ...newReqs.map(r => r.id))
@@ -444,9 +484,12 @@ async function pollNewRecords() {
       showToast(`收到 ${newReqs.length} 条新交互记录`, 'info')
     }
   } catch (e) {
-    console.warn('[poll] Failed to poll new records:', e.message || e)
+    if (e?.name !== 'AbortError') {
+      console.warn('[poll] Failed to poll new records:', e.message || e)
+    }
     // Silently ignore poll errors — will retry on next interval
   } finally {
+    if (_activeStreamAbort?.signal === signal) _activeStreamAbort = null
     polling.value = false
   }
 }
@@ -808,7 +851,25 @@ onMounted(async () => {
   await configPromise
 })
 
+// When the tab goes to the background, browsers may pause reading the
+// stream; without this the backend would keep a stream connection open to
+// a stalled client (which previously exhausted the backend stream pool and
+// froze the detail page for everyone).  Stop polling + abort on hide,
+// resume + re-sync on show.
+function handleVisibilityChange() {
+  if (document.hidden) {
+    stopPolling()
+    abortActiveStreams()
+  } else if (data.value.port) {
+    startPolling()
+    pollNewRecords()  // immediate re-sync after returning to the tab
+  }
+}
+document.addEventListener('visibilitychange', handleVisibilityChange)
+
 onUnmounted(() => {
   stopPolling()
+  abortActiveStreams()
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
 </script>

@@ -465,6 +465,16 @@ def get_port_history(
 
     async def stream_ndjson():
         own_db = database.StreamSessionLocal()
+        # True only when the full result set was consumed (LIMIT rows all
+        # streamed).  Early exit (client disconnect / GeneratorExit /
+        # exception) leaves unread rows on the SSCursor — such a connection
+        # must be INVALIDATED, never returned to the pool, or the next
+        # user of that pooled connection will hang on stale protocol data
+        # (root cause of the QueuePool exhaustion / "正在从后端拉取交互记录" freeze).
+        _stream_completed = False
+        # Hard wall-clock cap as a last line of defence against zombie
+        # streams (client paused reading, proxy never closes the socket).
+        _deadline = time.monotonic() + 120.0
         try:
             query = (
                 own_db.query(RequestModel)
@@ -493,22 +503,44 @@ def get_port_history(
                 yield (
                     json.dumps(rec, default=str, ensure_ascii=False) + "\n"
                 ).encode("utf-8")
-                # Detect client disconnect every 20 rows → stop early,
-                # so the DB connection is still healthy when we close it.
-                if _row_idx % 20 == 0 and await request.is_disconnected():
+                # Detect client disconnect every 5 rows → abandon the stream
+                # (and discard the connection) as early as possible, so a
+                # disconnected viewer cannot hold a pool slot for long.
+                if _row_idx % 5 == 0 and await request.is_disconnected():
                     logger.info("History client disconnected: port=%d rows=%d", _port_id, _row_idx)
                     return
+                # Absolute deadline — prevents a zombie stream (client paused
+                # reading, upstream proxy holding the socket open) from
+                # occupying the pool connection indefinitely.
+                if time.monotonic() > _deadline:
+                    logger.warning(
+                        "History stream deadline exceeded: port=%d rows=%d — aborting",
+                        _port_id, _row_idx,
+                    )
+                    return
+            _stream_completed = True
         finally:
-            try:
-                own_db.close()
-            except Exception:
-                # Connection already broken (client disconnect / MySQL timeout).
-                # Invalidate discards the raw DBAPI connection without rollback.
+            if _stream_completed:
+                # All rows consumed → connection is clean, safe to reuse.
+                try:
+                    own_db.close()
+                except Exception:
+                    try:
+                        own_db.invalidate()
+                    except Exception:
+                        logger.warning(
+                            "Stream session cleanup failed for port=%d: "
+                            "connection already destroyed, pool will discard on next use",
+                            _port_id,
+                        )
+            else:
+                # Early exit — SSCursor may still hold unread rows.  Returning
+                # it to the pool would poison the next checkout, so discard it.
                 try:
                     own_db.invalidate()
                 except Exception:
                     logger.warning(
-                        "Stream session cleanup failed for port=%d: "
+                        "Stream session invalidate failed for port=%d: "
                         "connection already destroyed, pool will discard on next use",
                         _port_id,
                     )
@@ -1118,6 +1150,12 @@ def export_port_history(
     async def stream_jsonl():
         own_db = database.StreamSessionLocal()
         _row_count = 0
+        # Same pool-hygiene rule as stream_ndjson: only a fully-consumed
+        # result set may return its connection to the pool.  Any early exit
+        # discards the connection (SSCursor may hold unread rows).
+        _export_completed = False
+        # 30-minute hard cap so a stalled export cannot hog a pool slot forever.
+        _export_deadline = time.monotonic() + 1800.0
         try:
             # Build query, deferring columns the output format does not need.
             _deferred = [RequestModel.response_body_raw]  # never needed for export
@@ -1157,9 +1195,16 @@ def export_port_history(
                         first = False
                         yield _build_simple_row(r, idx)
                         # Heartbeat: check client connection every 100 rows
-                        if idx % 100 == 0 and await request.is_disconnected():
-                            logger.info("Export client disconnected: port=%d rows=%d", _port_number, _row_count)
-                            return
+                        if idx % 100 == 0:
+                            if await request.is_disconnected():
+                                logger.info("Export client disconnected: port=%d rows=%d", _port_number, _row_count)
+                                return
+                            if time.monotonic() > _export_deadline:
+                                logger.warning(
+                                    "Export deadline exceeded: port=%d rows=%d — aborting",
+                                    _port_number, _row_count,
+                                )
+                                return
                     yield b"]"
                 except GeneratorExit:
                     logger.info("Export cancelled by client: port=%d rows=%d", _port_number, _row_count)
@@ -1198,9 +1243,16 @@ def export_port_history(
                         first = False
                         yield _build_full_row(r)
                         # Heartbeat: check client connection every 100 rows
-                        if row % 100 == 0 and await request.is_disconnected():
-                            logger.info("Export client disconnected: port=%d rows=%d", _port_number, _row_count)
-                            return
+                        if row % 100 == 0:
+                            if await request.is_disconnected():
+                                logger.info("Export client disconnected: port=%d rows=%d", _port_number, _row_count)
+                                return
+                            if time.monotonic() > _export_deadline:
+                                logger.warning(
+                                    "Export deadline exceeded: port=%d rows=%d — aborting",
+                                    _port_number, _row_count,
+                                )
+                                return
                     yield b"]}"
                 except GeneratorExit:
                     logger.info("Export cancelled by client: port=%d rows=%d", _port_number, _row_count)
@@ -1218,16 +1270,29 @@ def export_port_history(
                     yield _err_obj
                     yield b'],"_export_error":"incomplete"}'
 
+            _export_completed = True
             logger.info("Export finished: port=%d %d rows", _port_number, _row_count)
         finally:
-            try:
-                own_db.close()
-            except Exception:
+            if _export_completed:
+                # All rows consumed → connection is clean, safe to reuse.
+                try:
+                    own_db.close()
+                except Exception:
+                    try:
+                        own_db.invalidate()
+                    except Exception:
+                        logger.warning(
+                            "Export stream cleanup failed for port=%d: "
+                            "connection already destroyed, pool will discard on next use",
+                            _port_number,
+                        )
+            else:
+                # Early exit — SSCursor may still hold unread rows; discard it.
                 try:
                     own_db.invalidate()
                 except Exception:
                     logger.warning(
-                        "Export stream cleanup failed for port=%d: "
+                        "Export stream invalidate failed for port=%d: "
                         "connection already destroyed, pool will discard on next use",
                         _port_number,
                     )

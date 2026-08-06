@@ -73,11 +73,12 @@ def _init_engine():
     # instead of loading the entire result set into memory.  A separate engine with
     # its own small pool prevents SSCursor connections from leaking into the normal
     # pool (SSCursor requires reading all rows before the next query).
+    # Pool sized for concurrent detail-page viewers + exports (15+15 = 30 slots).
     global _stream_engine, StreamSessionLocal
     _stream_engine = create_engine(
         DATABASE_URL,
-        pool_size=5,
-        max_overflow=5,
+        pool_size=15,
+        max_overflow=15,
         pool_pre_ping=True,
         pool_recycle=600,
         connect_args={

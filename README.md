@@ -128,23 +128,29 @@ uv sync
 
 > 以上三种方式自由选择。`start.sh` 会自动识别 `conda activate`、`.venv`、`uv` 或任意 Python 路径。
 
-#### 4. 启动后端
+#### 4. 启动服务（后端 + 前端一键启动）
 
 推荐使用启动脚本（自动处理进程清理和环境检测）：
 
 ```bash
-# 自动检测 Python 环境并启动
+# 自动检测 Python 环境并启动后端 + 前端(vite)
 ./start.sh
 
-# 或显式指定：
+# 或显式指定 Python 环境：
 ./start.sh -c llm-proxy          # 使用 conda 环境 "llm-proxy"
 ./start.sh -u                    # 使用 uv run python
 ./start.sh -p /usr/bin/python3.12 # 使用指定 Python 路径
-./start.sh -p python3            # 使用系统 python3
 PYTHON_BIN=python3.10 ./start.sh  # 环境变量覆盖
 ```
 
-停止后端：
+`start.sh` 会依次启动：
+
+1. **后端**（`backend/main.py`，监听 :3998），PID 写入 `back.pid`
+2. **前端**（`vite dev server`，监听 :3999），以 `nohup setsid` 方式后台运行，进程组 ID 写入 `vite.pid`
+
+> `setsid` 让 vite 及其 node 子进程处于独立进程组，`stop.sh` 可通过 `kill -- -PGID` 整组优雅关闭，不会残留孤儿 node 进程。
+
+停止服务（同时停止前后端）：
 
 ```bash
 ./stop.sh
@@ -153,8 +159,11 @@ PYTHON_BIN=python3.10 ./start.sh  # 环境变量覆盖
 查看日志：
 
 ```bash
-tail -f back.log
+tail -f back.log   # 后端日志
+tail -f vite.log   # 前端日志
 ```
+
+> `*.log` 与 `*.pid` 均已在 `.gitignore` 中忽略，不会提交到版本库。
 
 `start.sh` 的 Python 环境检测顺序：
 1. 命令行参数（`-p` / `-c` / `-u`）
@@ -163,7 +172,7 @@ tail -f back.log
 4. 当前 conda 环境的 python（`$CONDA_PREFIX/bin/python`）
 5. 系统的 `python3`
 
-> `start.sh` 启动前会自动检测并清理端口 3998 上的孤儿进程，防止多次启动导致多进程冲突。`stop.sh` 先发送 SIGTERM 优雅关闭（等待 20 秒），超时后强制 SIGKILL。
+> `start.sh` 启动前会自动检测并清理 3998/3999 端口上的孤儿进程（仅匹配 `-sTCP:LISTEN` 状态，不会误杀 vscode 端口转发等连接方进程）。`stop.sh` 先发送 SIGTERM 优雅关闭（等待 20 秒），超时后整组 SIGKILL，最后验证端口释放。
 
 输出示例：
 ```
@@ -176,7 +185,9 @@ Created admin user: admin
 [Main] Management API + Shared Proxy ready on port 3998
 ```
 
-#### 5. 启动前端（终端 2）
+#### 5. 前端独立启动（可选）
+
+> 通常无需手动启动前端——`start.sh` 已自动启动 vite。以下为单独调试时的命令：
 
 ```bash
 cd frontend
@@ -186,7 +197,7 @@ npm run dev
 
 前端 Vite 开发服务器自动代理 `/api` 到 `localhost:3998`，监听 `0.0.0.0:3999`。
 
-> 如需修改前端绑定的 IP 或端口，编辑 `frontend/vite.config.js` 中的 `host` / `port` 字段即可。
+> 如需修改前端绑定的 IP 或端口，编辑 `frontend/vite.config.js` 中的 `host` / `port` 字段即可。`/api` 代理配置了 300 秒读写超时（`timeout` / `proxyTimeout`），确保异常流式连接能被及时回收。
 
 #### 6. 访问
 
@@ -413,8 +424,8 @@ llm-proxy/
 ├── docker-compose.yml       # 2 容器编排
 ├── nginx.conf               # 前端 nginx 配置
 ├── pyproject.toml           # uv 项目定义 + Python 依赖声明 + pytest 配置
-├── start.sh                 # 启动脚本（自动检测 Python 环境 + 孤儿进程清理）
-├── stop.sh                  # 停止脚本（优雅关闭 → 超时强杀 → 端口释放验证）
+├── start.sh                 # 启动脚本（后端 + 前端 vite 一键启动，PID 写入 back.pid / vite.pid）
+├── stop.sh                  # 停止脚本（进程组优雅关闭 → 超时强杀 → 端口释放验证）
 ├── README.md
 │
 ├── tests/                    # 测试套件
@@ -428,7 +439,7 @@ llm-proxy/
 ├── backend/                 # Python FastAPI 后端
 │   ├── main.py              # 入口：启动 FastAPI + 注册路由 + lifespan
 │   ├── config.py            # 读取 .env 环境变量（含 CLEANUP_BATCH_SIZE / CLEANUP_LOG_INTERVAL）
-│   ├── database.py          # 自动建库建表 + 三连接池（管理/日志/流式导出）+ 迁移 + 共享清理工具（get_raw_connection / warn_fragmented_raw）
+│   ├── database.py          # 自动建库建表 + 三连接池（管理/日志/流式）+ 迁移 + 共享清理工具（get_raw_connection / warn_fragmented_raw）
 │   ├── models.py            # ORM 模型（User / Port / Request）
 │   ├── schemas.py           # Pydantic 请求/响应模型
 │   ├── auth.py              # JWT 认证 + bcrypt 密码哈希
@@ -440,7 +451,7 @@ llm-proxy/
 │   └── routers/
 │       ├── auth_router.py   # 注册/登录/用户信息/修改密码
 │       ├── admin_router.py  # 用户审批 + 已删除端口管理
-│       ├── ports_router.py  # 端口 CRUD + 软删除 + 停用/启用 + 历史查询 + 流式导出
+│       ├── ports_router.py  # 端口 CRUD + 软删除 + 停用/启用 + 历史 NDJSON 流 + 流式导出（含连接池卫生约束）
 │       └── config_router.py # 前端配置（display_ip）
 │
 └── frontend/                # Vue 3 前端
@@ -451,7 +462,7 @@ llm-proxy/
         ├── main.js          # Vue 入口（createApp + Pinia + Router）
         ├── App.vue          # 根组件（导航栏 + 用户信息 + 主题切换 + toast 通知）
         ├── style.css        # 全局样式（CSS 变量主题系统：浅色/深色/跟随系统）
-        ├── api/index.js     # API 客户端（axios 拦截器 + NDJSON 流式加载 + ticket 导出）
+        ├── api/index.js     # API 客户端（axios 拦截器 + NDJSON 流式加载（45s 超时/可中止）+ ticket 导出）
         ├── stores/auth.js   # Pinia 认证状态（token/用户信息/登录/登出）
         ├── stores/theme.js  # Pinia 主题状态（浅色/深色/跟随系统 + localStorage 持久化）
         ├── router/index.js  # 路由配置 + 守卫（guest/auth/admin 三级权限）
@@ -1050,6 +1061,111 @@ sequenceDiagram
 | 真正瓶颈在上游 | OpenAI 的生成速度（秒级）远超代理转发开销（微秒级） |
 
 如需高可用，应使用多容器 + 负载均衡，而非单机多进程。
+
+## 流式查询连接池健康设计
+
+交互记录查询、实时轮询、大数据量导出全部走**服务端流式响应**（NDJSON / JSON 流），依赖专用流式连接池（`StreamSessionLocal`，SSCursor 服务端游标）。流式连接的生命周期比普通查询长得多，因此对**连接的取用、归还、失效**有一套严格的卫生约束，确保任何客户端行为都不会让连接池被占满。
+
+### 三层流式架构
+
+```mermaid
+flowchart TD
+    subgraph Browser["浏览器"]
+        VUE["Vue 详情页<br/>初次加载 / 每2s轮询 / 加载更多 / 导出"]
+        HIDDEN["页面隐藏/切换标签<br/>visibilitychange → 中止流"]
+        ABORT["fetch 45s 硬超时<br/>AbortController"]
+    end
+
+    subgraph Proxy["代理层 (vite dev / nginx)"]
+        PROXY["/api 代理<br/>300s 读写超时<br/>僵尸连接强制回收"]
+    end
+
+    subgraph Backend["FastAPI 后端"]
+        STREAM["StreamingResponse<br/>generator 逐行产出"]
+        CHECK["每 5 行检测<br/>客户端断开?"]
+        DEADLINE["120s 硬时限<br/>(导出 1800s)"]
+        INVALIDATE{"流完整读完?"}
+        INVALIDATE -->|"是"| CLOSE["close() 归还连接池<br/>可复用"]
+        INVALIDATE -->|"否(中途断开/超时)"| DISCARD["invalidate() 丢弃连接<br/>SSCursor 未读行不留入池"]
+    end
+
+    subgraph DB["MySQL"]
+        POOL["流式连接池<br/>15 + 15 = 30 槽"]
+        SSC["SSCursor 服务端游标<br/>逐批取行 yield_per(50)"]
+    end
+
+    VUE -->|"流式 fetch"| PROXY
+    PROXY -->|"HTTP"| STREAM
+    HIDDEN -.->|"abort"| VUE
+    ABORT -.->|"abort"| VUE
+    STREAM --> CHECK --> DEADLINE --> INVALIDATE
+    STREAM --> SSC
+    CLOSE --> POOL
+    DISCARD --> POOL
+
+    style INVALIDATE fill:#d5f5e3,stroke:#27ae60,color:#145a32
+    style DISCARD fill:#fdebd0,stroke:#e67e22,color:#7e5100
+    style PROXY fill:#d6eaf8,stroke:#2980b9,color:#154360
+```
+
+### 设计原则 1：连接归还的"干净性"判定
+
+SSCursor 是**服务端游标**：MySQL 端保持结果集，客户端逐批拉取。如果中途退出（客户端断开、超时、异常），MySQL 结果集可能仍有未读行——此时把连接还回池，下一个使用者会在**陈旧协议状态**上执行查询，导致行为异常。
+
+因此两条流式路径（历史流 `stream_ndjson`、导出流 `stream_jsonl`）统一遵循：
+
+- **完整读完全部行** → `close()` 正常归还，连接可复用
+- **任何提前退出**（`GeneratorExit`、客户端断开、超时、异常）→ `invalidate()` 丢弃底层连接，池自动新建替代连接
+
+```python
+_stream_completed = False
+try:
+    for r in query.yield_per(50):
+        ...
+        if await request.is_disconnected():
+            return          # 提前退出
+    _stream_completed = True
+finally:
+    if _stream_completed:
+        own_db.close()          # 干净连接 → 归还
+    else:
+        own_db.invalidate()     # 可能有未读行 → 丢弃
+```
+
+### 设计原则 2：断开检测与硬时限
+
+| 防护层 | 实现 | 目的 |
+|--------|------|------|
+| 客户端断开检测 | 每产出 5 行检查 `request.is_disconnected()` | 浏览器关闭/刷新后尽快放弃流，尽早释放连接 |
+| 流时长硬上限 | 历史流 120s、导出流 1800s 单调钟截止 | 即使代理层不关 socket（页面被冻结等极端场景），流也不会无限占用连接 |
+| 代理层超时 | vite `/api` 代理 `timeout`/`proxyTimeout` = 300s | 浏览器侧冻结的流在代理层被强制销毁，后端 socket 写错误 → generator 退出 → 连接被清理 |
+
+> 三层防护互为兜底：任一层失效，其余层仍能保证连接最终被回收。
+
+### 设计原则 3：连接池容量与隔离
+
+流式连接池与普通查询池（管理 API 用）、日志池（代理写库用）**三池完全隔离**，流式查询的长时间占用不会挤占管理接口的可用连接。
+
+- 流式池容量：`pool_size=15, max_overflow=15`（共 30 槽），支撑多用户同时查看详情/轮询/导出
+- 普通池：20+40（管理 API）；日志池：10+20（代理记录写入）
+- 全部启用 `pool_pre_ping=True`、`pool_recycle=600s`，规避 MySQL 空闲超时回收导致连接失效
+
+### 设计原则 4：前端生命周期对齐
+
+流式请求的发起方（浏览器）同步承担"关闭"职责，避免产生无人消费的流：
+
+| 场景 | 前端行为 |
+|------|----------|
+| 页面切换/隐藏 | `visibilitychange` → 停止 2s 轮询 + `AbortController` 中止进行中的流；回到页面立即重新同步 |
+| 组件卸载 | `onUnmounted` → 停止轮询 + 中止流 |
+| 单次流超时 | fetch 内置 45s 硬超时（`AbortController`），超时给出"加载超时，请重试"提示而非无限转圈 |
+| 轮询失败 | 静默忽略（下个周期自动重试），不打断用户操作 |
+
+前端中止 → 浏览器关闭 TCP 连接 → 代理层销毁上游 socket → 后端 `is_disconnected()` 检测到 → 连接按"不干净"路径丢弃。**整条链路闭环**，任何一端都不会无限持有资源。
+
+### 为什么每 5 行检查而不是每 20 行
+
+断开检测频率直接影响连接释放速度：20 行一次检测意味着最多滞后 19 行才感知断开；5 行一次将滞后缩短到 4 行，配合 120s 硬时限，连接在**毫秒~分钟级**内必然被回收，同时检测本身是零成本的协程检查（`await request.is_disconnected()`），不增加数据库负载。
 
 ## 大量数据删除：后台批量清理架构
 

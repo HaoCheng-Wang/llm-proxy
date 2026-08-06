@@ -19,7 +19,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PIDFILE="$SCRIPT_DIR/back.pid"
+VITE_PIDFILE="$SCRIPT_DIR/vite.pid"
 LOGFILE="$SCRIPT_DIR/back.log"
+VITE_LOGFILE="$SCRIPT_DIR/vite.log"
 
 # ── Parse flags ──
 PYTHON_CMD=""
@@ -97,8 +99,23 @@ if [ -f "$PIDFILE" ]; then
     fi
 fi
 
-# ── Safety net: kill any orphan processes on port 3998 ──
-ORPHANS=$(lsof -ti :3998 2>/dev/null || true)
+# ── Pre-flight: vite (frontend dev server, port 3999) ──
+if [ -f "$VITE_PIDFILE" ]; then
+    OLD_VITE_PID=$(cat "$VITE_PIDFILE")
+    if kill -0 "$OLD_VITE_PID" 2>/dev/null; then
+        echo "⚠️  Frontend (vite) is already running (PID $OLD_VITE_PID)."
+        echo "   Run ./stop.sh first, or: kill $OLD_VITE_PID"
+        exit 1
+    else
+        echo "🧹 Stale vite PID file found (PID $OLD_VITE_PID no longer exists) — cleaning up"
+        rm -f "$VITE_PIDFILE"
+    fi
+fi
+
+# ── Safety net: kill any orphan LISTEN processes on port 3998 ──
+# 只匹配监听端口的进程（-sTCP:LISTEN），避免误杀 vscode 远程端口转发
+# 等仅作为客户端连接该端口的进程。
+ORPHANS=$(lsof -ti :3998 -sTCP:LISTEN 2>/dev/null || true)
 if [ -n "$ORPHANS" ]; then
     echo "🧹 Killing orphan process(es) on port 3998: $ORPHANS"
     kill -9 $ORPHANS 2>/dev/null || true
@@ -112,4 +129,20 @@ nohup $PYTHON_CMD backend/main.py > "$LOGFILE" 2>&1 &
 NEW_PID=$!
 echo "$NEW_PID" > "$PIDFILE"
 echo "✅ Backend started (PID $NEW_PID, log: $LOGFILE)"
-echo "   Stop with: ./stop.sh"
+
+# ── Start vite (frontend dev server) ──
+# nohup + setsid: 让 vite 脱离当前终端，且记录进程组 ID，stop.sh 可整组关闭
+# （npx 包装进程被 kill 后 node 子进程会继续存活，必须杀进程组）。
+echo "🚀 Starting frontend (vite)..."
+cd "$SCRIPT_DIR/frontend"
+nohup setsid npx vite --port 3999 > "$VITE_LOGFILE" 2>&1 &
+NEW_VITE_PID=$!
+echo "$NEW_VITE_PID" > "$VITE_PIDFILE"
+cd "$SCRIPT_DIR"
+echo "✅ Frontend started (PGID $NEW_VITE_PID, log: $VITE_LOGFILE)"
+
+echo ""
+echo "🎉 All services started!"
+echo "   Frontend: http://<server>:3999"
+echo "   Backend:  http://<server>:3998"
+echo "   Stop all with: ./stop.sh"
