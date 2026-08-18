@@ -11,6 +11,7 @@
 - [API 接口](#api-接口)
 - [环境变量](#环境变量)
 - [生产环境安全建议](#生产环境安全建议)
+- [生产环境性能建议](#生产环境性能建议)
 - [完整数据流](#完整数据流)
 - [数据模型](#数据模型)
 - [安全设计](#安全设计)
@@ -661,6 +662,63 @@ certbot --nginx -d your-domain.com
 
 系统默认允许代理目标指向任意地址（包括内网）。如需部署到公网，在 `.env` 中设置 `ALLOW_INTERNAL_TARGETS=false`。
 
+## 生产环境性能建议
+
+### MySQL InnoDB 缓冲池（重要）
+
+`requests` 表会持续膨胀（每条流式交互记录含请求/响应头、请求体、响应体等 LONGTEXT 字段，可达数百 KB~数 MB）。
+
+MySQL 默认的 `innodb_buffer_pool_size` 仅为 **128MB**——对于几十 GB 的表，这会导致：
+
+- 所有数据读取直接打磁盘，**任何触碰大表的操作都极慢**（实测读 1000 行需 15 秒）
+- 存量数据清理（`UPDATE`/`OPTIMIZE`）、历史查询、导出全部受拖累
+
+**建议调大到 2GB（或物理内存的 50-70%）。**
+
+#### 方式一：动态调整（临时，重启 MySQL 后失效）
+
+```sql
+SET GLOBAL innodb_buffer_pool_size = 2147483648;  -- 2GB（单位字节）
+```
+
+无需重启、立即生效，适合快速验证。但 MySQL 重启后恢复默认值，**仅用于临时应急**。
+
+#### 方式二：写入配置文件（持久化，推荐）
+
+在 MySQL 配置文件的 `[mysqld]` 段添加：
+
+```ini
+[mysqld]
+innodb_buffer_pool_size = 2G
+```
+
+配置文件位置（按读取优先级）：
+
+| 路径 | 说明 |
+|------|------|
+| `/etc/mysql/my.cnf` | 主配置（Debian/Ubuntu 常为符号链接） |
+| `/etc/mysql/conf.d/*.cnf` | 全局配置片段（推荐放这里，如 `mysql-performance.cnf`） |
+| `/etc/mysql/mariadb.conf.d/*.cnf` | MariaDB 专用片段 |
+
+> 这些路径属 root 所有，写入需要 `sudo`。修改后需重启 MySQL 生效：`sudo systemctl restart mysql`（或 `mariadb`）。
+
+#### 验证是否生效
+
+```sql
+SHOW VARIABLES LIKE 'innodb_buffer_pool_size';
+-- 期望输出 Value = 2147483648 (2GB)
+```
+
+#### 其他值得关注的 InnoDB 参数
+
+| 参数 | 建议值 | 说明 |
+|------|--------|------|
+| `innodb_log_file_size` | 512M~1G | 默认 48MB 偏小，大事务/大表 DDL 时日志频繁切换 |
+| `innodb_flush_log_at_trx_commit` | 1（默认） | 数据安全优先；可改 2 提升写入吞吐但最多丢 1 秒数据 |
+| `innodb_io_capacity` | 按磁盘类型 | SSD 建议 1000+，避免刷盘瓶颈 |
+
+> 调优后请重启 MySQL 并观察 `requests` 表查询/清理/导出速度，通常有数倍提升。
+
 ## 完整数据流
 
 ### 1. 用户注册
@@ -817,7 +875,7 @@ sequenceDiagram
 | `request_headers` / `request_body` | ✅ | ✅ |
 | `response_headers` | ✅ | ✅ |
 | `response_body` | JSON | 重建 JSON（失败时回退为原始文本） |
-| `response_body_raw` | 同 response_body | 完整原始 SSE 文本 |
+| `response_body_raw` | NULL（不冗余存储） | 仅重建失败时保存完整原始 SSE 文本，成功时为 NULL |
 | `status_code` | ✅ | ✅ |
 | `duration_ms` | ✅ | ✅ |
 | `reconstruction_error` | 始终 False | True = 重建失败（前端展示警告） |
@@ -826,7 +884,8 @@ sequenceDiagram
 
 - 端口被删除 → 记录仍写入，`port_id=NULL`
 - 端口被停用 → 进行中的请求正常记录，不再产生 `port_id=NULL` 的孤立行
-- SSE 重建失败 → `response_body_raw` 保留原始数据，`reconstruction_error=True`
+- SSE 重建成功 → `response_body` 已含完整响应 JSON，不再额外存储原始 SSE 文本（省去 5–70 倍冗余体积；原始 SSE 的 `data:` 前缀与分块元数据远大于最终 JSON）
+- SSE 重建失败 → `response_body_raw` 保留完整原始数据，`reconstruction_error=True`，前端展示警告并可按需查看原始文本
 - DB 写入失败 → 3 次重试
 - 进程被 kill → `shutdown_db_executor()` 设有 15 秒超时保护，防止卡住的 MySQL 连接阻塞进程退出
 
@@ -908,7 +967,7 @@ erDiagram
         longtext request_body "请求体 JSON"
         longtext response_headers "响应头 JSON"
         longtext response_body "响应 JSON（重建）"
-        longtext response_body_raw "原始 SSE 文本"
+        longtext response_body_raw "原始 SSE 文本（仅重建失败时保存，成功时为 NULL）"
         int status_code "HTTP 状态码"
         int duration_ms "请求耗时"
         bool reconstruction_error "SSE 重建失败"

@@ -119,7 +119,6 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
     # Forward the request
     status_code = 502
     resp_body_str = None
-    resp_body_raw_str = None
     full_body = None           # raw response bytes from upstream (non-streaming)
     resp_headers_json = "{}"
     resp_content_type = "application/json"
@@ -304,6 +303,10 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                                 reconstructed_json = raw_sse_text
 
                         duration_ms = int((time.time() - start_time) * 1000)
+                        # 原始 SSE 文本仅在重组失败时保存（response_body_raw）。
+                        # 重组成功时 response_body 已含完整响应 JSON，再存一份
+                        # 原始文本属于纯冗余——每条流式记录可省下数倍体积
+                        # （SSE 的 data: 前缀/事件元数据/分块边界远大于最终 JSON）。
                         _fire_and_forget_save(_save_record_async(
                             port_number, request.method,
                             forward_path
@@ -312,7 +315,9 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                             req_headers_json, req_body_str,
                             resp_headers_json, reconstructed_json,
                             status_code, duration_ms,
-                            resp_body_raw=raw_sse_text,
+                            resp_body_raw=(
+                                raw_sse_text if reconstruction_error else None
+                            ),
                             reconstruction_error=reconstruction_error,
                         ))
                     except Exception as e:
@@ -449,11 +454,6 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
             await stream_ctx.__aexit__(None, None, None)
             stream_owned_by_generator = False
             resp_body_str = _serialize_body(full_body, label="response")
-            try:
-                resp_body_raw_str = full_body.decode("utf-8", errors="replace")
-            except Exception as e:
-                logger.debug("Failed to decode full body as UTF-8, using response text: %s", e)
-                resp_body_raw_str = resp_body_str
 
     except httpx.TimeoutException as e:
         status_code = 504
@@ -501,16 +501,15 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
 
     # Save non-streaming record in background
     if not is_streaming:
-        # For non-streaming responses, resp_body_str holds the pretty-printed
-        # JSON; resp_body_raw_str holds the raw decoded response body so
-        # response_body_raw is populated consistently with the streaming path.
+        # 非流式响应：response_body 已保存完整响应内容（JSON 美化或原文），
+        # response_body_raw 与它信息等价，不再冗余存储，节省空间。
         _fire_and_forget_save(_save_record_async(
             port_number, request.method,
             forward_path + ("?" + query_string if query_string else ""),
             req_headers_json, req_body_str,
             resp_headers_json, resp_body_str,
             status_code, duration_ms,
-            resp_body_raw=resp_body_raw_str or resp_body_str,
+            resp_body_raw=None,
         ))
 
     # Return response with original content-type for non-streaming.
