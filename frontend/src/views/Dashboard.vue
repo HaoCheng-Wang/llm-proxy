@@ -15,7 +15,8 @@
               <th>代理地址</th>
               <th>目标地址</th>
               <th>描述</th>
-              <th v-if="auth.isAdmin">创建者</th>
+              <th>创建者</th>
+              <th>可见性</th>
               <th>请求数</th>
               <th>状态</th>
               <th>协议</th>
@@ -38,8 +39,14 @@
                 <span style="font-size:13px;word-break:break-all">{{ port.target_url }}</span>
               </td>
               <td>{{ port.description || '-' }}</td>
-              <td v-if="auth.isAdmin">
+              <td>
                 <span class="badge" style="background:var(--accent-bg-active);color:var(--accent)">{{ port.username || '-' }}</span>
+              </td>
+              <td>
+                <span :class="['badge', port.is_public ? 'badge-active' : 'badge-inactive']"
+                      :title="port.is_public ? '所有用户可见（只读）' : '仅创建者和管理员可见'">
+                  {{ port.is_public ? 'public' : '私有' }}
+                </span>
               </td>
               <td>{{ port.request_count }}</td>
               <td>
@@ -59,18 +66,20 @@
                   <button class="btn btn-outline btn-sm" @click="$router.push(`/port/${port.id}`)">
                     查看详情
                   </button>
-                  <button class="btn btn-outline btn-sm" @click="openEdit(port)" style="color:var(--color-warning);border-color:var(--color-warning-bg)">
-                    编辑
-                  </button>
-                  <button v-if="port.is_active" class="btn btn-warning btn-sm" @click="handleStop(port)">
-                    停用
-                  </button>
-                  <button v-else class="btn btn-success btn-sm" @click="handleStart(port)">
-                    启用
-                  </button>
-                  <button class="btn btn-danger btn-sm" @click="handleDelete(port)">
-                    删除
-                  </button>
+                  <template v-if="canManage(port)">
+                    <button class="btn btn-outline btn-sm" @click="openEdit(port)" style="color:var(--color-warning);border-color:var(--color-warning-bg)">
+                      编辑
+                    </button>
+                    <button v-if="port.is_active" class="btn btn-warning btn-sm" @click="handleStop(port)">
+                      停用
+                    </button>
+                    <button v-else class="btn btn-success btn-sm" @click="handleStart(port)">
+                      启用
+                    </button>
+                    <button class="btn btn-danger btn-sm" @click="handleDelete(port)">
+                      删除
+                    </button>
+                  </template>
                 </div>
               </td>
             </tr>
@@ -140,18 +149,20 @@
             <input v-model="createForm.description" class="form-input"
                    placeholder="用于区分不同用途的代理" />
           </div>
-          <div v-if="auth.isAdmin" class="form-group">
+          <div class="form-group">
             <label>👤 所属用户</label>
             <select v-model="createForm.user_id" class="form-input"
                     :disabled="usersLoading">
-              <option :value="null">— 选择用户（默认：自己）—</option>
-              <option v-for="u in userList" :key="u.id" :value="u.id"
+              <option :value="null">— 自己（默认）—</option>
+              <option v-if="auth.isAdmin" v-for="u in userList" :key="u.id" :value="u.id"
                       :disabled="!u.is_approved">
                 {{ u.username }} ({{ u.role === 'admin' ? '管理员' : u.is_approved ? '已审批' : '待审批' }})
               </option>
+              <option value="public">🌐 public（所有用户可见）</option>
             </select>
             <p style="font-size:12px;color:var(--text-muted);margin-top:4px">
-              管理员可为其他用户创建代理。默认创建给自己。只能为已审批用户创建。
+              <span v-if="auth.isAdmin">管理员可为其他用户创建代理，只能为已审批用户创建。</span>
+              选择 public 后，所有已登录用户都能在列表中看到该代理并查看交互记录，但只有你和管理员能编辑。
             </p>
           </div>
           <div class="form-group">
@@ -233,18 +244,21 @@
               {{ editForm.has_api_key ? '已配置自定义 Key。留空保存则保持不变；勾选上方选项可清除。' : '留空则透传智能体原始 Key；填写则替换智能体发送的认证头' }}
             </p>
           </div>
-          <div v-if="auth.isAdmin" class="form-group">
+          <div class="form-group">
             <label>👤 所属用户</label>
             <select v-model="editForm.user_id" class="form-input"
                     :disabled="usersLoading">
-              <option :value="null">— 不修改（保持当前用户）—</option>
-              <option v-for="u in userList" :key="u.id" :value="u.id"
+              <option v-if="!auth.isAdmin" :value="null">— 自己（私有）—</option>
+              <option v-else :value="null">— 不修改所属用户 —</option>
+              <option v-if="auth.isAdmin" v-for="u in userList" :key="u.id" :value="u.id"
                       :disabled="!u.is_approved">
                 {{ u.username }} ({{ u.role === 'admin' ? '管理员' : u.is_approved ? '已审批' : '待审批' }})
               </option>
+              <option value="public">🌐 public（所有用户可见）</option>
             </select>
             <p style="font-size:12px;color:var(--text-muted);margin-top:4px">
-              管理员可将代理转移给其他已审批用户。默认不修改。
+              <span v-if="auth.isAdmin">管理员可将代理转移给其他已审批用户。</span>
+              选 public：所有用户只读可见；选自己/其他用户：仅本人和管理员可见。
             </p>
           </div>
           <div class="form-group">
@@ -320,8 +334,11 @@ async function handleCreate() {
       prefer_http2: createForm.value.prefer_http2,
       api_key: createForm.value.api_key || undefined,
     }
-    // Only include user_id when admin explicitly selects a different user
-    if (auth.isAdmin && createForm.value.user_id !== null && createForm.value.user_id !== undefined) {
+    // 'public' → visible to all users (owner stays as the current user)
+    if (createForm.value.user_id === 'public') {
+      payload.is_public = true
+    } else if (auth.isAdmin && createForm.value.user_id !== null && createForm.value.user_id !== undefined) {
+      // Admin explicitly picked a different user → private port owned by them
       payload.user_id = createForm.value.user_id
     }
     await api.createPort(payload)
@@ -374,8 +391,12 @@ function openEdit(port) {
     id: port.id,
     port_number: port.port_number,
     _original_port_number: port.port_number,
-    user_id: null,  // admin-only: null = don't change
+    // Pre-select current visibility: 'public' for public ports, otherwise the
+    // owner (null = "myself / don't change").
+    user_id: port.is_public ? 'public'
+      : (auth.isAdmin && port.user_id !== auth.userId ? port.user_id : null),
     _original_user_id: port.user_id || null,
+    _original_is_public: !!port.is_public,
     target_url: port.target_url,
     description: port.description || '',
     prefer_http2: port.prefer_http2,  // null=not set yet, true/false=user picked
@@ -384,6 +405,12 @@ function openEdit(port) {
     clear_api_key: false,
   }
   showEditModal.value = true
+}
+
+// True for admins and the port owner — everyone else gets read-only access
+// (public ports are visible to all, but only the owner/admin can manage them).
+function canManage(port) {
+  return auth.isAdmin || port.user_id === auth.userId
 }
 
 async function handleEdit() {
@@ -422,11 +449,20 @@ async function handleEdit() {
       payload.api_key = editForm.value.api_key  // override with new value
     }
     // else: don't include api_key → backend treats as None → don't change
-    // user_id: only send when admin explicitly selects a different user
-    if (auth.isAdmin && editForm.value.user_id !== null && editForm.value.user_id !== undefined) {
-      if (editForm.value.user_id !== editForm.value._original_user_id) {
-        payload.user_id = editForm.value.user_id
+    // Owner/visibility mapping:
+    //  - 'public' → make public (owner unchanged)
+    //  - admin picks a specific user → transfer ownership + make private
+    //  - null (self / don't change) → if it was public, turn it private
+    const uid = editForm.value.user_id
+    if (uid === 'public') {
+      if (!editForm.value._original_is_public) payload.is_public = true
+    } else if (auth.isAdmin && uid !== null && uid !== undefined) {
+      if (uid !== editForm.value._original_user_id) {
+        payload.user_id = uid
+        if (editForm.value._original_is_public) payload.is_public = false
       }
+    } else if (uid === null && editForm.value._original_is_public) {
+      payload.is_public = false
     }
     await api.updatePort(editForm.value.id, payload)
     showEditModal.value = false

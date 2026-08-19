@@ -189,3 +189,35 @@ def user_headers(approved_user):
     """Authorization headers for regular approved user."""
     token = create_access_token({"user_id": approved_user.id, "role": "user"})
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest_asyncio.fixture
+async def second_user(setup_database):
+    """Create a second approved test user (for multi-user visibility tests)."""
+    db = database.SessionLocal()
+    try:
+        user = db.query(User).filter(User.username == "testuser2").first()
+        if not user:
+            user = User(
+                username="testuser2",
+                password_hash=hash_password("testpass2"),
+                role="user",
+                is_approved=True,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        else:
+            user.password_hash = hash_password("testpass2")
+            user.is_approved = True
+            db.commit()
+        yield user
+    finally:
+        db.close()
+
+
+@pytest.fixture
+def second_headers(second_user):
+    """Authorization headers for the second regular user."""
+    token = create_access_token({"user_id": second_user.id, "role": "user"})
+    return {"Authorization": f"Bearer {token}"}

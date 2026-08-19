@@ -43,6 +43,8 @@ class PortCreate(BaseModel):
     description: str = Field(default="", max_length=200)
     prefer_http2: Optional[bool] = None  # None=HTTP/1.1, set later on edit
     api_key: Optional[str] = Field(None, max_length=500)  # None=pass-through, set=override
+    # True = visible to all users (read-only). Owner/admin keep full control.
+    is_public: bool = False
     # Admin-only: specify which user this port belongs to.
     # When omitted, the port is created for the current user.
     # When set by a non-admin, the request is rejected.
@@ -61,6 +63,8 @@ class PortUpdate(BaseModel):
     description: Optional[str] = Field(None, max_length=200)
     prefer_http2: Optional[bool] = None  # None=don't change, False/True=set
     api_key: Optional[str] = Field(None, max_length=500)  # None=don't change, ""=clear, set=override
+    # None=don't change, True=make public, False=make private.
+    is_public: Optional[bool] = None
     # Admin-only: reassign port owner.  None=don't change.
     # Non-admin users cannot change the owner of any port.
     user_id: Optional[int] = None
@@ -73,6 +77,7 @@ class PortInfo(BaseModel):
     target_url: str
     description: str
     is_active: bool
+    is_public: bool = False  # True=visible to all users (read-only)
     prefer_http2: Optional[bool] = None  # None/False=HTTP/1.1, True=HTTP/2
     has_api_key: bool = False  # True if api_key is configured (actual value never exposed)
     deleted_at: Optional[datetime] = None

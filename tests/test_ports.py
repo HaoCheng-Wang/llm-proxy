@@ -670,3 +670,188 @@ async def test_port_list_includes_user_id(client, admin_headers):
     list_resp = await client.get("/api/ports", headers=admin_headers)
     for port in list_resp.json():
         assert "user_id" in port
+
+
+# ─────────────────────────────────────────────────────────────
+# Public port visibility (is_public)
+# ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_create_public_port(client, user_headers):
+    """A user can create a port with is_public=true."""
+    resp = await client.post("/api/ports", headers=user_headers, json={
+        "target_url": "https://httpbin.org",
+        "description": "Public port",
+        "is_public": True,
+    })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["is_public"] is True
+    assert data["user_id"]  # owner is the creator
+
+
+@pytest.mark.asyncio
+async def test_public_port_visible_to_other_user(client, user_headers, second_headers):
+    """Another user sees a public port in the list, including the creator name."""
+    create_resp = await client.post("/api/ports", headers=user_headers, json={
+        "target_url": "https://httpbin.org",
+        "description": "Public for all",
+        "is_public": True,
+    })
+    assert create_resp.status_code == 200
+    port_id = create_resp.json()["id"]
+
+    resp = await client.get("/api/ports", headers=second_headers)
+    assert resp.status_code == 200
+    found = [p for p in resp.json() if p["id"] == port_id]
+    assert found, "public port should be visible to another user"
+    assert found[0]["username"] == "testuser"  # creator name visible to non-owner
+    assert found[0]["is_public"] is True
+
+
+@pytest.mark.asyncio
+async def test_public_port_history_visible_to_other_user(client, user_headers, second_headers):
+    """Another user can read a public port's history stream (with creator name)."""
+    create_resp = await client.post("/api/ports", headers=user_headers, json={
+        "target_url": "https://httpbin.org",
+        "description": "Public history",
+        "is_public": True,
+    })
+    port_id = create_resp.json()["id"]
+
+    resp = await client.get(f"/api/ports/{port_id}", headers=second_headers)
+    assert resp.status_code == 200
+    text = resp.text
+    assert "port_number" in text  # first NDJSON line is port metadata
+    assert "testuser" in text     # creator name included in metadata
+
+
+@pytest.mark.asyncio
+async def test_public_port_export_visible_to_other_user(client, user_headers, second_headers):
+    """Another user can export and create download tickets for a public port."""
+    create_resp = await client.post("/api/ports", headers=user_headers, json={
+        "target_url": "https://httpbin.org",
+        "description": "Public export",
+        "is_public": True,
+    })
+    port_id = create_resp.json()["id"]
+
+    resp = await client.get(f"/api/ports/{port_id}/export?format=simple", headers=second_headers)
+    assert resp.status_code == 200
+
+    ticket_resp = await client.post(f"/api/ports/{port_id}/export-ticket", headers=second_headers)
+    assert ticket_resp.status_code == 200
+    assert "ticket" in ticket_resp.json()
+
+
+@pytest.mark.asyncio
+async def test_public_port_write_denied_for_other_user(client, user_headers, second_headers):
+    """Another user cannot edit/stop/start/delete/clear a public port (read-only)."""
+    create_resp = await client.post("/api/ports", headers=user_headers, json={
+        "target_url": "https://httpbin.org",
+        "description": "Read-only public",
+        "is_public": True,
+    })
+    port_id = create_resp.json()["id"]
+
+    # PUT (edit)
+    resp = await client.put(f"/api/ports/{port_id}", headers=second_headers, json={
+        "description": "hijack"
+    })
+    assert resp.status_code == 403
+    # stop
+    resp = await client.post(f"/api/ports/{port_id}/stop", headers=second_headers)
+    assert resp.status_code == 403
+    # start
+    resp = await client.post(f"/api/ports/{port_id}/start", headers=second_headers)
+    assert resp.status_code == 403
+    # delete
+    resp = await client.delete(f"/api/ports/{port_id}", headers=second_headers)
+    assert resp.status_code == 403
+    # clear history
+    resp = await client.delete(f"/api/ports/{port_id}/history", headers=second_headers)
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_private_port_invisible_to_other_user(client, user_headers, second_headers):
+    """A private port stays invisible to other users (regression)."""
+    create_resp = await client.post("/api/ports", headers=user_headers, json={
+        "target_url": "https://httpbin.org",
+        "description": "Private",
+    })
+    port_id = create_resp.json()["id"]
+    assert create_resp.json()["is_public"] is False
+
+    resp = await client.get("/api/ports", headers=second_headers)
+    ids = [p["id"] for p in resp.json()]
+    assert port_id not in ids
+
+    resp = await client.get(f"/api/ports/{port_id}", headers=second_headers)
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_update_port_toggle_public(client, user_headers, second_headers):
+    """Owner can toggle is_public on/off via PUT."""
+    create_resp = await client.post("/api/ports", headers=user_headers, json={
+        "target_url": "https://httpbin.org",
+        "description": "Toggle",
+    })
+    port_id = create_resp.json()["id"]
+
+    # Make public
+    resp = await client.put(f"/api/ports/{port_id}", headers=user_headers, json={
+        "is_public": True
+    })
+    assert resp.status_code == 200
+    assert resp.json()["is_public"] is True
+
+    resp = await client.get("/api/ports", headers=second_headers)
+    assert port_id in [p["id"] for p in resp.json()]
+
+    # Make private again
+    resp = await client.put(f"/api/ports/{port_id}", headers=user_headers, json={
+        "is_public": False
+    })
+    assert resp.status_code == 200
+    assert resp.json()["is_public"] is False
+
+    resp = await client.get("/api/ports", headers=second_headers)
+    assert port_id not in [p["id"] for p in resp.json()]
+
+
+@pytest.mark.asyncio
+async def test_public_port_hidden_after_delete(client, user_headers, second_headers):
+    """A soft-deleted public port disappears from other users' lists."""
+    create_resp = await client.post("/api/ports", headers=user_headers, json={
+        "target_url": "https://httpbin.org",
+        "description": "Soon deleted",
+        "is_public": True,
+    })
+    port_id = create_resp.json()["id"]
+
+    resp = await client.delete(f"/api/ports/{port_id}", headers=user_headers)
+    assert resp.status_code == 200
+
+    resp = await client.get("/api/ports", headers=second_headers)
+    assert port_id not in [p["id"] for p in resp.json()]
+
+    # Direct history access also denied after delete
+    resp = await client.get(f"/api/ports/{port_id}", headers=second_headers)
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_active_ports_includes_public(client, user_headers, second_headers):
+    """active-ports returns public ports to other users too."""
+    create_resp = await client.post("/api/ports", headers=user_headers, json={
+        "target_url": "https://httpbin.org",
+        "description": "Active public",
+        "is_public": True,
+    })
+    port_number = create_resp.json()["port_number"]
+
+    resp = await client.get("/api/ports/active-ports", headers=second_headers)
+    assert resp.status_code == 200
+    assert port_number in resp.json()

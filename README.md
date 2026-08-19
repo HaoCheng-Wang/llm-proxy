@@ -1,6 +1,6 @@
 # LLM Proxy — 智能体与大模型 API 通信拦截记录系统
 
-截获和记录智能体与大模型 API 之间 HTTP 通信的代理系统。支持流式/非流式请求、SSE 重组为完整 JSON、JSON 树形查看、实时刷新、多用户隔离。
+截获和记录智能体与大模型 API 之间 HTTP 通信的代理系统。支持流式/非流式请求、SSE 重组为完整 JSON、JSON 树形查看、实时刷新、多用户隔离、**代理公开共享（public）**。
 
 ## 目录
 
@@ -55,7 +55,7 @@ flowchart LR
 | 编号 | 5 位随机数，系统分配，永不冲突；**管理员可编辑**代理编号（10000–99999） |
 | 服务器 | 单进程 FastAPI + asyncio，一个端口处理千级并发 |
 | 配置存储 | MySQL，所有状态持久化，内存缓存 + TTL 加速 |
-| 多用户 | 用户注册/登录，JWT 认证，代理按用户隔离；**管理员可创建/转移代理归属** |
+| 多用户 | 用户注册/登录，JWT 认证，代理按用户隔离；**管理员可创建/转移代理归属**；**代理可设为 public，对所有用户只读可见** |
 | 安全 | JWT 认证 + bcrypt + SSRF 防护 + CORS + 管理员专属操作权限校验 |
 | 转发协议 | HTTP/1.1 默认 + HTTP/2 按端口可选择 |
 | API Key 覆盖 | 按端口可选配置专属 api_key，替换智能体原始认证头 |
@@ -543,8 +543,9 @@ flowchart TD
 | 功能 | 实现 |
 |------|------|
 | 实时刷新 | 端口详情页每 2 秒轮询 `GET /api/ports/{id}?since_id=N`，仅拉取新记录 |
-| 代理编辑 | 管理员可编辑代理编号（5 位数字）、目标地址、转发协议、API Key、**所属用户（可转移给其他用户）** |
-| 用户筛选 | 管理员创建/编辑代理时可通过下拉框选择归属用户，仅可选已审批用户 |
+| 代理编辑 | 管理员可编辑代理编号（5 位数字）、目标地址、转发协议、API Key、**所属用户（可转移给其他用户）**；所有用户可切换 **public（所有用户可见）** |
+| 用户筛选 | 管理员创建/编辑代理时可通过下拉框选择归属用户，仅可选已审批用户；所有用户可选 **🌐 public（所有用户可见）** |
+| 公开代理 | 设为 public 的代理对所有已登录用户**只读可见**：列表可见（含创建者名字）、详情页可查看交互记录、可导出；编辑/启停/删除/清空历史仍仅限创建者和管理员；关闭 public 后其他用户立即不可见 |
 | 交互筛选 | 按请求方法分类：`📤 API请求`（POST/PUT/PATCH/DELETE）vs `🌐 其他`（GET/OPTIONS/HEAD） |
 | JSON 树形查看 | 基于 `vue-json-pretty`，请求和响应 JSON 各有独立树形查看按钮，支持折叠/展开/搜索 |
 | 重建异常审查 | 当 `reconstruction_error=True` 时显示橙色警告横幅，提供"查看完整 SSE 原始文本"按钮 |
@@ -577,11 +578,11 @@ flowchart TD
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/ports` | 创建代理（管理员可通过 `user_id` 为其他用户创建） |
-| GET | `/api/ports` | 列出代理（支持 `skip`/`limit` 分页参数，默认 0/5000，响应含 `user_id`） |
-| GET | `/api/ports/active-ports` | 获取所有活跃端口号 |
-| GET | `/api/ports/{id}` | 代理详情 + 交互历史（流式 NDJSON，分页，首行元数据含 `user_id`） |
-| PUT | `/api/ports/{id}` | 编辑代理（含转发协议、api_key、编号修改、管理员可转移归属） |
+| POST | `/api/ports` | 创建代理（管理员可通过 `user_id` 为其他用户创建；`is_public=true` 对所有用户只读可见） |
+| GET | `/api/ports` | 列出代理（支持 `skip`/`limit` 分页参数，默认 0/5000，响应含 `user_id`/`is_public`/`username`；非管理员可见自己的代理 + 所有 public 代理） |
+| GET | `/api/ports/active-ports` | 获取所有活跃端口号（非管理员含 public 代理） |
+| GET | `/api/ports/{id}` | 代理详情 + 交互历史（流式 NDJSON，分页，首行元数据含 `user_id`/`is_public`/`username`；public 代理对所有用户可读） |
+| PUT | `/api/ports/{id}` | 编辑代理（含转发协议、api_key、编号修改、`is_public` 开关、管理员可转移归属） |
 | DELETE | `/api/ports/{id}` | 软删除（可恢复） |
 | POST | `/api/ports/{id}/stop` | 停用 |
 | POST | `/api/ports/{id}/start` | 启用 |
@@ -951,6 +952,7 @@ erDiagram
         string target_url "目标 API 地址"
         string description "用途描述"
         bool is_active "是否启用"
+        bool is_public "是否公开（所有用户只读可见）"
         bool prefer_http2 "HTTP/2 开关"
         string api_key "API Key 覆盖"
         datetime deleted_at "软删除时间"

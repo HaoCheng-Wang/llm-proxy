@@ -27,6 +27,7 @@ class Port(Base):
     target_url = Column(String(500), nullable=False)
     description = Column(String(200), default="")
     is_active = Column(Boolean, default=True)
+    is_public = Column(Boolean, nullable=False, default=False)  # True=visible to all users (read-only)
     prefer_http2 = Column(Boolean, nullable=True)  # NULL=HTTP/1.1, False=HTTP/1.1, True=HTTP/2
     api_key = Column(String(500), nullable=True)   # NULL=pass-through, set=override agent's key
     deleted_at = Column(DateTime, nullable=True)

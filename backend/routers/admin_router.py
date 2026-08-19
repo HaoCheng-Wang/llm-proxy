@@ -292,6 +292,7 @@ def list_deleted_ports(
             target_url=port.target_url,
             description=port.description or "",
             is_active=port.is_active,
+            is_public=port.is_public,
             prefer_http2=port.prefer_http2,
             has_api_key=port.api_key is not None,
             deleted_at=port.deleted_at,

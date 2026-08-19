@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, defer
-from sqlalchemy import func, text
+from sqlalchemy import func, or_, text
 from sqlalchemy.exc import IntegrityError
 import database
 from database import get_db, get_raw_connection, warn_fragmented_raw
@@ -59,6 +59,24 @@ def _consume_ticket(ticket: str) -> tuple[int, int] | None:
     if expires_at < time.time():
         return None
     return (port_id, user_id)
+
+
+def _check_view_access(port: Port, current_user: User) -> None:
+    """Authorize read access to a port's data (history, raw SSE, export).
+
+    Allowed: admins, the port owner, and — for public ports — any approved
+    user.  Public ports are read-only for non-owners: mutations (edit, stop/
+    start, delete, clear history) keep the stricter owner/admin check in the
+    write endpoints below.  Soft-deleted public ports are NOT visible to
+    non-owners.
+    """
+    if current_user.role == "admin":
+        return
+    if port.user_id == current_user.id:
+        return
+    if port.is_public and port.deleted_at is None:
+        return
+    raise HTTPException(status_code=403, detail="Access denied")
 
 
 def _is_private_ip(hostname: str) -> bool:
@@ -280,6 +298,7 @@ def create_port(
             description=data.description,
             prefer_http2=data.prefer_http2,
             api_key=data.api_key or None,
+            is_public=data.is_public,
             is_active=True,
         )
         db.add(port)
@@ -306,6 +325,7 @@ def create_port(
         target_url=port.target_url,
         description=port.description or "",
         is_active=port.is_active,
+        is_public=port.is_public,
         prefer_http2=port.prefer_http2,
         has_api_key=port.api_key is not None,
         created_at=port.created_at,
@@ -330,8 +350,12 @@ def list_ports(
     if current_user.role == "admin":
         ports = db.query(Port).filter(Port.deleted_at.is_(None)).order_by(Port.created_at.desc()).offset(skip).limit(limit).all()
     else:
+        # Own ports + public ports (public = visible read-only to all users)
         ports = db.query(Port).filter(
-            Port.user_id == current_user.id,
+            or_(
+                Port.user_id == current_user.id,
+                Port.is_public.is_(True),
+            ),
             Port.deleted_at.is_(None),
         ).order_by(Port.created_at.desc()).offset(skip).limit(limit).all()
 
@@ -347,12 +371,12 @@ def list_ports(
     ).group_by(RequestModel.port_id).all()
     count_map = {row[0]: row[1] for row in count_rows}
 
-    # Batch-fetch creator usernames for all ports in a single query (admin only)
+    # Batch-fetch creator usernames for all ports in a single query —
+    # returned to everyone so non-owners can see the creator of public ports.
     username_map: dict[int, str] = {}
-    if current_user.role == "admin":
-        user_ids = {p.user_id for p in ports}
-        users = db.query(User.id, User.username).filter(User.id.in_(user_ids)).all()
-        username_map = {u.id: u.username for u in users}
+    user_ids = {p.user_id for p in ports}
+    users = db.query(User.id, User.username).filter(User.id.in_(user_ids)).all()
+    username_map = {u.id: u.username for u in users}
 
     result = []
     for port in ports:
@@ -363,6 +387,7 @@ def list_ports(
             target_url=port.target_url,
             description=port.description or "",
             is_active=port.is_active,
+            is_public=port.is_public,
             prefer_http2=port.prefer_http2,
             has_api_key=port.api_key is not None,
             created_at=port.created_at,
@@ -384,7 +409,10 @@ def get_active_port_numbers(
         ).all()
     else:
         ports = db.query(Port.port_number).filter(
-            Port.user_id == current_user.id,
+            or_(
+                Port.user_id == current_user.id,
+                Port.is_public.is_(True),
+            ),
             Port.is_active.is_(True),
             Port.deleted_at.is_(None),
         ).all()
@@ -416,8 +444,7 @@ def get_port_history(
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
 
-    if current_user.role != "admin" and port.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    _check_view_access(port, current_user)
 
     # ── Count + creator on request-scoped session (cheap, happens once) ──
     request_count = db.query(func.count(RequestModel.id)).filter(
@@ -435,6 +462,7 @@ def get_port_history(
         "target_url": port.target_url,
         "description": port.description or "",
         "is_active": port.is_active,
+        "is_public": port.is_public,
         "prefer_http2": port.prefer_http2,
         "has_api_key": port.api_key is not None,
         "deleted_at": port.deleted_at,
@@ -728,6 +756,10 @@ def update_port(
         if data.api_key is not None:
             port.api_key = data.api_key.strip() or None
 
+        # is_public: None=don't change, True=make public, False=make private
+        if data.is_public is not None:
+            port.is_public = data.is_public
+
         if new_port_number is not None and new_port_number != port.port_number:
             port.port_number = new_port_number
 
@@ -772,6 +804,7 @@ def update_port(
         target_url=port.target_url,
         description=port.description or "",
         is_active=port.is_active,
+        is_public=port.is_public,
         prefer_http2=port.prefer_http2,
         has_api_key=port.api_key is not None,
         created_at=port.created_at,
@@ -889,8 +922,7 @@ def get_single_request(
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
 
-    if current_user.role != "admin" and port.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    _check_view_access(port, current_user)
 
     req_record = db.query(RequestModel).filter(
         RequestModel.id == request_id,
@@ -932,8 +964,7 @@ def get_raw_sse(
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
 
-    if current_user.role != "admin" and port.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    _check_view_access(port, current_user)
 
     row = (
         db.query(RequestModel.response_body_raw)
@@ -962,8 +993,7 @@ def create_export_ticket(
     port = db.query(Port).filter(Port.id == port_id).first()
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
-    if current_user.role != "admin" and port.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    _check_view_access(port, current_user)
 
     ticket = _create_ticket(port_id, current_user.id)
     return {"ticket": ticket, "expires_in": _DOWNLOAD_TICKET_TTL}
@@ -1042,12 +1072,7 @@ def export_port_history(
         logger.warning("Export: port=%d not found", port_id)
         raise HTTPException(status_code=404, detail="Port not found")
 
-    if current_user.role != "admin" and port.user_id != current_user.id:
-        logger.warning(
-            "Export: access denied port=%d owner=%d user=%d",
-            port_id, port.user_id, current_user.id,
-        )
-        raise HTTPException(status_code=403, detail="Access denied")
+    _check_view_access(port, current_user)
     logger.info(
         "Export port lookup: port_number=%d target=%s elapsed=%.3fs",
         port.port_number, port.target_url, time.time() - _t_port,

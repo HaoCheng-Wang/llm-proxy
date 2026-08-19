@@ -49,6 +49,7 @@
           </button>
         </div>
         <button
+          v-if="canManage"
           class="btn btn-danger btn-sm"
           :disabled="!!data.port?.deleted_at"
           :title="data.port?.deleted_at ? '请先到已删除端口页面恢复此代理后再清空历史' : '清空全部历史'"
@@ -64,6 +65,14 @@
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:14px">
         <div><span class="text-muted">目标地址：</span>{{ data.port.target_url }}</div>
         <div><span class="text-muted">描述：</span>{{ data.port.description || '-' }}</div>
+        <div><span class="text-muted">创建者：</span>{{ data.port.username || '-' }}</div>
+        <div>
+          <span class="text-muted">可见性：</span>
+          <span :class="['badge', data.port.is_public ? 'badge-active' : 'badge-inactive']"
+                :title="data.port.is_public ? '所有用户可见（只读）' : '仅创建者和管理员可见'">
+            {{ data.port.is_public ? 'public（所有用户可见）' : '私有' }}
+          </span>
+        </div>
         <div><span class="text-muted">编号：</span><code>{{ data.port.port_number }}</code></div>
         <div><span class="text-muted">总请求数：</span>{{ data.port.request_count }}</div>
         <div>
@@ -251,7 +260,9 @@
 import { ref, reactive, computed, onMounted, onUnmounted, inject, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api from '../api'
+import { useAuthStore } from '../stores/auth'
 
+const auth = useAuthStore()
 const route = useRoute()
 const router = useRouter()
 const showToast = inject('showToast')
@@ -284,6 +295,13 @@ const isApiMethod = (m) => ['post', 'put', 'patch', 'delete'].includes(m.toLower
 
 const apiCount = computed(() => requests.value.filter(r => isApiMethod(r.method)).length)
 const otherCount = computed(() => requests.value.filter(r => !isApiMethod(r.method)).length)
+
+// Only the owner (or admin) can clear history — public ports are read-only
+// for everyone else.
+const canManage = computed(() => {
+  if (!data.value.port) return false
+  return auth.isAdmin || data.value.port.user_id === auth.userId
+})
 
 const filteredRequests = computed(() => {
   if (methodFilter.value === 'api') return requests.value.filter(r => isApiMethod(r.method))
