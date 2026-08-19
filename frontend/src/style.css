@@ -1070,6 +1070,51 @@ table tr:hover td {
   gap: 10px;
 }
 
+/* Public-visibility switch card (independent of the owner dropdown) */
+.public-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  background: var(--white-fade);
+}
+
+.public-option:hover {
+  border-color: var(--border-hover);
+  background: var(--white-fade-hover);
+}
+
+.public-option.active {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+
+.public-option input[type="checkbox"] {
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+.public-info {
+  flex: 1;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.public-info strong {
+  color: var(--text-primary);
+}
+
+.public-desc {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
 .protocol-option {
   display: flex;
   align-items: flex-start;
