@@ -14,7 +14,12 @@ import httpx
 import certifi
 import database
 from models import Port, Request as RequestModel
-from config import PORT_CACHE_TTL, HTTPX_MAX_KEEPALIVE_CONNECTIONS, DB_SAVE_FIELD_MAX_BYTES
+from config import (
+    PORT_CACHE_TTL,
+    HTTPX_MAX_KEEPALIVE_CONNECTIONS,
+    DB_SAVE_FIELD_MAX_BYTES,
+    SSE_RECONSTRUCT_MAX_BYTES,
+)
 
 logger = logging.getLogger("llm_proxy.proxy")
 
@@ -370,13 +375,30 @@ def _save_to_db(port_number: int, method: str, path: str,
                 resp_headers: str, resp_body: str | None,
                 status_code: int, duration_ms: int,
                 resp_body_raw: str | None = None,
-                reconstruction_error: bool = False):
+                reconstruction_error: bool = False,
+                stream_buf=None):
     """Save a request/response record to the database. Runs in a thread.
     Retries up to 3 times on transient connection errors.
+
+    When ``stream_buf`` is given it is the raw SSE spool for a streaming
+    response: the body is decoded and reconstructed here, inside the worker
+    thread, rather than on the event loop.  The buffer is consumed once and
+    always closed, so it must not be reused after this call.
 
     Uses the dedicated log engine (LogSessionLocal) so that burst writes from
     proxy logging never compete with FastAPI management API connections.
     """
+    if stream_buf is not None:
+        try:
+            resp_body, resp_body_raw, reconstruction_error = (
+                _finalize_stream_body(stream_buf, port_number)
+            )
+        finally:
+            try:
+                stream_buf.close()
+            except Exception as e:
+                logger.debug("Failed to close stream buffer: %s", e)
+
     last_error = None
     for attempt in range(3):
         db = database.LogSessionLocal()
@@ -438,23 +460,40 @@ async def _save_record_async(port_number: int, method: str, path: str,
                               resp_headers: str, resp_body: str | None,
                               status_code: int, duration_ms: int,
                               resp_body_raw: str | None = None,
-                              reconstruction_error: bool = False):
+                              reconstruction_error: bool = False,
+                              stream_buf=None):
     """Async wrapper — runs the sync DB save in the dedicated log thread pool.
 
     Uses ``database._db_executor`` (configured via DB_SAVE_WORKERS) so that
     burst log writes never compete with asyncio's default thread pool.
+
+    ``stream_buf`` (raw SSE spool) is passed through and consumed in the
+    worker thread, keeping decode + reconstruction off the event loop.
     """
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        database._db_executor,
-        _save_to_db,
-        port_number, method, path,
-        req_headers, req_body,
-        resp_headers, resp_body,
-        status_code, duration_ms,
-        resp_body_raw,
-        reconstruction_error,
-    )
+    try:
+        await loop.run_in_executor(
+            database._db_executor,
+            _save_to_db,
+            port_number, method, path,
+            req_headers, req_body,
+            resp_headers, resp_body,
+            status_code, duration_ms,
+            resp_body_raw,
+            reconstruction_error,
+            stream_buf,
+        )
+    except BaseException:
+        # The worker never ran (cancelled during shutdown drain, or the
+        # executor is already shut down), so _save_to_db's finally — the
+        # normal closer — will not fire.  Close it here or the spool file
+        # leaks until GC.  Harmless if it did run: close() is idempotent.
+        if stream_buf is not None:
+            try:
+                stream_buf.close()
+            except Exception as e:
+                logger.debug("Failed to close stream buffer: %s", e)
+        raise
 
 
 # Headers to exclude when forwarding
@@ -478,6 +517,7 @@ __all__ = [
     "_serialize_body",
     "_save_to_db",
     "_save_record_async",
+    "_finalize_stream_body",
     "_truncate_if_oversized",
     "_sanitize_text",
     "_fire_and_forget_save",
@@ -485,6 +525,83 @@ __all__ = [
     "_reconstruct_sse_to_json",
     "EXCLUDE_HEADERS",
 ]
+
+
+def _finalize_stream_body(resp_buf, port_number: int):
+    """Read a buffered SSE stream for storage: (response_body,
+    response_body_raw, reconstruction_error).
+
+    MUST run off the event loop (it is called from ``_save_to_db``, which
+    already executes in the DB thread pool).  Decoding and reconstruction are
+    O(body size) CPU work; doing them on the loop stalls every other in-flight
+    request for the duration.
+
+    Takes ownership of ``resp_buf`` only in the sense that it reads it — the
+    caller closes it.
+    """
+    resp_buf.seek(0)
+    # Guard: get the file size without reading it into memory.
+    # SpooledTemporaryFile.rollover() replaces _file with a real file;
+    # in-memory BytesIO supports tell() too.  If unsupported, fall back to
+    # reading the whole thing.
+    try:
+        buf_size = resp_buf.seek(0, 2)  # seek to end
+        resp_buf.seek(0)                 # back to start
+    except Exception:
+        buf_size = None
+
+    if buf_size is not None and buf_size > SSE_RECONSTRUCT_MAX_BYTES:
+        # Stream is too large — skip reconstruction and keep only the first
+        # SSE_RECONSTRUCT_MAX_BYTES bytes with a truncation warning.
+        logger.warning(
+            "SSE stream for port %d is %d bytes (limit %d) — truncating raw "
+            "text and skipping JSON reconstruction",
+            port_number, buf_size, SSE_RECONSTRUCT_MAX_BYTES,
+        )
+        truncated = resp_buf.read(SSE_RECONSTRUCT_MAX_BYTES)
+        raw_sse_text = truncated.decode("utf-8", errors="replace")
+        raw_sse_text += (
+            f"\n\n[TRUNCATED: {buf_size} bytes total, "
+            f"only first {SSE_RECONSTRUCT_MAX_BYTES} bytes saved]"
+        )
+        # The truncated text is the only copy we keep.  Storing it in
+        # response_body *and* response_body_raw would make the row ~2x this
+        # size, past MySQL's max_allowed_packet (64 MiB here) — the INSERT
+        # would fail and the record would be lost entirely.
+        return raw_sse_text, None, True
+
+    full_body = resp_buf.read()
+    if not full_body:
+        return None, None, False
+
+    raw_sse_text = full_body.decode("utf-8", errors="replace")
+    # Release the raw bytes now: decode() has already copied everything, and
+    # holding both doubles peak memory in this worker for the largest streams.
+    del full_body
+    try:
+        reconstructed_json = _reconstruct_sse_to_json(raw_sse_text)
+    except Exception as recon_err:
+        logger.warning(
+            "SSE reconstruction failed for port %d: %s: %s — saving raw text",
+            port_number, type(recon_err).__name__, recon_err,
+        )
+        reconstructed_json = raw_sse_text
+
+    reconstruction_error = (
+        reconstructed_json is None
+        or (isinstance(reconstructed_json, str)
+            and reconstructed_json.lstrip().startswith("data:"))
+    )
+    if reconstruction_error and reconstructed_json is None:
+        reconstructed_json = raw_sse_text
+
+    # 原始 SSE 文本仅在重组失败时保存（response_body_raw）。
+    # 重组成功时 response_body 已含完整响应 JSON，再存一份原始文本属于纯冗余
+    # ——每条流式记录可省下数倍体积（SSE 的 data: 前缀/事件元数据/分块边界
+    # 远大于最终 JSON）。
+    return (reconstructed_json,
+            raw_sse_text if reconstruction_error else None,
+            reconstruction_error)
 
 
 def _serialize_body(body_bytes: bytes, label: str = "body") -> str | None:

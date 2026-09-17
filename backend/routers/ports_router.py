@@ -79,6 +79,43 @@ def _check_view_access(port: Port, current_user: User) -> None:
     raise HTTPException(status_code=403, detail="Access denied")
 
 
+def _drop_export_connection(session, port_number: int = 0):
+    """Destroy the raw MySQL socket without draining unread rows.
+
+    PyMySQL spins on the socket until it has read *every* remaining packet when
+    the server-side result set is still active (`_finish_unbuffered_query`):
+    "there is, in fact, no way to stop MySQL from sending all the data after
+    executing a query, so we just spin, and wait for an EOF packet".  For a
+    20k-row export that is gigabytes of synchronous reads.
+
+    The drain is triggered both by `SSCursor.close()` and by *any* later command
+    on the same connection — including the ROLLBACK that `Session.close()`
+    issues.  Killing the socket first makes all of them fail instantly:
+    `_execute_command` begins with `if not self._sock: raise InterfaceError`,
+    and the drain's `_read_packet` raises instead of blocking.
+
+    This is the export path's only zombie protection, so it must run before
+    `invalidate()` on every abandon path.
+    """
+    try:
+        conn = session.connection()      # NB: a method, not an attribute
+        dbapi = conn.connection
+        raw = getattr(dbapi, "driver_connection", dbapi)
+        raw._force_close()
+        # Mark any active server-side result as dead too, so a later cursor
+        # close short-circuits rather than raising into an unraisable warning.
+        result = getattr(raw, "_result", None)
+        if result is not None and getattr(result, "unbuffered_active", False):
+            result.unbuffered_active = False
+    except Exception:
+        # Logged rather than silently swallowed: a bare `except: pass` here
+        # once hid the fact that this call was a no-op.
+        logger.debug(
+            "Export force-drop failed for port=%d — the connection will be "
+            "invalidated instead", port_number, exc_info=True,
+        )
+
+
 def _is_private_ip(hostname: str) -> bool:
     """Check if a hostname resolves to a private/internal IP address."""
     # Direct IP check
@@ -1172,15 +1209,31 @@ def export_port_history(
         parts.append(b'}')
         return b"".join(parts)
 
-    async def stream_jsonl():
+    def stream_jsonl():
+        # Sync generator: Starlette iterates it in a worker thread
+        # (anyio.to_thread), so the blocking SSCursor fetches never occupy the
+        # event loop.  An async generator here would freeze the whole API for
+        # the duration of every large export.
+        #
+        # Note the limit of that guarantee: Starlette 1.x's
+        # iterate_in_threadpool never closes a sync iterator, and uvicorn
+        # (ASGI < 2.4) cancels the stream without aclosing it, so on abandon
+        # this generator is closed only when it is garbage-collected — and
+        # that finalization runs on the EVENT LOOP thread.  The teardown is
+        # therefore made cheap rather than off-loop: the finally block
+        # force-drops the socket before invalidate(), and with the socket gone
+        # every drain path fails instantly instead of reading gigabytes.
         own_db = database.StreamSessionLocal()
         _row_count = 0
         # Same pool-hygiene rule as stream_ndjson: only a fully-consumed
         # result set may return its connection to the pool.  Any early exit
         # discards the connection (SSCursor may hold unread rows).
         _export_completed = False
-        # 30-minute hard cap so a stalled export cannot hog a pool slot forever.
-        _export_deadline = time.monotonic() + 1800.0
+        # No wall-clock cap: HTTP has no download timeout, so the transfer
+        # completes whenever the client keeps reading.  Zombie protection does
+        # not rely on a deadline — an abandoned export is force-dropped in the
+        # finally below, and a worker blocked on a fetch is bounded by MySQL's
+        # read_timeout (600s) before its connection is discarded.
         try:
             # Build query, deferring columns the output format does not need.
             _deferred = [RequestModel.response_body_raw]  # never needed for export
@@ -1219,20 +1272,10 @@ def export_port_history(
                             yield b","
                         first = False
                         yield _build_simple_row(r, idx)
-                        # Heartbeat: check client connection every 100 rows
-                        if idx % 100 == 0:
-                            if await request.is_disconnected():
-                                logger.info("Export client disconnected: port=%d rows=%d", _port_number, _row_count)
-                                return
-                            if time.monotonic() > _export_deadline:
-                                logger.warning(
-                                    "Export deadline exceeded: port=%d rows=%d — aborting",
-                                    _port_number, _row_count,
-                                )
-                                return
                     yield b"]"
                 except GeneratorExit:
                     logger.info("Export cancelled by client: port=%d rows=%d", _port_number, _row_count)
+                    # Teardown happens once, in the outer finally.
                     return
                 except Exception as _export_err:
                     logger.error("Export interrupted: port=%d %d rows — %s: %s",
@@ -1246,6 +1289,12 @@ def export_port_history(
                     }, ensure_ascii=False).encode("utf-8")
                     yield _err_obj
                     yield b"]"
+                    # Incomplete: return so _export_completed stays False and
+                    # the finally discards the connection instead of closing
+                    # it.  Falling through would send a close() -> ROLLBACK to
+                    # a connection whose server-side result set is still live,
+                    # and PyMySQL answers that by draining every unread row.
+                    return
             else:
                 # Full: {"port":{...},"requests":[...]}
                 yield b'{"port":'
@@ -1267,20 +1316,10 @@ def export_port_history(
                             yield b","
                         first = False
                         yield _build_full_row(r)
-                        # Heartbeat: check client connection every 100 rows
-                        if row % 100 == 0:
-                            if await request.is_disconnected():
-                                logger.info("Export client disconnected: port=%d rows=%d", _port_number, _row_count)
-                                return
-                            if time.monotonic() > _export_deadline:
-                                logger.warning(
-                                    "Export deadline exceeded: port=%d rows=%d — aborting",
-                                    _port_number, _row_count,
-                                )
-                                return
                     yield b"]}"
                 except GeneratorExit:
                     logger.info("Export cancelled by client: port=%d rows=%d", _port_number, _row_count)
+                    # Teardown happens once, in the outer finally.
                     return
                 except Exception as _export_err:
                     logger.error("Export interrupted: port=%d %d rows — %s: %s",
@@ -1294,12 +1333,18 @@ def export_port_history(
                     }, ensure_ascii=False).encode("utf-8")
                     yield _err_obj
                     yield b'],"_export_error":"incomplete"}'
+                    # Incomplete — see the simple-format branch above.
+                    return
 
             _export_completed = True
             logger.info("Export finished: port=%d %d rows", _port_number, _row_count)
         finally:
+            # Single teardown point, reached on every exit: normal completion,
+            # an exception mid-iteration, a client disconnect, or the generator
+            # being closed at GC time.
             if _export_completed:
-                # All rows consumed → connection is clean, safe to reuse.
+                # Every row was consumed → the result set is drained → the
+                # connection is clean and safe to return to the pool.
                 try:
                     own_db.close()
                 except Exception:
@@ -1312,7 +1357,12 @@ def export_port_history(
                             _port_number,
                         )
             else:
-                # Early exit — SSCursor may still hold unread rows; discard it.
+                # Early exit — the SSCursor may still hold unread rows, and
+                # BOTH close() (via its ROLLBACK) and cursor teardown would
+                # synchronously drain them.  Kill the socket first so whatever
+                # runs afterwards cannot block; this is the export path's only
+                # zombie protection, so it must precede invalidate().
+                _drop_export_connection(own_db, _port_number)
                 try:
                     own_db.invalidate()
                 except Exception:

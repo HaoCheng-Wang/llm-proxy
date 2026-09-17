@@ -544,7 +544,11 @@ async function toggleRawSse(req) {
     rawSseLoading.value[req.id] = true
     try {
       const result = await api.getRawSse(portId, req.id)
-      rawSseData.value[req.id] = result.raw_sse || ''
+      // Absent when the stream exceeded SSE_RECONSTRUCT_MAX_BYTES: the raw
+      // text is then already stored (truncated) as the response body, and a
+      // second copy is deliberately not kept.
+      rawSseData.value[req.id] = result.raw_sse
+        || '(该记录未单独保存原始 SSE 文本——流体积超过重建上限，原始文本已截断存入上方响应体)'
     } catch (e) {
       rawSseData.value[req.id] = '(加载失败)'
     } finally {

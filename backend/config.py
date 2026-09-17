@@ -127,5 +127,12 @@ SSE_RECONSTRUCT_MAX_BYTES = int(os.getenv("SSE_RECONSTRUCT_MAX_BYTES", str(50 * 
 # DB 保存时单字段最大大小（字节）。超过此大小的 request_body/response_body
 # 在写入数据库前会被截断并追加警告标记，防止单条 LONGTEXT 记录撑爆 MySQL
 # 或导致 _sanitize_text() 在超大文本上消耗过多 CPU。
-# 默认 100 MB，与 MySQL max_allowed_packet 64MB 留有安全余量。
-DB_SAVE_FIELD_MAX_BYTES = int(os.getenv("DB_SAVE_FIELD_MAX_BYTES", str(100 * 1024 * 1024)))
+#
+# 默认 60 MB —— 必须低于 MySQL 的 max_allowed_packet，否则超限的 INSERT 会被
+# 服务端拒绝，_save_to_db 重试 3 次后丢弃整条记录（只留一条 error 日志）。
+# 本机实测 max_allowed_packet = 67108864 (64 MiB)，60 MiB 留出约 4 MiB 余量。
+# 注意：该上限是整个数据包的限制，按字段计的上限并不能保证整行一定装得下
+# ——若 request_body / response_body / response_body_raw 同时接近上限，
+# 总和仍可能超包。真正的兜底是它们各自的上游写入路径（如
+# SSE_RECONSTRUCT_MAX_BYTES）先把体积压下来。
+DB_SAVE_FIELD_MAX_BYTES = int(os.getenv("DB_SAVE_FIELD_MAX_BYTES", str(60 * 1024 * 1024)))

@@ -24,14 +24,13 @@ from fastapi.responses import Response, JSONResponse, StreamingResponse
 from proxy_app import (
     get_shared_client,
     get_http2_client,
-    _reconstruct_sse_to_json,
     aget_target_url,
     _serialize_body,
     _save_record_async,
     _fire_and_forget_save,
     EXCLUDE_HEADERS,
 )
-from config import PROXY_BODY_MEMORY_LIMIT, SSE_RECONSTRUCT_MAX_BYTES
+from config import PROXY_BODY_MEMORY_LIMIT
 
 logger = logging.getLogger("llm_proxy.proxy")
 logger.setLevel(logging.DEBUG)
@@ -227,99 +226,40 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                 # a helper called from finally ensures the record is still
                 # written even on premature disconnect.
                 _record_saved = False
+                _buf_transferred = False
 
                 def _save_stream_record():
-                    """Read resp_buf → reconstruct → schedule DB save.
+                    """Hand the SSE spool to the save pipeline.
 
-                    Uses only sync operations + _fire_and_forget_save (no
-                    await) so it is safe to call from a finally block under
-                    GeneratorExit.
+                    Only sync operations + _fire_and_forget_save (no await), so
+                    it is safe to call from a finally block under GeneratorExit.
+
+                    Decoding and JSON reconstruction happen in the DB worker
+                    thread (see proxy_app._finalize_stream_body), not here:
+                    they are O(body size) and would otherwise stall the event
+                    loop for every other in-flight request.  That moves
+                    ownership of ``resp_buf`` to the save task, so the caller
+                    must not close it afterwards.
                     """
-                    nonlocal _record_saved
+                    nonlocal _record_saved, _buf_transferred
                     if _record_saved:
                         return
                     _record_saved = True  # set first to prevent double-save
                     try:
-                        resp_buf.seek(0)
-                        # Guard: get file size without reading into memory.
-                        # SpooledTemporaryFile.rollover() sets _file to a
-                        # real file; tell() works.  In-memory BytesIO also
-                        # supports tell().  If somehow unsupported, fall
-                        # back to reading the whole thing.
-                        try:
-                            _buf_size = resp_buf.seek(0, 2)  # seek to end
-                            resp_buf.seek(0)                  # back to start
-                        except Exception:
-                            _buf_size = None
-
-                        if _buf_size is not None and _buf_size > SSE_RECONSTRUCT_MAX_BYTES:
-                            # Stream is too large — skip reconstruction,
-                            # save only the first SSE_RECONSTRUCT_MAX_BYTES
-                            # bytes with a truncation warning.
-                            logger.warning(
-                                "SSE stream for port %d is %d bytes "
-                                "(limit %d) — truncating raw text and "
-                                "skipping JSON reconstruction",
-                                port_number, _buf_size,
-                                SSE_RECONSTRUCT_MAX_BYTES,
-                            )
-                            truncated = resp_buf.read(SSE_RECONSTRUCT_MAX_BYTES)
-                            raw_sse_text = truncated.decode(
-                                "utf-8", errors="replace",
-                            )
-                            raw_sse_text += (
-                                f"\n\n[TRUNCATED: {_buf_size} bytes total, "
-                                f"only first {SSE_RECONSTRUCT_MAX_BYTES} "
-                                f"bytes saved]"
-                            )
-                            reconstructed_json = raw_sse_text
-                            reconstruction_error = True
-                        else:
-                            full_body = resp_buf.read()
-                            if not full_body:
-                                return
-                            raw_sse_text = full_body.decode(
-                                "utf-8", errors="replace")
-                            try:
-                                reconstructed_json = _reconstruct_sse_to_json(
-                                    raw_sse_text)
-                            except Exception as recon_err:
-                                logger.warning(
-                                    "SSE reconstruction failed for port %d: "
-                                    "%s: %s — saving raw text",
-                                    port_number,
-                                    type(recon_err).__name__, recon_err,
-                                )
-                                reconstructed_json = raw_sse_text
-
-                            reconstruction_error = (
-                                reconstructed_json is None
-                                or (isinstance(reconstructed_json, str)
-                                    and reconstructed_json.lstrip()
-                                    .startswith("data:"))
-                            )
-                            if reconstruction_error \
-                                    and reconstructed_json is None:
-                                reconstructed_json = raw_sse_text
-
                         duration_ms = int((time.time() - start_time) * 1000)
-                        # 原始 SSE 文本仅在重组失败时保存（response_body_raw）。
-                        # 重组成功时 response_body 已含完整响应 JSON，再存一份
-                        # 原始文本属于纯冗余——每条流式记录可省下数倍体积
-                        # （SSE 的 data: 前缀/事件元数据/分块边界远大于最终 JSON）。
-                        _fire_and_forget_save(_save_record_async(
+                        task = _fire_and_forget_save(_save_record_async(
                             port_number, request.method,
                             forward_path
                             + ("?" + query_string
                                if query_string else ""),
                             req_headers_json, req_body_str,
-                            resp_headers_json, reconstructed_json,
+                            resp_headers_json, None,
                             status_code, duration_ms,
-                            resp_body_raw=(
-                                raw_sse_text if reconstruction_error else None
-                            ),
-                            reconstruction_error=reconstruction_error,
+                            resp_body_raw=None,
+                            reconstruction_error=False,
+                            stream_buf=resp_buf,
                         ))
+                        _buf_transferred = task is not None
                     except Exception as e:
                         logger.error(
                             "Failed to save stream record for port %d: "
@@ -390,7 +330,10 @@ async def shared_proxy_endpoint(request: Request, port_number: int, path: str):
                             port_number,
                         )
                         _save_stream_record()
-                    resp_buf.close()
+                    # The save task owns and closes the buffer when it got
+                    # scheduled; closing it here too would race with the read.
+                    if not _buf_transferred:
+                        resp_buf.close()
                     try:
                         await current_ctx.__aexit__(None, None, None)
                     except Exception as e:

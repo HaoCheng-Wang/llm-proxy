@@ -17,6 +17,8 @@
 - [安全设计](#安全设计)
 - [高并发设计](#高并发设计)
 - [SSE 流式处理](#sse-流式处理spooledtemporaryfile-架构)
+  - [累积复杂度陷阱：为什么不能用字符串自增拼接（2026-09 修复）](#累积复杂度陷阱为什么不能用字符串自增拼接2026-09-修复)
+  - [重建为什么必须在 worker 线程（2026-09 修复）](#重建为什么必须在-worker-线程2026-09-修复)
 - [大数据量导出：端到端流式架构](#大数据量导出端到端流式架构)
   - [各层关键设计](#各层关键设计)
   - [一次性 Ticket 鉴权](#一次性-ticket-鉴权)
@@ -33,6 +35,8 @@
   - [实测效果](#实测效果)
   - [各优化项贡献](#各优化项贡献)
   - [瓶颈分析](#瓶颈分析)
+  - [导出流的事件循环安全（2026-08 事故修复）](#导出流的事件循环安全2026-08-事故修复)
+    - [2026-09 复核：上面三项修复的漏洞与补正](#2026-09-复核上面三项修复的漏洞与补正)
 - [许可证](#许可证)
 
 ## 核心设计
@@ -444,15 +448,15 @@ llm-proxy/
 │   ├── models.py            # ORM 模型（User / Port / Request）
 │   ├── schemas.py           # Pydantic 请求/响应模型
 │   ├── auth.py              # JWT 认证 + bcrypt 密码哈希
-│   ├── proxy_app.py         # 代理核心：HTTP/1.1 + HTTP/2 双客户端、DB 记录、SSE 解析入口
-│   ├── sse_parsers.py       # SSE 解析模块（LiteLLM 三层架构）：StreamChunk + ChunkAccumulator + 5 个 Provider 解析器
+│   ├── proxy_app.py         # 代理核心：HTTP/1.1 + HTTP/2 双客户端、DB 记录、SSE 落库（worker 线程重建）
+│   ├── sse_parsers.py       # SSE 解析模块（LiteLLM 三层架构）：StreamChunk + StrParts/ChunkAccumulator + 5 个 Provider 解析器
 │   ├── shared_proxy.py      # 共享代理端点 /{port_number}/{path}
 │   ├── proxy_manager.py     # 端口配置查询 + 缓存刷新
 │   ├── requirements.txt     # pip 依赖
 │   └── routers/
 │       ├── auth_router.py   # 注册/登录/用户信息/修改密码
 │       ├── admin_router.py  # 用户审批 + 已删除端口管理
-│       ├── ports_router.py  # 端口 CRUD + 软删除 + 停用/启用 + 历史 NDJSON 流 + 流式导出（含连接池卫生约束）
+│       ├── ports_router.py  # 端口 CRUD + 软删除 + 停用/启用 + 历史 NDJSON 流 + 流式导出（worker 线程迭代、断开 force-drop、无硬超时）
 │       └── config_router.py # 前端配置（display_ip）
 │
 └── frontend/                # Vue 3 前端
@@ -497,8 +501,8 @@ flowchart TD
 
     subgraph Proxy["代理层"]
         SHARED["shared_proxy.py<br/>共享代理端点<br/>/{port}/{path}"]
-        PROXY_APP["proxy_app.py<br/>HTTP/1.1+HTTP/2 双客户端<br/>端口缓存 + DB 写入<br/>SSE 解析入口"]
-        SSE["sse_parsers.py<br/>LiteLLM 三层架构<br/>5 个 Provider 解析器"]
+        PROXY_APP["proxy_app.py<br/>HTTP/1.1+HTTP/2 双客户端<br/>端口缓存 + DB 写入<br/>SSE 重建（worker 线程）"]
+        SSE["sse_parsers.py<br/>LiteLLM 三层架构<br/>StrParts 惰性拼接<br/>5 个 Provider 解析器"]
         PROXY_MGR["proxy_manager.py<br/>端口配置查询"]
     end
 
@@ -548,7 +552,7 @@ flowchart TD
 | 公开代理 | 创建/编辑弹窗中「🌐 可见性」为独立开关（与所属用户下拉框分开）：设为 public 的代理对所有已登录用户**只读可见**——列表可见（含创建者名字）、详情页可查看交互记录、可导出；编辑/启停/删除/清空历史仍仅限创建者和管理员；关闭 public 后其他用户立即不可见；转移归属不影响 public 状态 |
 | 交互筛选 | 按请求方法分类：`📤 API请求`（POST/PUT/PATCH/DELETE）vs `🌐 其他`（GET/OPTIONS/HEAD） |
 | JSON 树形查看 | 基于 `vue-json-pretty`，请求和响应 JSON 各有独立树形查看按钮，支持折叠/展开/搜索 |
-| 重建异常审查 | 当 `reconstruction_error=True` 时显示橙色警告横幅，提供"查看完整 SSE 原始文本"按钮 |
+| 重建异常审查 | 当 `reconstruction_error=True` 时显示橙色警告横幅，提供"查看完整 SSE 原始文本"按钮（`response_body_raw` 为 NULL 时——超长流截断的情形——按钮内提示原文已存于响应体） |
 | 一键导出 | 三合一：JSON 数据导出 / **流式全量导出**（浏览器原生 `<a>` 下载，不经过 JS 内存） / 后端全量 API 请求导出（浏览器原生下载，支持取消时自动释放后端资源） |
 | 分页加载 | 首次加载 10 条，支持"加载更多"和"加载全部"，上限 100 条/次 |
 | 内存保护 | 最多缓存 5000 条记录（`MAX_LOADED_RECORDS` 软上限），超出后提示使用后端导出 |
@@ -590,7 +594,7 @@ flowchart TD
 | DELETE | `/api/ports/{id}/history/{req_id}` | 删除单条记录 |
 | GET | `/api/ports/{id}/history/{req_id}` | 获取单条记录详情 |
 | GET | `/api/ports/{id}/history/{req_id}/raw-sse` | 按需获取原始 SSE 文本 |
-| GET | `/api/ports/{id}/export` | 流式导出全部交互 JSON（SSCursor + StreamingResponse + Content-Disposition） |
+| GET | `/api/ports/{id}/export` | 流式导出全部交互 JSON（SSCursor + worker 线程迭代 + Content-Disposition；无硬超时，断开自动 force-drop 释放连接） |
 | POST | `/api/ports/{id}/export-ticket` | 创建一次性下载 ticket（用于浏览器原生下载，JWT 不暴露在 URL 中） |
 
 ### 管理员
@@ -637,6 +641,8 @@ flowchart TD
 | `PORT_CACHE_TTL` | 5 | 端口缓存刷新间隔（秒） |
 | `HTTPX_MAX_KEEPALIVE_CONNECTIONS` | 100 | httpx keep-alive 空闲连接数 |
 | `PROXY_BODY_MEMORY_LIMIT` | 10485760 | 请求/响应体内存缓冲上限（字节） |
+| `SSE_RECONSTRUCT_MAX_BYTES` | 52428800 | SSE 流超过此大小则放弃 JSON 重建，只存截断原文（50 MiB） |
+| `DB_SAVE_FIELD_MAX_BYTES` | 62914560 | 单字段入库上限（字节），必须低于 MySQL `max_allowed_packet`（60 MiB） |
 | `CLEANUP_BATCH_SIZE` | 1000 | 后台清理每批 DELETE 行数 |
 | `CLEANUP_LOG_INTERVAL` | 10 | 后台清理每 N 批输出一次进度日志 |
 
@@ -844,7 +850,8 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant C as 智能体
-    participant P as LLM Proxy
+    participant P as LLM Proxy (事件循环)
+    participant T as DB 写线程池
     participant D as MySQL
     participant U as 上游 LLM API
 
@@ -858,10 +865,11 @@ sequenceDiagram
         Note over P: ≤10MB 内存, >10MB 溢写临时文件
     end
 
-    P->>P: resp_buf.read() → 完整 SSE body
-    P->>P: _reconstruct_sse_to_json() → 重组 JSON
-    P--)D: asyncio.create_task → INSERT requests
-    Note over P,D: 一次 INSERT, 不阻塞客户端。<br/>客户端断连时 finally 块兜底保存已收集的部分数据。
+    P--)T: asyncio.create_task(stream_buf=resp_buf)
+    Note over P,T: 缓冲区所有权移交，事件循环不再持有
+    T->>T: read + decode + _reconstruct_sse_to_json()
+    T->>D: INSERT requests（一次写入）
+    Note over P,D: 不阻塞客户端，也不阻塞其他并发请求。<br/>客户端断连时 finally 块兜底保存已收集的部分数据。
 ```
 
 ### 5. 数据入库（关键保证）
@@ -875,11 +883,11 @@ sequenceDiagram
 | `method` / `path` | ✅ | ✅ |
 | `request_headers` / `request_body` | ✅ | ✅ |
 | `response_headers` | ✅ | ✅ |
-| `response_body` | JSON | 重建 JSON（失败时回退为原始文本） |
-| `response_body_raw` | NULL（不冗余存储） | 仅重建失败时保存完整原始 SSE 文本，成功时为 NULL |
+| `response_body` | JSON | 重建 JSON（失败时回退为原始文本；超长流被截断时存截断原文） |
+| `response_body_raw` | NULL（不冗余存储） | 仅重建失败时保存完整原始 SSE 文本；成功时为 NULL，超长流截断时也为 NULL（原文已在 `response_body`） |
 | `status_code` | ✅ | ✅ |
 | `duration_ms` | ✅ | ✅ |
-| `reconstruction_error` | 始终 False | True = 重建失败（前端展示警告） |
+| `reconstruction_error` | 始终 False | True = 重建失败**或**流超长被截断（前端展示警告） |
 
 数据不丢失保证：
 
@@ -887,6 +895,8 @@ sequenceDiagram
 - 端口被停用 → 进行中的请求正常记录，不再产生 `port_id=NULL` 的孤立行
 - SSE 重建成功 → `response_body` 已含完整响应 JSON，不再额外存储原始 SSE 文本（省去 5–70 倍冗余体积；原始 SSE 的 `data:` 前缀与分块元数据远大于最终 JSON）
 - SSE 重建失败 → `response_body_raw` 保留完整原始数据，`reconstruction_error=True`，前端展示警告并可按需查看原始文本
+- 流超长（> `SSE_RECONSTRUCT_MAX_BYTES`）→ 放弃重建，`response_body` 存前 N 字节原文 + `[TRUNCATED: ...]` 标记，`response_body_raw` 为 NULL（不再重复存同一份，否则单行翻倍会突破 `max_allowed_packet` 导致整条记录写不进去）
+- 流式响应体为空（上游发出 `text/event-stream` 却未写任何字节）→ 仍写入记录（`response_body=NULL`），保留请求侧信息。2026-09 前该情况整条记录被丢弃
 - DB 写入失败 → 3 次重试
 - 进程被 kill → `shutdown_db_executor()` 设有 15 秒超时保护，防止卡住的 MySQL 连接阻塞进程退出
 
@@ -969,7 +979,7 @@ erDiagram
         longtext request_body "请求体 JSON"
         longtext response_headers "响应头 JSON"
         longtext response_body "响应 JSON（重建）"
-        longtext response_body_raw "原始 SSE 文本（仅重建失败时保存，成功时为 NULL）"
+        longtext response_body_raw "原始 SSE 文本（仅重建失败时保存；成功或超长截断时为 NULL）"
         int status_code "HTTP 状态码"
         int duration_ms "请求耗时"
         bool reconstruction_error "SSE 重建失败"
@@ -1081,8 +1091,8 @@ sequenceDiagram
             API-->>C: yield chunk (立即透传)
             API->>API: SpooledTemporaryFile.write(chunk)
         end
-        API->>API: reconstruct SSE → JSON
-        API--)THREAD: create_task(save_record)
+        API--)THREAD: create_task(save_record, stream_buf=resp_buf)
+        THREAD->>THREAD: read + decode + reconstruct SSE → JSON
         THREAD->>MYSQL: INSERT requests (LogSessionLocal)
     and 并发请求 2
         C->>API: POST /12345/v1/embeddings
@@ -1103,13 +1113,16 @@ sequenceDiagram
 | 瓶颈点 | 方案 | 参数 |
 |--------|------|------|
 | 事件循环阻塞 | 所有 DB 查询在线程池执行 | `run_in_executor(_db_executor)` |
+| 导出流阻塞 | 导出为 sync generator，Starlette 在 worker 线程拉取 | 阻塞的读取不占用事件循环；放弃时的清理靠 force-drop 变便宜而非移出循环（2026-09 复核修正，见[导出流的事件循环安全](#导出流的事件循环安全2026-08-事故修复)） |
 | 管理接口 vs 日志争抢 | 双 DB 连接池完全隔离 | 管理池 20+40 / 日志池 10+20 |
 | 线程池争抢 | 代理日志使用专用线程池 | `DB_SAVE_WORKERS=8` |
 | 上游连接数 | httpx 双客户端（热启动）| HTTP/1.1 (默认) + HTTP/2 (按端口可选), 连接无上限 |
 | 端口查找 | 内存缓存 + TTL（`threading.Lock` 保护并发写入） | 5 秒过期，缓存命中率 99.9%+；单条 DB 回退写入时同步更新 TTL |
 | 请求体 OOM | SpooledTemporaryFile | ≤10MB 内存，>10MB 溢写磁盘 |
 | 流式内存累积 | SpooledTemporaryFile | ≤10MB 内存, >10MB 自动溢写临时文件 |
-| 流式重建 | 流结束后立即同步重组 | 无需后台 Worker, 即写即见 |
+| 流式重建阻塞事件循环 | 重建移入 `_db_executor` 线程（`_finalize_stream_body`） | 大流结束不再冻结所有并发请求（2026-09 修复） |
+| 流式重建复杂度 | 增量累积用 `list + join`，而非 `s += delta` / `x = x + y` | O(长度×事件数) → O(长度)；18.9MB 流 6.7s → 0.43s |
+| 流式重建时机 | 流结束后一次性重组 | 无需新增后台 Worker 队列（复用 `_db_executor`）, 即写即见 |
 | HTTP/1.1 keepalive | 连接池预热 + 自动重试 | 无 GOAWAY，流式稳定不中断 |
 
 ### 为什么不需要多进程
@@ -1118,7 +1131,7 @@ sequenceDiagram
 |------|------|
 | I/O 密集型 | 代理转发 90%+ 时间在 await（等待网络），CPU 利用率 <5% |
 | asyncio 协程 | 单线程调度数千协程，每个协程切换开销微秒级 |
-| 阻塞操作已隔离 | DB 写入、SSE 解析全部放到专用线程池；`shutdown_db_executor()` 设 15 秒超时防止进程退出卡死 |
+| 阻塞操作已隔离 | DB 写入、SSE 读取与重建全部放到专用线程池（重建自 2026-09 起进入该池）；`shutdown_db_executor()` 设 15 秒超时防止进程退出卡死 |
 | 真正瓶颈在上游 | OpenAI 的生成速度（秒级）远超代理转发开销（微秒级） |
 
 如需高可用，应使用多容器 + 负载均衡，而非单机多进程。
@@ -1144,7 +1157,7 @@ flowchart TD
     subgraph Backend["FastAPI 后端"]
         STREAM["StreamingResponse<br/>generator 逐行产出"]
         CHECK["每 5 行检测<br/>客户端断开?"]
-        DEADLINE["120s 硬时限<br/>(导出 1800s)"]
+        DEADLINE["历史流 120s 硬时限<br/>导出流无硬时限"]
         INVALIDATE{"流完整读完?"}
         INVALIDATE -->|"是"| CLOSE["close() 归还连接池<br/>可复用"]
         INVALIDATE -->|"否(中途断开/超时)"| DISCARD["invalidate() 丢弃连接<br/>SSCursor 未读行不留入池"]
@@ -1173,7 +1186,7 @@ flowchart TD
 
 SSCursor 是**服务端游标**：MySQL 端保持结果集，客户端逐批拉取。如果中途退出（客户端断开、超时、异常），MySQL 结果集可能仍有未读行——此时把连接还回池，下一个使用者会在**陈旧协议状态**上执行查询，导致行为异常。
 
-因此两条流式路径（历史流 `stream_ndjson`、导出流 `stream_jsonl`）统一遵循：
+因此两条流式路径（历史流 `stream_ndjson`、导出流 `stream_jsonl`）遵循同样的归还原则（实现细节不同，见[导出流的事件循环安全](#导出流的事件循环安全2026-08-事故修复)）：
 
 - **完整读完全部行** → `close()` 正常归还，连接可复用
 - **任何提前退出**（`GeneratorExit`、客户端断开、超时、异常）→ `invalidate()` 丢弃底层连接，池自动新建替代连接
@@ -1195,13 +1208,14 @@ finally:
 
 ### 设计原则 2：断开检测与硬时限
 
-| 防护层 | 实现 | 目的 |
-|--------|------|------|
-| 客户端断开检测 | 每产出 5 行检查 `request.is_disconnected()` | 浏览器关闭/刷新后尽快放弃流，尽早释放连接 |
-| 流时长硬上限 | 历史流 120s、导出流 1800s 单调钟截止 | 即使代理层不关 socket（页面被冻结等极端场景），流也不会无限占用连接 |
-| 代理层超时 | vite `/api` 代理 `timeout`/`proxyTimeout` = 300s | 浏览器侧冻结的流在代理层被强制销毁，后端 socket 写错误 → generator 退出 → 连接被清理 |
+| 防护层 | 历史流（stream_ndjson） | 导出流（stream_jsonl） |
+|--------|------------------------|------------------------|
+| 客户端断开检测 | 每产出 5 行检查 `request.is_disconnected()` | 无主动检测——断连不会被立即感知：sync generator 的关闭要等 GC（Starlette 不 close 同步迭代器），届时由 `finally` 的 force-drop 完成清理 |
+| 硬时限 | 120s 单调钟截止（流短，兜底足够） | **无硬时限**（HTTP 协议没有下载超时，数据持续流动即可完成；海量导出可达 1 小时以上） |
+| 提前退出处理 | `invalidate()` 丢弃连接 | 先 `_drop_export_connection()` 销毁底层 socket、并把活动结果标记为非活动，再 `invalidate()`——否则 PyMySQL 会同步排空剩余未读行（含 `close()` 的 ROLLBACK 触发） |
+| 代理层超时 | vite `/api` 代理 `timeout`/`proxyTimeout` = 300s（空闲超时，仅无数据流动时触发） | 同左 |
 
-> 三层防护互为兜底：任一层失效，其余层仍能保证连接最终被回收。
+> 导出流的僵尸防护不依赖任何硬时限：放弃 → 生成器关闭 → force-drop（socket 置空 + 结果标记非活动）→ invalidate，排空自旋不再执行；worker 阻塞在 fetch 时由 MySQL `read_timeout=600s` 兜底，最多延迟一个 fetch 周期释放（期间只占 1 个池槽位 + 1 个 worker 线程，不影响其他 API）。**残余**：释放时机取决于 GC，不是即时的。
 
 ### 设计原则 3：连接池容量与隔离
 
@@ -1222,7 +1236,7 @@ finally:
 | 单次流超时 | fetch 内置 45s 硬超时（`AbortController`），超时给出"加载超时，请重试"提示而非无限转圈 |
 | 轮询失败 | 静默忽略（下个周期自动重试），不打断用户操作 |
 
-前端中止 → 浏览器关闭 TCP 连接 → 代理层销毁上游 socket → 后端 `is_disconnected()` 检测到 → 连接按"不干净"路径丢弃。**整条链路闭环**，任何一端都不会无限持有资源。
+前端中止 → 浏览器关闭 TCP 连接 → 代理层销毁上游 socket → 后端感知断开（历史流 `is_disconnected()`，导出流 ASGI send 失败）→ 连接按"不干净"路径丢弃（导出流额外 force-drop）。**整条链路闭环**，任何一端都不会无限持有资源。
 
 ### 为什么每 5 行检查而不是每 20 行
 
@@ -1496,6 +1510,50 @@ flowchart LR
 
 使用 `ChunkAccumulator` 的是简单解析器（OpenAI Chat、Gemini），它们内部状态就是 accumulator。Anthropic 和 OpenAI Responses 有更复杂的状态机，但最终 `finalize()` 中做了类似的事情。
 
+#### 累积复杂度陷阱：为什么不能用字符串自增拼接（2026-09 修复）
+
+**问题**：每个解析器都靠"每个事件追加一段 delta"来累积最终文本。直觉写法是 `self._text += chunk.text_delta`，但它比看起来贵得多。
+
+Python 字符串不可变，`+=` 必须重新分配并复制**已累积的全部内容**。CPython 有一个原地扩容优化（`unicode_concatenate`）能把它降到均摊 O(1)，但**前提是目标对象的引用计数为 1** —— 而实例属性和 dict 值天然不满足：容器里一份引用、求值栈上一份引用，计数至少是 2，优化直接失效。
+
+于是每个事件都要复制一遍全长内容，总代价变成 **O(最终长度 × 事件数)**。纯字符串累积本身的实测（一条 delta 4 字节，即一个事件一个 token）：
+
+| 事件数 | 最终长度 | `attr +=`（修复前） | `list + join`（修复后） | 劣化倍数 |
+|:--:|--:|--:|--:|:--:|
+| 5,000 | 19.5 KB | 1.4 ms | 0.3 ms | 5× |
+| 20,000 | 78 KB | 34.4 ms | 1.1 ms | 31× |
+| 50,000 | 195 KB | 630.6 ms | 2.8 ms | 225× |
+| 200,000 | 781 KB | **16,144 ms** | 10.8 ms | **1500×** |
+
+**方案**：`StrParts` —— 只往 list 里 append 片段，第一次读取时才 `"".join()` 并缓存结果。对外接口完全不变（`text` / `reasoning` / `tool_calls` 仍是属性，返回类型一致）。
+
+修复后完整重建流程（`reconstruct_sse_to_json`，含每事件 `json.loads` 与 `finalize`）恢复线性：
+
+| 流大小 | 修复前 | 修复后 | 加速 |
+|--:|--:|--:|:--:|
+| 0.94 MB | 36 ms | 20 ms | 1.8× |
+| 3.78 MB | 341 ms | 81 ms | 4.2× |
+| 9.44 MB | 1,798 ms | 211 ms | 8.5× |
+| 18.88 MB | 6,667 ms | 425 ms | **15.7×** |
+
+覆盖 12 处同类写法：
+
+| 解析器 | 位置 |
+|--------|------|
+| `ChunkAccumulator`（4 处） | `text`、`reasoning`、工具调用的 `name` 与 `arguments` |
+| `AnthropicSSEParser`（5 处） | block 的 `text`、`thinking`、`signature`、`input_json`，以及未知 delta 类型的兜底拼接 |
+| `OpenAIResponsesSSEParser`（3 处） | `output_text`、`reasoning_text`、`function_args` |
+
+> 其中 Anthropic 的 4 处写的是 `x = x + y` 而非 `x += y`。两者代价完全相同——都是"取旧值、相加、存回"，同样不受原地优化保护。**只搜 `+=` 会漏掉它们**，这是排查这类问题时容易踩的坑。
+
+> `GenericSSEParser` 里同样的 `all_text += ...` **不需要改**：它是局部变量，引用计数为 1，CPython 的原地优化生效，本来就是线性的。这从反面印证了上面"引用计数决定优化是否生效"的判断。
+>
+> 改动经 A/B 验证：对改动前的模块做逐字节对比，32 个用例（四种协议格式 + 未知 delta 类型、缺失 `content_block_start`、**同一 index 重复 `content_block_start`**、工具名分片、多 block、citations、compaction、垃圾输入等边界）输出**完全一致**，在 Python 3.13 与 3.14 上均验证。
+>
+> 重复 `content_block_start` 这一组是补测出来的：惰性拼接把片段按 `(index, field)` 暂存，而 `content_block_start` 会**整体替换**该 index 的 block，若不随之一并丢弃，旧片段就会被拼进新 block（中继重试重发 `content_block_start` 会复现）。`_discard_fragments()` 负责这件事。
+
+**为什么影响面超出单条流**：重建发生在**流结束时**，而当时它在事件循环上同步执行。所以一条大流结束的瞬间，整个代理进程（所有端口、所有并发请求）都会冻结到重建跑完。这不是"这条流慢一点"，而是"所有流一起卡住" —— 这正是[把重建挪进 worker 线程](#重建为什么必须在-worker-线程2026-09-修复)的原因。
+
 #### Provider 深入
 
 **Anthropic — 状态机驱动**
@@ -1586,11 +1644,14 @@ async for chunk in response.aiter_bytes():
     yield chunk                        # ① 立即发给客户端
     resp_buf.write(chunk)              # ② 写入缓冲区
 
-# 流结束
-resp_buf.seek(0)
-full_body = resp_buf.read()           # ③ 读出完整 SSE
-reconstructed = _reconstruct_sse_to_json(full_body)  # ④ 重组 JSON
-asyncio.create_task(_save_record_async(...))          # ⑤ 一次性写入 requests
+# 流结束 —— 缓冲区所有权移交给保存任务，本协程不再 close()
+asyncio.create_task(_save_record_async(..., stream_buf=resp_buf))
+                                       # ③ 交给 DB 写线程池，其中：
+                                       #    _finalize_stream_body()
+                                       #      resp_buf.read()     读出完整 SSE
+                                       #      decode + 重建 JSON
+                                       #      close()             释放缓冲区
+                                       #    → INSERT requests   ④ 一次性写入
 ```
 
 **为什么不在流进行中写 MySQL？**
@@ -1600,6 +1661,31 @@ asyncio.create_task(_save_record_async(...))          # ⑤ 一次性写入 requ
 **溢出到磁盘**
 
 SpooledTemporaryFile 在小于 `PROXY_BODY_MEMORY_LIMIT`（默认 10 MB）时完全在内存中操作。超过上限时自动透明地溢出到磁盘临时文件。LLM API 的响应通常远小于 10 MB，因此绝大多数流不会触及磁盘。
+
+#### 重建为什么必须在 worker 线程（2026-09 修复）
+
+读缓冲、decode、重建 JSON 三步都是 **O(响应体大小)** 的 CPU 工作，且都在流结束时触发。早期实现把它们放在流结束的同步路径上（事件循环内），后果是：**一条大流结束的瞬间，整个进程的所有并发请求一起冻结** —— 因为单线程 asyncio 无法在重建期间调度任何其他协程。
+
+现在这三步全部在 `_finalize_stream_body()` 内完成，而它由 `_save_to_db()` 调用，后者本来就在 `database._db_executor`（`DB_SAVE_WORKERS=8`）里跑。事件循环只做一次 `create_task`。
+
+**缓冲区所有权随之转移** —— 这是本次改动最容易出错的地方：
+
+| 环节 | 规则 |
+|------|------|
+| `_save_stream_record()` | 把 `resp_buf` 交给保存任务，并记录 `_buf_transferred` |
+| 生成器 `finally` | 仅在 `_buf_transferred` 为假时才 `close()`，否则会与 worker 线程的读取竞争 |
+| 调度失败（无事件循环） | `_fire_and_forget_save()` 返回 `None` → `_buf_transferred=False` → 生成器自己收尾，不泄漏 |
+| `_save_to_db()` | 在**重试循环之前**只读取一次并 `close()`。放进重试循环会失败——已被消费的 SpooledTemporaryFile 无法重放 |
+
+**超长流的截断分支：只存一份**
+
+流体积超过 `SSE_RECONSTRUCT_MAX_BYTES`（默认 50 MB）时放弃重建，只保留前 N 字节原文并追加 `[TRUNCATED: ...]` 标记，同时置 `reconstruction_error=1`。
+
+原实现在这个分支里把同一份截断原文**同时写进 `response_body` 和 `response_body_raw`**：单行因此达到 ~2× 上限，而 2×50 MB 会突破 MySQL 的 `max_allowed_packet`（本机实测 64 MiB），INSERT 被服务端拒绝 → 重试 3 次 → 记录**彻底丢失**。护栏存在的唯一目的就是处理超长流，却恰好让这些流存不进库。
+
+现在截断分支只存 `response_body` 一份（`response_body_raw` 为 NULL）。同属"存两份"的**重建失败分支保持原样**：那里 `response_body` 可能只是原始文本、也可能为空，`response_body_raw` 是独立的可查副本，前端"查看完整 SSE 原始文本"按钮依赖它（对应 `GET /api/ports/{id}/history/{req_id}/raw-sse`）。仅当它确实为 NULL 时，前端才提示该记录未单独保存原文。
+
+> `DB_SAVE_FIELD_MAX_BYTES` 默认值同步从 100 MB 下调到 60 MiB，与实测的 `max_allowed_packet = 67108864` 对齐。原先的 100 MB 配着"与 64MB 留有安全余量"的注释，实际是**超出**上限——落在 64~100 MB 之间的单字段不会被截断，INSERT 一样失败。
 
 ### 数据库连接池设计
 
@@ -1616,7 +1702,7 @@ SpooledTemporaryFile 在小于 `PROXY_BODY_MEMORY_LIMIT`（默认 10 MB）时完
 │   用途：代理日志写入 → 写 requests
 │   调用方：代理转发线程
 │
-└─ _stream_engine (pool_size=5, max_overflow=5)
+└─ _stream_engine (pool_size=15, max_overflow=15)
     连接同一个 MySQL
     用途：大数据量流式查询 → 端口历史导出
     特性：pymysql SSCursor (server-side cursor)，逐批拉取行，不一次性加载到内存
@@ -1651,7 +1737,7 @@ flowchart LR
 
 如果共用一套连接池，100 个 SSE 流同时结束的瞬间——每个流一次 `INSERT requests`——可能暂时耗尽池中连接。此时管理员尝试登录，发现**无连接可用**，只能排队等 30 秒超时。三套池完全隔离后，日志写入再繁忙，管理接口始终有 20 个空闲连接待命。
 
-流式导出使用第三套池，原因是 **pymysql SSCursor 的约束**：SSCursor 在读取完所有行之前不能在同一连接上执行其他查询。如果导出使用了管理池的连接，可能导致其他请求无法读取数据。独立小池（5+5）确保导出不阻塞其他操作。
+流式导出使用第三套池，原因是 **pymysql SSCursor 的约束**：SSCursor 在读取完所有行之前不能在同一连接上执行其他查询。如果导出使用了管理池的连接，可能导致其他请求无法读取数据。独立小池（15+15）确保导出不阻塞其他操作。
 
 **日志专用线程池**
 
@@ -1823,14 +1909,16 @@ SQLAlchemy `defer()` 让 `SELECT` 语句不拉取这些列，MySQL 也就不会�
 
 #### 生成器异常恢复与主动断连检测
 
-**问题背景**：FastAPI 的 `StreamingResponse` 通过 async generator 逐块推送数据。如果客户端中途断开（关闭浏览器标签、取消下载、网络中断），Starlette 向生成器注入 `GeneratorExit`；如果 MySQL 连接意外断开（超时、重启、网络故障），未捕获的异常会导致 uvicorn 输出 ASGI application error，浏览器收到损坏的 HTTP 响应。
+**问题背景**：FastAPI 的 `StreamingResponse` 通过生成器逐块推送数据。如果客户端中途断开（关闭浏览器标签、取消下载、网络中断），生成器需要被关闭以便释放它持有的数据库连接；如果 MySQL 连接意外断开（超时、重启、网络故障），未捕获的异常会导致 uvicorn 输出 ASGI application error，浏览器收到损坏的 HTTP 响应。
+
+> 断开信号的传递方式取决于生成器类型，这点容易想当然：**async generator** 会被 Starlette 注入 `GeneratorExit`；而**同步生成器**不会——Starlette 的 `iterate_in_threadpool` 既不 close 它，uvicorn（ASGI < 2.4）取消流时也不 `aclose()` 它，因此它只在被 GC 时关闭，且那一次终结发生在**事件循环线程**上。导出流是后者，所以它的放弃清理依赖 force-drop 足够便宜，而不是依赖"断开即触发"。
 
 本项目有**两条流式路径**使用断连检测，检测粒度根据场景调整：
 
-| 路径 | 接口 | 输出格式 | 检测间隔 | `yield_per` | 连接池 |
-|------|------|----------|:--:|:--:|------|
-| 历史查看 | `GET /api/ports/{id}` | NDJSON | 每 20 行 | 50 | `StreamSessionLocal` (SSCursor) |
-| 数据导出 | `GET /api/ports/{id}/export` | JSON | 每 100 行 | 500 | `StreamSessionLocal` (SSCursor) |
+| 路径 | 接口 | 输出格式 | 断连检测 | `yield_per` | 连接池 |
+|------|------|----------|----------|:--:|------|
+| 历史查看 | `GET /api/ports/{id}` | NDJSON | 每 20 行 `is_disconnected()` + 120s 硬时限 | 50 | `StreamSessionLocal` (SSCursor) |
+| 数据导出 | `GET /api/ports/{id}/export` | JSON | 无主动检测（sync generator + worker 线程拉取；关闭由 GC 触发，届时 force-drop + invalidate）；无硬时限 | 500 | `StreamSessionLocal` (SSCursor) |
 
 **历史查看（NDJSON）的断连检测频率更高（20 行）**，因为前端轮询和"加载更多"场景下用户频繁切换页面，及时发现断开可以更快释放 SSCursor 连接。
 
@@ -1906,19 +1994,19 @@ sequenceDiagram
         F->>F: _build_full_row(r)
         F-->>N: yield bytes
         N-->>C: gzip 压缩 → 推送
-        Note over F: 每 100 行: await request.is_disconnected()
+        Note over F: sync generator 由 Starlette 在 worker 线程拉取<br/>（阻塞读取不占用事件循环；无超时限制）
     end
 
     alt 客户端取消下载
         C-->>N: TCP RST
-        N-->>F: GeneratorExit 或 is_disconnected()=True
-        F->>F: logger.info('client disconnected')
-        F->>F: finally: close() → invalidate() 降级
-        Note over D: SSCursor 连接被丢弃<br/>MySQL 释放服务端游标资源
+        N-->>F: 生成器被关闭（Starlette 不 close 同步迭代器，<br/>实际由 GC 触发，跑在事件循环线程上）
+        F->>F: finally: _drop_export_connection()<br/>销毁 socket + 把结果标记为非活动
+        F->>F: finally: invalidate() 丢弃连接
+        Note over D: 排空自旋不再执行<br/>MySQL 释放服务端游标资源
     else 正常完成
         F->>F: 生成数组结束符 ]}
         F->>F: finally: close() 归还连接
-        Note over D: SSCursor 连接正常归还连接池
+        Note over D: 结果集已读完，SSCursor 连接正常归还连接池
     end
 ```
 
@@ -2001,7 +2089,48 @@ Export progress: 3624/12087 (30%) elapsed=124.3s interval=[1208 rows in 38.4s, 3
 
 全部软件优化到位后，传输速度由**生产 MySQL 服务器的磁盘 I/O 能力**决定。12087 行 × 2 个 LONGTEXT（request_body + response_body）≈ 每行 ~200KB 需从 InnoDB 溢出页读取，合计约 2.4GB 的磁盘 I/O。
 
-在代码层面，SQL 使用 `USE INDEX` 强制复合索引（`Backward index scan`，零 filesort）、列按需选取（simple 只查 2 个 LONGTEXT）、字节拼接零 CPU 开销、async 生成器 + `request.is_disconnected()` 心跳检测——所有能做的都做了。如果需要进一步加速，方向是 MySQL 服务器硬件（SSD、InnoDB buffer pool 扩容到物理内存 70-80%，使 LONGTEXT 溢出页命中缓存）或架构层面（写入时预计算导出 JSON 列）。
+在代码层面，SQL 使用 `USE INDEX` 强制复合索引（`Backward index scan`，零 filesort）、列按需选取（simple 只查 2 个 LONGTEXT）、字节拼接零 CPU 开销、sync 生成器让阻塞读取在 worker 线程执行——软件侧能做的都做了。如果需要进一步加速，方向是 MySQL 服务器硬件（SSD、InnoDB buffer pool 扩容到物理内存 70-80%，使 LONGTEXT 溢出页命中缓存）或架构层面（写入时预计算导出 JSON 列）。
+
+#### 导出流的事件循环安全（2026-08 事故修复）
+
+2026-08 生产事故：一个 48,964 行（约 23GB）的端口触发"从后端下载全部交互记录"后，整个管理系统卡死（所有代理显示"暂无代理"）。根因是**阻塞式数据库 I/O 被放到了事件循环线程上**：
+
+1. 导出生成器原为 async generator，却在事件循环线程上同步执行 SSCursor 读取
+2. 30 分钟硬超时触发后 `return`，循环退出时 SQLAlchemy 关闭结果集——而 PyMySQL SSCursor 的 `close()` 会**同步排空剩余未读行**（本次约 15GB），表现为阻塞的 socket recv
+3. MySQL 侧数据源源不断到达，recv 既不超时也不报错，**事件循环被无限期钉死**，全部 API 冻结（MySQL 中该 SELECT 持续 `Sending to client` 长达 67 分钟）
+
+修复三件事：
+
+| 修复 | 说明 |
+|------|------|
+| async → sync 生成器 | `stream_jsonl()` 改为普通生成器，Starlette 通过 `iterate_in_threadpool` 在 AnyIO worker 线程中拉取；阻塞的 SSCursor **读取**不再占用事件循环 |
+| 断开即 force-drop | 放弃导出时先 `_drop_export_connection()` 强制关闭底层 socket，使后续任何排空动作立即失败，连接再由 `finally` 的 `invalidate()` 丢弃 |
+| 移除 30 分钟硬超时 | HTTP 协议没有下载超时，数据持续流动下载必然完成；僵尸防护不再依赖截止时间 |
+
+#### 2026-09 复核：上面三项修复的漏洞与补正
+
+2026-09 复盘该路径时发现三处逻辑漏洞，其中第一处是**致命的**——它让"断开即 force-drop"这条唯一防线从未生效：
+
+| 漏洞 | 后果 | 修正 |
+|------|------|------|
+| `session.connection` 写成了属性访问（应为方法调用） | `conn.connection` 抛 `AttributeError`，被裸 `except Exception: pass` 吞掉——force-drop **静默失效**，排空照常执行 | 改为 `session.connection()`；异常改为 `logger.debug` 记录，不再静默 |
+| 迭代中途出错时 `_export_completed = True` 仍会执行 | 代码注释写"All rows consumed"，实际中途夭折的结果集未读完，`finally` 却走 `close()` → **ROLLBACK 本身就是排空触发器** | 两条 `except Exception` 分支显式 `return`，使该标志只在真正读完时置位 |
+| force-drop 仅挂在两个内层 `GeneratorExit` 处理上 | 其它放弃路径（异常、外层 yield 处断开）只做 `invalidate()`，没有先行断开 socket | 收敛为 `finally` 中**唯一**的清理点：未完成则先 force-drop 再 `invalidate()` |
+
+**为什么 `close()` 会排空**：PyMySQL 的 `_execute_command` 开头是 `if not self._sock: raise InterfaceError`，紧接着是 `if self._result.unbuffered_active: self._result._finish_unbuffered_query()`。也就是说**任何**后续命令（含 `Session.close()` 发出的 ROLLBACK）都会触发那个 `while unbuffered_active: _read_packet()` 的阻塞自旋。所以未读完的结果集**绝不能**走 `close()` 路径，且必须在任何关闭动作之前先销毁 socket。
+
+**关于"迭代已移出事件循环"的边界**：这句话只对**迭代**成立。Starlette 1.x 的 `iterate_in_threadpool` 没有 `try/finally`、也不会 close 同步迭代器；uvicorn（ASGI 2.3）取消流时同样不会 `aclose()` 它。因此客户端放弃后，生成器**只在被 GC 时才关闭，而那次终结发生在事件循环线程上**。结论：teardown 并没有被移出事件循环——它是被**变便宜**了。force-drop 是纯内存操作（把 `_sock` 置空、把结果标记为非活动），此后的 `invalidate()` 在死 socket 上同样是微秒级，于是即便跑在事件循环上也无可感知停顿。
+
+修复后僵尸防护（不依赖任何硬时限）：
+
+- 客户端断开 / 迭代异常 → 生成器被关闭 → `finally`：先 force-drop（socket 置空 + 结果标记非活动）→ `invalidate()` 丢弃连接。两条路径都不再触发排空，且两条防线互为兜底（socket 没了则读写立即抛错；结果标记非活动则自旋循环根本不执行）
+- worker 阻塞在 fetch 时由 MySQL `read_timeout=600s` 兜底，最多延迟一个 fetch 周期释放（期间只占 1 个池槽位 + 1 个 worker 线程，不影响其他 API）
+
+> 已知残余：放弃导出的连接要靠 GC 触发关闭，因此**释放时机不确定**——池槽位与服务端游标会多保留一段时间，而不是断开即释放。这是该路径目前唯一的已知残余。
+>
+> 顺带记一笔**背压是正常的**，不要误判：uvicorn 的 `send()` 开头就是 `if self.flow.write_paused and not self.disconnected: await self.flow.drain()`，而传输层在写缓冲区超过 `HIGH_WATER_LIMIT`（64 KiB）时调用 `pause_writing()` 置位 `write_paused`。因此停读的客户端会让生产端**一起停下**，每连接至多缓冲约 64 KiB + 一个分块，不会堆积成内存风险。实测（1000×64KiB，客户端只发请求不读）：生产端被阻塞整个窗口、进程 RSS 零增长，客户端关闭 socket 后生产端在 0.01s 内跑完剩余分块。
+
+> 实测验证：70MB 导出期间管理 API 响应保持 70ms 级；客户端中途断开后无僵尸线程/僵尸连接。海量端口（20GB+）的导出耗时取决于链路带宽（100Mbps 网卡实测约 11MB/s），全程保持浏览器页面打开即可完成。
 
 ### 请求头转发规则
 

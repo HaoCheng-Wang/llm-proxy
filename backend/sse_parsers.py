@@ -59,6 +59,43 @@ class StreamChunk:
 #  Layer 3 helper: ChunkAccumulator
 # ──────────────────────────────────────────────
 
+class StrParts:
+    """Append-only string assembled from fragments, joined once on first read.
+
+    Every SSE parser grows strings by appending one delta per event.  Writing
+    that as ``s += delta`` on a *stored* string (an instance attribute or a
+    dict value) is quadratic: Python strings are immutable, and CPython's
+    in-place-resize optimisation only kicks in when the target's reference
+    count is 1 — which a stored value never has, because the container and the
+    caller's stack each hold a reference.  So each ``+=`` reallocates and
+    copies everything accumulated so far, making reconstruction
+    O(total_length × events).
+
+    Measured on a 200k-event / 780 KB stream: 16.1s with ``+=`` versus 10.8ms
+    with append+join.  Because reconstruction runs in the proxy, that
+    difference was 16s of frozen event loop for every other in-flight request.
+    """
+
+    __slots__ = ("_parts", "_joined")
+
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+        self._joined: str | None = None
+
+    def append(self, value: str) -> None:
+        if value:
+            self._parts.append(value)
+            self._joined = None
+
+    def get(self) -> str:
+        if self._joined is None:
+            self._joined = "".join(self._parts)
+        return self._joined
+
+    def __bool__(self) -> bool:
+        return bool(self._parts)
+
+
 class ChunkAccumulator:
     """Collect StreamChunk objects and merge by field type.
 
@@ -67,9 +104,11 @@ class ChunkAccumulator:
     """
 
     def __init__(self) -> None:
-        self._text: str = ""
-        self._reasoning: str = ""
-        self._tool_calls: dict[int, dict] = {}    # index → {id, type, function: {name, arguments}}
+        self._text = StrParts()
+        self._reasoning = StrParts()
+        # index → {id, type, name: StrParts, arguments: StrParts}
+        self._tool_calls: dict[int, dict] = {}
+        self._tool_calls_view: dict[int, dict] | None = None
         self._finish_reason: str | None = None
         self._usage: dict | None = None
         self._metadata: dict = {}
@@ -79,25 +118,26 @@ class ChunkAccumulator:
     def add(self, chunk: StreamChunk) -> None:
         """Merge one chunk into the accumulator."""
         if chunk.text_delta:
-            self._text += chunk.text_delta
+            self._text.append(chunk.text_delta)
         if chunk.reasoning_delta:
-            self._reasoning += chunk.reasoning_delta
+            self._reasoning.append(chunk.reasoning_delta)
 
         # Tool calls merge by index
         if chunk.tool_call_delta:
+            self._tool_calls_view = None
             idx = chunk.tool_call_delta.get("index", 0)
-            tc = self._tool_calls.setdefault(idx, {
-                "id": "", "type": "function",
-                "function": {"name": "", "arguments": ""},
-            })
+            tc = self._tool_calls.get(idx)
+            if tc is None:
+                tc = self._tool_calls[idx] = {
+                    "id": "", "type": "function",
+                    "name": StrParts(), "arguments": StrParts(),
+                }
             if chunk.tool_call_delta.get("id"):
                 tc["id"] = chunk.tool_call_delta["id"]
             if chunk.tool_call_delta.get("type"):
                 tc["type"] = chunk.tool_call_delta["type"]
-            if chunk.tool_call_delta.get("name"):
-                tc["function"]["name"] += chunk.tool_call_delta["name"]
-            if chunk.tool_call_delta.get("arguments"):
-                tc["function"]["arguments"] += chunk.tool_call_delta["arguments"]
+            tc["name"].append(chunk.tool_call_delta.get("name") or "")
+            tc["arguments"].append(chunk.tool_call_delta.get("arguments") or "")
 
         if chunk.finish_reason:
             self._finish_reason = chunk.finish_reason
@@ -114,15 +154,30 @@ class ChunkAccumulator:
 
     @property
     def text(self) -> str:
-        return self._text
+        return self._text.get()
 
     @property
     def reasoning(self) -> str:
-        return self._reasoning
+        return self._reasoning.get()
 
     @property
     def tool_calls(self) -> dict[int, dict]:
-        return self._tool_calls
+        # Materialise on read; the fragment form is internal only.  Returning
+        # fresh dicts keeps the accumulator reusable if finalize() runs twice.
+        # Cached because finalize() reads this several times (truthiness, keys,
+        # then per index) and each read would otherwise re-join every argument
+        # string — the exact cost StrParts exists to avoid.
+        if self._tool_calls_view is None:
+            self._tool_calls_view = {
+                idx: {
+                    "id": tc["id"],
+                    "type": tc["type"],
+                    "function": {"name": tc["name"].get(),
+                                 "arguments": tc["arguments"].get()},
+                }
+                for idx, tc in self._tool_calls.items()
+            }
+        return self._tool_calls_view
 
     @property
     def finish_reason(self) -> str | None:
@@ -225,6 +280,9 @@ class AnthropicSSEParser(BaseSSEParser):
         self.blocks: dict[int, dict] = {}
         # Each block: {"type": str, "text": str, "thinking": str, "signature": str,
         #               "id": str, "name": str, "input_json": str}
+        # Growing fields are buffered as fragments here and joined into the
+        # block dicts by _materialize() when finalize() runs — see StrParts.
+        self._fragments: dict[tuple[int, str], StrParts] = {}
         self.stop_reason: str | None = None
         self.stop_sequence: str | None = None
         self.stop_details: dict | None = None
@@ -233,6 +291,36 @@ class AnthropicSSEParser(BaseSSEParser):
         self.model: str = ""
         self.msg_id: str = ""
         self.role: str = "assistant"
+
+    def _discard_fragments(self, idx: int) -> None:
+        """Drop buffered fragments for one block index.
+
+        ``content_block_start`` replaces the block at an index outright.  Any
+        fragments still buffered for a *previous* incarnation of that block
+        must be discarded with it — otherwise ``_materialize()`` would join
+        them into the new block, duplicating text that the pre-refactor code
+        dropped.  Relays that re-emit ``content_block_start`` after a retry
+        hit this path.
+        """
+        for key in [k for k in self._fragments if k[0] == idx]:
+            del self._fragments[key]
+
+    def _append(self, idx: int, field: str, value: str) -> None:
+        """Buffer a delta fragment for a block field (see StrParts)."""
+        if not value:
+            return
+        parts = self._fragments.get((idx, field))
+        if parts is None:
+            parts = self._fragments[(idx, field)] = StrParts()
+        parts.append(value)
+
+    def _materialize(self) -> None:
+        """Join buffered fragments into the block dicts.  Idempotent."""
+        for (idx, field), parts in self._fragments.items():
+            block = self.blocks.get(idx)
+            if block is not None:
+                block[field] = block.get(field, "") + parts.get()
+        self._fragments.clear()
 
     def parse_line(self, line: str) -> StreamChunk | None:
         if not line.startswith("data:"):
@@ -259,6 +347,7 @@ class AnthropicSSEParser(BaseSSEParser):
             cb = event.get("content_block", {})
             block_type = cb.get("type", "text")
 
+            self._discard_fragments(idx)
             self.blocks[idx] = {"type": block_type}
 
             if block_type in (self._BLOCK_TOOL_USE, self._BLOCK_SERVER_TOOL_USE):
@@ -310,16 +399,13 @@ class AnthropicSSEParser(BaseSSEParser):
                     self.blocks[idx] = {"type": self._BLOCK_TEXT, "text": "", "citations": []}
 
             if delta_type == self._DELTA_TEXT:
-                self.blocks[idx]["text"] = self.blocks[idx].get("text", "") + delta.get("text", "")
+                self._append(idx, "text", delta.get("text", ""))
             elif delta_type == self._DELTA_THINKING:
-                self.blocks[idx]["thinking"] = self.blocks[idx].get("thinking", "") + delta.get("thinking", "")
+                self._append(idx, "thinking", delta.get("thinking", ""))
             elif delta_type == self._DELTA_SIGNATURE:
-                self.blocks[idx]["signature"] = self.blocks[idx].get("signature", "") + delta.get("signature", "")
+                self._append(idx, "signature", delta.get("signature", ""))
             elif delta_type == self._DELTA_INPUT_JSON:
-                self.blocks[idx]["input_json"] = (
-                    self.blocks[idx].get("input_json", "")
-                    + delta.get("partial_json", "")
-                )
+                self._append(idx, "input_json", delta.get("partial_json", ""))
             elif delta_type == self._DELTA_CITATIONS:
                 if "citations" not in self.blocks[idx]:
                     self.blocks[idx]["citations"] = []
@@ -332,8 +418,7 @@ class AnthropicSSEParser(BaseSSEParser):
                 # Unknown delta type — concatenate all string values as text
                 for dk, dv in delta.items():
                     if dk != "type" and isinstance(dv, str):
-                        self.blocks[idx].setdefault("text", "")
-                        self.blocks[idx]["text"] += dv
+                        self._append(idx, "text", dv)
 
         # ── content_block_stop ── (no data needed, index is enough)
         elif event_type == self._CB_STOP:
@@ -368,6 +453,7 @@ class AnthropicSSEParser(BaseSSEParser):
         return StreamChunk(raw=event)
 
     def finalize(self) -> dict | None:
+        self._materialize()
         # Build content blocks
         content_blocks: list[dict] = []
         for _idx in sorted(self.blocks.keys()):
@@ -550,14 +636,27 @@ class OpenAIResponsesSSEParser(BaseSSEParser):
     """
 
     def __init__(self) -> None:
-        self.output_text: str = ""
-        self.reasoning_text: str = ""
-        self.function_args: str = ""
+        # Delta fragments, joined lazily by the properties below (see StrParts).
+        self._output_text = StrParts()
+        self._reasoning_text = StrParts()
+        self._function_args = StrParts()
         self.response_id: str = ""
         self.model: str = ""
         self.status: str = ""
         self.usage: dict | None = None
         self.output_items: list[dict] = []
+
+    @property
+    def output_text(self) -> str:
+        return self._output_text.get()
+
+    @property
+    def reasoning_text(self) -> str:
+        return self._reasoning_text.get()
+
+    @property
+    def function_args(self) -> str:
+        return self._function_args.get()
 
     def parse_line(self, line: str) -> StreamChunk | None:
         if not line.startswith("data:"):
@@ -585,15 +684,15 @@ class OpenAIResponsesSSEParser(BaseSSEParser):
                 self.output_items = resp["output"]
 
         elif event_type == "response.output_text.delta":
-            self.output_text += event.get("delta", "")
+            self._output_text.append(event.get("delta", ""))
             chunk.text_delta = event.get("delta", "")
 
         elif event_type == "response.reasoning_summary_text.delta":
-            self.reasoning_text += event.get("delta", "")
+            self._reasoning_text.append(event.get("delta", ""))
             chunk.reasoning_delta = event.get("delta", "")
 
         elif event_type == "response.function_call_arguments.delta":
-            self.function_args += event.get("delta", "")
+            self._function_args.append(event.get("delta", ""))
 
         elif event_type == "response.failed":
             self.status = "failed"
